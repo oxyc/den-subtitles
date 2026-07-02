@@ -39,7 +39,7 @@
   <label for="osToken">OpenSubtitles token <span style="font-weight:400;color:#8b919b">(optional)</span></label>
   <input id="osToken" type="password" placeholder="service-account JWT — raises download quota" autocomplete="off" />
 
-  <label for="provider">AI provider</label>
+  <label for="provider">AI provider <span style="font-weight:400;color:#8b919b">(optional — leave the key blank for subtitles only)</span></label>
   <select id="provider"></select>
 
   <label for="model">Model</label>
@@ -50,8 +50,8 @@
   <div class="hint">Default is the cheap/fast/decent tier. Pick a bigger model to re-translate a
     title that reads badly.</div>
 
-  <label for="apiKey">API key</label>
-  <input id="apiKey" type="password" placeholder="sk-…" autocomplete="off" />
+  <label for="apiKey">AI provider API key <span style="font-weight:400;color:#8b919b">(optional)</span></label>
+  <input id="apiKey" type="password" placeholder="leave blank for fetch + sync without translation" autocomplete="off" />
 
   <div class="check">
     <input id="autoSync" type="checkbox" checked />
@@ -98,16 +98,19 @@
   fillModels();
 
   document.getElementById("build").addEventListener("click", () => {
+    const apiKey = document.getElementById("apiKey").value.trim();
     const cfg = {
-      provider: provider.value,
-      model: modelCustom.value.trim() || modelSelect.value || "",
-      apiKey: document.getElementById("apiKey").value.trim(),
       osKey: document.getElementById("osKey").value.trim(),
       osToken: document.getElementById("osToken").value.trim() || undefined,
       autoSync: document.getElementById("autoSync").checked,
     };
     if (!cfg.osKey) { alert("An OpenSubtitles API key is required."); return; }
-    if (!cfg.apiKey) { alert("An AI provider API key is required."); return; }
+    // AI translation is optional — only include the provider/model/key when a key is given.
+    if (apiKey) {
+      cfg.provider = provider.value;
+      cfg.model = modelCustom.value.trim() || modelSelect.value || "";
+      cfg.apiKey = apiKey;
+    }
     const b64 = btoa(JSON.stringify(cfg))
       .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     const url = location.origin + "/" + b64 + "/manifest.json";

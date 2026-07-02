@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use crate::httputil::{self, percent_decode, Body};
 use crate::opensubtitles;
 use crate::state::AppState;
-use crate::userconfig::{self, UserConfig};
+use crate::userconfig::{self, LlmConfig, UserConfig};
 use crate::{srt, translate};
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60); // 60 days — mirrors the app cache
@@ -32,9 +32,9 @@ pub fn manifest(configured: bool) -> Value {
         "version": "0.1.0",
         "name": "Den Subtitles",
         "description": if configured {
-            "OpenSubtitles (hash-matched + auto-synced) with BYOK AI translation for Den."
+            "OpenSubtitles (hash-matched + auto-synced) with optional BYOK AI translation for Den."
         } else {
-            "Self-hosted subtitles for Den — configure with your AI provider key to enable translation."
+            "Self-hosted subtitles for Den — configure with your OpenSubtitles key (AI translation optional)."
         },
         "resources": ["subtitles"],
         "types": ["movie", "series"],
@@ -169,6 +169,10 @@ pub async fn handle_translate(
     let Some(cfg) = userconfig::decode(config) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
     };
+    // Translation needs the (optional) LLM credential — a subtitles-only install has none.
+    let Some(llm) = &cfg.llm else {
+        return httputil::text(StatusCode::BAD_REQUEST, "no AI provider configured for translation");
+    };
     let Some((imdb, season, episode)) = parse_id(id) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_id");
     };
@@ -176,13 +180,13 @@ pub async fn handle_translate(
         "translate:{imdb}:{}:{}:{lang}:{}:{}",
         season.unwrap_or(0),
         episode.unwrap_or(0),
-        provider_tag(&cfg),
-        cfg.model,
+        provider_tag(llm),
+        llm.model,
     );
 
     // Warm the cache if needed (both the .json and .srt forms share it).
     if state.cache.get(&cache_key).is_none() {
-        match produce_translation(state, &cfg, &imdb, season, episode, lang, &cache_key).await {
+        match produce_translation(state, &cfg, llm, &imdb, season, episode, lang, &cache_key).await {
             Ok(()) => {}
             Err(e) => return httputil::text(StatusCode::BAD_GATEWAY, &e),
         }
@@ -200,9 +204,11 @@ pub async fn handle_translate(
 }
 
 /// Fetch a source subtitle (prefer English), translate it, and store the result in the cache.
+#[allow(clippy::too_many_arguments)]
 async fn produce_translation(
     state: &Arc<AppState>,
     cfg: &UserConfig,
+    llm: &LlmConfig,
     imdb: &str,
     season: Option<i64>,
     episode: Option<i64>,
@@ -224,14 +230,14 @@ async fn produce_translation(
     if cues.is_empty() {
         return Err("source subtitle was empty".into());
     }
-    let translated = translate::translate(&state.http, cfg, &cues, lang).await?;
+    let translated = translate::translate(&state.http, llm, &cues, lang).await?;
     state.cache.put(cache_key.to_string(), srt::serialize(&translated), CACHE_TTL);
     Ok(())
 }
 
-fn provider_tag(cfg: &UserConfig) -> &'static str {
+fn provider_tag(llm: &LlmConfig) -> &'static str {
     use crate::userconfig::Provider::*;
-    match cfg.provider {
+    match llm.provider {
         OpenAI => "openai",
         Anthropic => "anthropic",
         Google => "google",

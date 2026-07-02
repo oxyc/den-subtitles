@@ -37,10 +37,11 @@ carrying `alass`/`ffsubsync`/`ffmpeg`.
 
 ## Config
 
-Per-install config is base64url-encoded in the addon URL (den-scout / Torrentio style) and holds
-**both** BYOK credentials — the user's OpenSubtitles consumer key (the subtitle source) and their LLM
-key (translation) — a bearer secret the app stores in the Keychain. Build it at `/configure`. Nothing
-credential-shaped lives in the environment; `.env.example` is just infra (port, cache, origin).
+Per-install config is base64url-encoded in the addon URL (den-scout / Torrentio style), a bearer
+secret the app stores in the Keychain. The **OpenSubtitles key** (subtitle source) is required; the
+**LLM key** (translation) is **optional** — omit it for a fetch + auto-sync-only install with no AI.
+Build it at `/configure`. Nothing credential-shaped lives in the environment; `.env.example` is just
+infra (port, cache, origin).
 
 Supported providers: OpenAI, Google, Anthropic, xAI, OpenRouter (chat) and DeepL (MT). Default model
 is the cheap/fast/decent tier per provider; step up to a bigger model to re-translate a title that

@@ -17,7 +17,7 @@
 use serde_json::{json, Value};
 
 use crate::srt::Cue;
-use crate::userconfig::{Provider, UserConfig};
+use crate::userconfig::{LlmConfig, Provider};
 
 /// Cues per model call. Small enough that a retry-on-mismatch reprocesses little work, large enough
 /// to amortise the per-request latency and give the model intra-scene context.
@@ -29,7 +29,7 @@ const CONTEXT_WINDOW: usize = 6;
 /// cue's index/timing. Returns the same cues with translated `text`, or an error string.
 pub async fn translate(
     client: &reqwest::Client,
-    cfg: &UserConfig,
+    llm: &LlmConfig,
     cues: &[Cue],
     target_lang: &str,
 ) -> Result<Vec<Cue>, String> {
@@ -42,7 +42,7 @@ pub async fn translate(
 
     for batch in cues.chunks(BATCH) {
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let translated = translate_batch(client, cfg, &sources, target_lang, &context).await?;
+        let translated = translate_batch(client, llm, &sources, target_lang, &context).await?;
         for (cue, text) in batch.iter().zip(translated) {
             context.push((cue.text.clone(), text.clone()));
             out.push(Cue { text, ..cue.clone() });
@@ -58,7 +58,7 @@ pub async fn translate(
 /// single misbehaving batch degrades to smaller batches instead of corrupting the whole film.
 async fn translate_batch(
     client: &reqwest::Client,
-    cfg: &UserConfig,
+    llm: &LlmConfig,
     sources: &[String],
     target_lang: &str,
     context: &[(String, String)],
@@ -66,10 +66,10 @@ async fn translate_batch(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    let result = match cfg.provider {
+    let result = match llm.provider {
         // DeepL is a 1:1 text-array MT endpoint, not a chat model — no prompt, no JSON contract.
-        Provider::DeepL => deepl_translate(client, cfg, sources, target_lang).await,
-        _ => llm_translate(client, cfg, sources, target_lang, context).await,
+        Provider::DeepL => deepl_translate(client, llm, sources, target_lang).await,
+        _ => llm_translate(client, llm, sources, target_lang, context).await,
     };
 
     match result {
@@ -79,8 +79,8 @@ async fn translate_batch(
             // don't thread the first half's output into the second here — keeps the split simple.
             let mid = sources.len() / 2;
             // Box the recursive futures — an async fn can't hold an unboxed future of itself.
-            let mut left = Box::pin(translate_batch(client, cfg, &sources[..mid], target_lang, context)).await?;
-            let right = Box::pin(translate_batch(client, cfg, &sources[mid..], target_lang, context)).await?;
+            let mut left = Box::pin(translate_batch(client, llm, &sources[..mid], target_lang, context)).await?;
+            let right = Box::pin(translate_batch(client, llm, &sources[mid..], target_lang, context)).await?;
             left.extend(right);
             Ok(left)
         }
@@ -95,7 +95,7 @@ async fn translate_batch(
 /// JSON array back.
 async fn llm_translate(
     client: &reqwest::Client,
-    cfg: &UserConfig,
+    llm: &LlmConfig,
     sources: &[String],
     target_lang: &str,
     context: &[(String, String)],
@@ -121,7 +121,7 @@ async fn llm_translate(
     user.push_str("Translate this JSON array:\n");
     user.push_str(&serde_json::to_string(sources).map_err(|e| e.to_string())?);
 
-    let text = call_chat(client, cfg, &system, &user).await?;
+    let text = call_chat(client, llm, &system, &user).await?;
     parse_json_array(&text).ok_or_else(|| "model did not return a JSON array".to_string())
 }
 
@@ -129,14 +129,14 @@ async fn llm_translate(
 /// text. Bodies are built as `Value` so the three request shapes stay readable side by side.
 async fn call_chat(
     client: &reqwest::Client,
-    cfg: &UserConfig,
+    llm: &LlmConfig,
     system: &str,
     user: &str,
 ) -> Result<String, String> {
-    let (url, body, auth) = match cfg.provider {
+    let (url, body, auth) = match llm.provider {
         // OpenAI-compatible chat/completions: OpenAI, xAI, OpenRouter.
         Provider::OpenAI | Provider::Xai | Provider::OpenRouter => {
-            let base = match cfg.provider {
+            let base = match llm.provider {
                 Provider::OpenAI => "https://api.openai.com/v1",
                 Provider::Xai => "https://api.x.ai/v1",
                 _ => "https://openrouter.ai/api/v1",
@@ -144,7 +144,7 @@ async fn call_chat(
             (
                 format!("{base}/chat/completions"),
                 json!({
-                    "model": cfg.model,
+                    "model": llm.model,
                     "temperature": 0.2,
                     "messages": [
                         {"role": "system", "content": system},
@@ -157,7 +157,7 @@ async fn call_chat(
         Provider::Anthropic => (
             "https://api.anthropic.com/v1/messages".to_string(),
             json!({
-                "model": cfg.model,
+                "model": llm.model,
                 "max_tokens": 8192,
                 "temperature": 0.2,
                 "system": system,
@@ -168,7 +168,7 @@ async fn call_chat(
         Provider::Google => (
             format!(
                 "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-                cfg.model
+                llm.model
             ),
             json!({
                 "systemInstruction": {"parts": [{"text": system}]},
@@ -182,11 +182,11 @@ async fn call_chat(
 
     let mut req = client.post(&url).json(&body);
     req = match auth {
-        Auth::Bearer => req.bearer_auth(&cfg.api_key),
+        Auth::Bearer => req.bearer_auth(&llm.api_key),
         Auth::AnthropicKey => req
-            .header("x-api-key", &cfg.api_key)
+            .header("x-api-key", &llm.api_key)
             .header("anthropic-version", "2023-06-01"),
-        Auth::GoogleKey => req.header("x-goog-api-key", &cfg.api_key),
+        Auth::GoogleKey => req.header("x-goog-api-key", &llm.api_key),
     };
 
     let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
@@ -196,7 +196,7 @@ async fn call_chat(
         return Err(format!("provider {code}: {}", truncate(&body, 200)));
     }
     let v: Value = resp.json().await.map_err(|e| format!("bad json: {e}"))?;
-    extract_text(cfg.provider, &v).ok_or_else(|| "no text in provider response".to_string())
+    extract_text(llm.provider, &v).ok_or_else(|| "no text in provider response".to_string())
 }
 
 enum Auth {
@@ -220,14 +220,14 @@ fn extract_text(provider: Provider, v: &Value) -> Option<String> {
 /// DeepL `/v2/translate`: an array of texts in → an array of translations out, 1:1 by construction.
 async fn deepl_translate(
     client: &reqwest::Client,
-    cfg: &UserConfig,
+    llm: &LlmConfig,
     sources: &[String],
     target_lang: &str,
 ) -> Result<Vec<String>, String> {
     let body = json!({ "text": sources, "target_lang": deepl_code(target_lang) });
     let resp = client
         .post("https://api-free.deepl.com/v2/translate")
-        .header("Authorization", format!("DeepL-Auth-Key {}", cfg.api_key))
+        .header("Authorization", format!("DeepL-Auth-Key {}", llm.api_key))
         .json(&body)
         .send()
         .await
