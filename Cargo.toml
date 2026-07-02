@@ -1,0 +1,37 @@
+[package]
+name = "den-subtitles"
+version = "0.1.0"
+edition = "2021"
+description = "Den subtitles, one container: Stremio subtitles addon that fetches (OpenSubtitles, hash-matched), AI-translates (BYOK), and auto-syncs (alass/ffsubsync) SRTs for the Den Apple TV app"
+publish = false
+
+[[bin]]
+name = "den-subtitles"
+path = "src/main.rs"
+
+[dependencies]
+# current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
+# alass/ffsubsync/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rustls (not OpenSSL) with bundled webpki roots → no ca-certificates juggling, static-friendly TLS.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
+
+# Self-contained binary for a resource-constrained homelab. panic=unwind (default): a panic in one
+# request task unwinds just that connection (tokio catches it) instead of aborting the whole server.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

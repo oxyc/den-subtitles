@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Den Subtitles — Configure</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; max-width: 34rem; margin: 3rem auto;
+         padding: 0 1.25rem; background: #0d0f13; color: #e6e8ec; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  p.sub { color: #9aa0aa; margin: 0 0 1.75rem; }
+  label { display: block; font-weight: 600; margin: 1.1rem 0 .35rem; }
+  input, select { width: 100%; box-sizing: border-box; padding: .6rem .7rem; border-radius: 8px;
+         border: 1px solid #2a2f38; background: #161a20; color: inherit; font: inherit; }
+  .row { display: flex; gap: .75rem; } .row > * { flex: 1; }
+  .hint { color: #8b919b; font-size: .82rem; margin-top: .3rem; }
+  .check { display: flex; align-items: center; gap: .5rem; margin-top: 1.1rem; }
+  .check input { width: auto; }
+  button { margin-top: 1.75rem; width: 100%; padding: .75rem; border: 0; border-radius: 8px;
+           background: #3b82f6; color: #fff; font-weight: 600; font-size: 1rem; cursor: pointer; }
+  #out { margin-top: 1.25rem; display: none; }
+  #url { word-break: break-all; background: #161a20; border: 1px solid #2a2f38; border-radius: 8px;
+         padding: .7rem; font-family: ui-monospace, monospace; font-size: .8rem; }
+</style>
+</head>
+<body>
+  <h1>Den Subtitles</h1>
+  <p class="sub">Hash-matched OpenSubtitles, auto-sync, and your-own-key AI translation. Your keys
+    stay in this URL and are stored in the Den Keychain — never sent anywhere but OpenSubtitles and
+    your chosen AI provider.</p>
+
+  <label for="osKey">OpenSubtitles API key</label>
+  <input id="osKey" type="password" placeholder="your opensubtitles.com consumer key" autocomplete="off" />
+  <div class="hint">Register a free app at
+    <a href="https://www.opensubtitles.com/consumers" style="color:#7fb0ff">opensubtitles.com/consumers</a>.
+    This is the subtitle source.</div>
+
+  <label for="osToken">OpenSubtitles token <span style="font-weight:400;color:#8b919b">(optional)</span></label>
+  <input id="osToken" type="password" placeholder="service-account JWT — raises download quota" autocomplete="off" />
+
+  <label for="provider">AI provider</label>
+  <select id="provider"></select>
+
+  <label for="model">Model</label>
+  <div class="row">
+    <select id="modelSelect"></select>
+    <input id="modelCustom" placeholder="or type a custom model id" />
+  </div>
+  <div class="hint">Default is the cheap/fast/decent tier. Pick a bigger model to re-translate a
+    title that reads badly.</div>
+
+  <label for="apiKey">API key</label>
+  <input id="apiKey" type="password" placeholder="sk-…" autocomplete="off" />
+
+  <div class="check">
+    <input id="autoSync" type="checkbox" checked />
+    <label for="autoSync" style="margin:0;font-weight:400">Auto-sync subtitles (hash + reference alignment)</label>
+  </div>
+
+  <button id="build">Build install link</button>
+
+  <div id="out">
+    <label>Install URL</label>
+    <div id="url"></div>
+  </div>
+
+<script>
+  // provider -> suggested models (first is the default). Free text always allowed.
+  const MODELS = {
+    openai:     ["gpt-4o-mini", "gpt-4o"],
+    google:     ["gemini-2.0-flash", "gemini-2.5-pro"],
+    anthropic:  ["claude-haiku-4-5", "claude-sonnet-5"],
+    xai:        ["grok-2"],
+    openrouter: ["openai/gpt-4o-mini", "anthropic/claude-haiku-4-5"],
+    deepl:      [],
+  };
+  const LABELS = { openai:"OpenAI", google:"Google Gemini", anthropic:"Anthropic Claude",
+                   xai:"xAI Grok", openrouter:"OpenRouter", deepl:"DeepL (no AI context)" };
+
+  const provider = document.getElementById("provider");
+  const modelSelect = document.getElementById("modelSelect");
+  const modelCustom = document.getElementById("modelCustom");
+  for (const p of Object.keys(MODELS)) {
+    const o = document.createElement("option"); o.value = p; o.textContent = LABELS[p];
+    provider.appendChild(o);
+  }
+  function fillModels() {
+    modelSelect.innerHTML = "";
+    const list = MODELS[provider.value];
+    modelSelect.disabled = list.length === 0;
+    for (const m of list) {
+      const o = document.createElement("option"); o.value = m; o.textContent = m;
+      modelSelect.appendChild(o);
+    }
+  }
+  provider.addEventListener("change", fillModels);
+  fillModels();
+
+  document.getElementById("build").addEventListener("click", () => {
+    const cfg = {
+      provider: provider.value,
+      model: modelCustom.value.trim() || modelSelect.value || "",
+      apiKey: document.getElementById("apiKey").value.trim(),
+      osKey: document.getElementById("osKey").value.trim(),
+      osToken: document.getElementById("osToken").value.trim() || undefined,
+      autoSync: document.getElementById("autoSync").checked,
+    };
+    if (!cfg.osKey) { alert("An OpenSubtitles API key is required."); return; }
+    if (!cfg.apiKey) { alert("An AI provider API key is required."); return; }
+    const b64 = btoa(JSON.stringify(cfg))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const url = location.origin + "/" + b64 + "/manifest.json";
+    document.getElementById("url").textContent = url;
+    document.getElementById("out").style.display = "block";
+  });
+</script>
+</body>
+</html>
