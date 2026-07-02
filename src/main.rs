@@ -39,6 +39,16 @@ const CONFIGURE_PAGE: &str = include_str!("configure.html");
 /// Consecutive OpenSubtitles failures before /health reports `degraded` (ADDON-02).
 const HEALTH_FAIL_THRESHOLD: u32 = 3;
 
+/// The /health response body for a given consecutive-failure count (ADDON-02). Pure so the
+/// degraded/ok decision is unit-testable without standing up the HTTP server.
+fn health_body(os_fails: u32) -> serde_json::Value {
+    if os_fails >= HEALTH_FAIL_THRESHOLD {
+        serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "OpenSubtitles has been failing"})
+    } else {
+        serde_json::json!({"status": "ok"})
+    }
+}
+
 pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Incoming>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
     let path = parts.uri.path();
@@ -47,11 +57,7 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
         // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when OpenSubtitles has been
         // failing so the app's Plugins screen can surface it.
         "/health" => {
-            let body = if state.os_fails.load(std::sync::atomic::Ordering::Relaxed) >= HEALTH_FAIL_THRESHOLD {
-                serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "OpenSubtitles has been failing"})
-            } else {
-                serde_json::json!({"status": "ok"})
-            };
+            let body = health_body(state.os_fails.load(std::sync::atomic::Ordering::Relaxed));
             return httputil::json(StatusCode::OK, &body, "no-store");
         }
         "/manifest.json" => return httputil::json(StatusCode::OK, &addon::manifest(false), "public, max-age=3600"),
@@ -186,5 +192,33 @@ fn main() {
     if let Err(e) = rt.block_on(run(cfg)) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_ok_below_threshold() {
+        // Fewer than HEALTH_FAIL_THRESHOLD consecutive failures → healthy liveness.
+        for fails in 0..HEALTH_FAIL_THRESHOLD {
+            let body = health_body(fails);
+            assert_eq!(body["status"], "ok", "fails={fails} should be ok");
+            // No degraded fields leak into the healthy body.
+            assert!(body.get("reason").is_none());
+            assert!(body.get("detail").is_none());
+        }
+    }
+
+    #[test]
+    fn health_degraded_at_and_above_threshold() {
+        // At the threshold and beyond, OpenSubtitles is treated as down (ADDON-02).
+        for fails in [HEALTH_FAIL_THRESHOLD, HEALTH_FAIL_THRESHOLD + 1, 100] {
+            let body = health_body(fails);
+            assert_eq!(body["status"], "degraded", "fails={fails} should be degraded");
+            assert_eq!(body["reason"], "upstream_unavailable");
+            assert_eq!(body["detail"], "OpenSubtitles has been failing");
+        }
     }
 }
