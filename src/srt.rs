@@ -72,8 +72,19 @@ fn parse_ts(s: &str) -> Option<u64> {
     let m: u64 = parts.next()?.parse().ok()?;
     let sec: u64 = parts.next()?.parse().ok()?;
     // Pad/truncate the millisecond field to exactly 3 digits before parsing (e.g. "5" → 500).
-    let ms: u64 = format!("{:0<3}", &ms[..ms.len().min(3)]).parse().ok()?;
-    Some(((h * 60 + m) * 60 + sec) * 1000 + ms)
+    // char-based (not byte-slice): the ms field is arbitrary downloaded text, and a multibyte char
+    // straddling byte index 3 would panic a byte slice.
+    let ms3: String = ms.chars().take(3).collect();
+    let ms: u64 = format!("{ms3:0<3}").parse().ok()?;
+    // Saturating math: a malformed HH:MM:SS from hostile input mustn't overflow-panic in debug.
+    let total = h
+        .saturating_mul(60)
+        .saturating_add(m)
+        .saturating_mul(60)
+        .saturating_add(sec)
+        .saturating_mul(1000)
+        .saturating_add(ms);
+    Some(total)
 }
 
 fn format_ts(ms: u64) -> String {
@@ -94,6 +105,14 @@ mod tests {
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0], Cue { index: 1, start: 1000, end: 4000, text: "Hej, hur mår du?".into() });
         assert_eq!(serialize(&cues), src);
+    }
+
+    #[test]
+    fn does_not_panic_on_multibyte_millisecond_field() {
+        // A malformed timecode whose millisecond field carries a multibyte char at byte 3 must not
+        // panic a byte slice; the cue is simply skipped (unparseable ms).
+        let src = "1\n00:00:01,ab€ --> 00:00:02,000\nhi\n";
+        assert!(parse(src).is_empty());
     }
 
     #[test]

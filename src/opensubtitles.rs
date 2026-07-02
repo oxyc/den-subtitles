@@ -66,7 +66,7 @@ impl<'a> Client<'a> {
         if !resp.status().is_success() {
             return Err(format!("opensubtitles search {}", resp.status()));
         }
-        let v: Value = resp.json().await.map_err(|e| format!("bad json: {e}"))?;
+        let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
         let mut subs = parse_search(&v);
         // Hash matches first (already in sync), then most-downloaded (community-vetted timing).
         subs.sort_by(|a, b| b.hash_match.cmp(&a.hash_match).then(b.downloads.cmp(&a.downloads)));
@@ -88,18 +88,16 @@ impl<'a> Client<'a> {
         if !resp.status().is_success() {
             return Err(format!("opensubtitles download {}", resp.status()));
         }
-        let v: Value = resp.json().await.map_err(|e| format!("bad json: {e}"))?;
+        let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
         let link = v["link"].as_str().ok_or("no download link")?;
-        let body = self
+        // The link is OpenSubtitles-supplied and points at their CDN — cap the fetched body.
+        let resp = self
             .http
             .get(link)
             .send()
             .await
-            .map_err(|e| format!("fetch link failed: {e}"))?
-            .text()
-            .await
-            .map_err(|e| format!("read subtitle failed: {e}"))?;
-        Ok(body)
+            .map_err(|e| format!("fetch link failed: {e}"))?;
+        crate::fetch::capped_text(resp, crate::fetch::MAX_BODY).await
     }
 }
 

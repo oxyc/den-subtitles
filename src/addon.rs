@@ -53,13 +53,25 @@ pub fn self_base(state: &AppState, headers: &HeaderMap, config: &str) -> String 
         let proto = hdr("x-forwarded-proto")
             .map(|p| p.split(',').next().unwrap_or("http").trim().to_string())
             .unwrap_or_else(|| "http".to_string());
+        // Reflecting a client-controlled Host into a URL we hand back is a poisoning vector; only
+        // accept a sane host charset, else fall back. Set PUBLIC_BASE_URL in deploy to avoid this
+        // path entirely (see .env.example).
         let host = hdr("x-forwarded-host")
             .or_else(|| hdr("host"))
+            .filter(|h| is_sane_host(h))
             .unwrap_or("localhost")
             .to_string();
         format!("{proto}://{host}")
     };
     format!("{root}/{config}")
+}
+
+/// A hostname/authority we're willing to reflect into a returned URL: letters, digits, and the few
+/// punctuation chars a host+port legitimately uses. Rejects spaces, slashes, `@`, etc.
+fn is_sane_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_'))
 }
 
 /// `tt123` or `tt123:1:2` → (imdb, season, episode).
@@ -103,9 +115,13 @@ pub async fn handle_subtitles(
     let Some((imdb, season, episode)) = parse_id(id) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_id"}), "no-store");
     };
+    let Some(http) = state.http.as_ref() else {
+        eprintln!("subtitles: http client unavailable");
+        return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
+    };
 
     let client = opensubtitles::Client {
-        http: &state.http,
+        http,
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
     };
@@ -115,7 +131,12 @@ pub async fn handle_subtitles(
         .await
     {
         Ok(s) => s,
-        Err(_) => return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store"),
+        // Empty-200 is the correct Stremio shape for "nothing", but log the cause (our error strings
+        // carry no key) so an upstream/quota failure isn't invisible.
+        Err(e) => {
+            eprintln!("subtitles: opensubtitles search failed for {imdb}: {e}");
+            return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
+        }
     };
 
     let base = self_base(state, headers, config);
@@ -141,8 +162,11 @@ pub async fn handle_subtitle_file(state: &Arc<AppState>, config: &str, file_id: 
     if let Some(hit) = state.cache.get(&cache_key) {
         return httputil::srt(hit);
     }
+    let Some(http) = state.http.as_ref() else {
+        return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "subtitle service unavailable");
+    };
     let client = opensubtitles::Client {
-        http: &state.http,
+        http,
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
     };
@@ -151,7 +175,11 @@ pub async fn handle_subtitle_file(state: &Arc<AppState>, config: &str, file_id: 
             state.cache.put(cache_key, body.clone(), CACHE_TTL);
             httputil::srt(body)
         }
-        Err(_) => httputil::text(StatusCode::NOT_FOUND, "download failed"),
+        // An upstream/quota failure is a bad-gateway condition, not a missing resource.
+        Err(e) => {
+            eprintln!("subtitle: download of file {file_id} failed: {e}");
+            httputil::text(StatusCode::BAD_GATEWAY, "upstream subtitle fetch failed")
+        }
     }
 }
 
@@ -186,9 +214,11 @@ pub async fn handle_translate(
 
     // Warm the cache if needed (both the .json and .srt forms share it).
     if state.cache.get(&cache_key).is_none() {
-        match produce_translation(state, &cfg, llm, &imdb, season, episode, lang, &cache_key).await {
-            Ok(()) => {}
-            Err(e) => return httputil::text(StatusCode::BAD_GATEWAY, &e),
+        if let Err(e) = produce_translation(state, &cfg, llm, &imdb, season, episode, lang, &cache_key).await {
+            // Log the detail (no key in these strings); hand the client a generic message rather than
+            // echoing a raw upstream error body.
+            eprintln!("translate: {imdb} → {lang} failed: {e}");
+            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
         }
     }
 
@@ -215,8 +245,9 @@ async fn produce_translation(
     lang: &str,
     cache_key: &str,
 ) -> Result<(), String> {
+    let http = state.http.as_ref().ok_or("http client unavailable")?;
     let client = opensubtitles::Client {
-        http: &state.http,
+        http,
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
     };
@@ -230,7 +261,7 @@ async fn produce_translation(
     if cues.is_empty() {
         return Err("source subtitle was empty".into());
     }
-    let translated = translate::translate(&state.http, llm, &cues, lang).await?;
+    let translated = translate::translate(http, llm, &cues, lang).await?;
     state.cache.put(cache_key.to_string(), srt::serialize(&translated), CACHE_TTL);
     Ok(())
 }

@@ -12,6 +12,7 @@
 mod addon;
 mod cache;
 mod config;
+mod fetch;
 mod httputil;
 mod opensubtitles;
 mod srt;
@@ -105,7 +106,12 @@ fn strip_json(seg: &str) -> Option<&str> {
 }
 
 async fn run(cfg: Config) -> std::io::Result<()> {
-    std::fs::create_dir_all(&cfg.cache_dir)?;
+    // Don't refuse to boot on an unwritable cache mount — the artifact cache is fully in-memory and
+    // the sync scratch dir creates itself lazily. A failed pre-create is logged, not fatal (a hard
+    // exit here would crash-loop the container and the app would see only connection-refused).
+    if let Err(e) = std::fs::create_dir_all(&cfg.cache_dir) {
+        eprintln!("warning: cache dir {} not writable ({e}) — sync tiers will retry lazily", cfg.cache_dir.display());
+    }
     let port = cfg.port;
     let state = AppState::new(cfg);
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;

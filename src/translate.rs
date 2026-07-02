@@ -14,6 +14,8 @@
 //! ~30-60s background job for a full film is well within the click-and-wait UX. Cheap models
 //! (gpt-4o-mini / gemini-flash / haiku) clear the "good enough to follow the movie" bar here.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use crate::srt::Cue;
@@ -24,6 +26,12 @@ use crate::userconfig::{LlmConfig, Provider};
 const BATCH: usize = 40;
 /// How many prior (source → translation) pairs to carry forward for cross-batch consistency.
 const CONTEXT_WINDOW: usize = 6;
+/// Per-batch upstream bound for an LLM/DeepL call (above the client default; a completion is slower
+/// than a metadata fetch but must still be bounded).
+const LLM_TIMEOUT: Duration = Duration::from_secs(120);
+/// Ceiling on cues we'll translate for one title. A real film is ~1–3k cues; anything past this is a
+/// pathological/hostile SRT that would run unbounded (cost, wall-clock), so we refuse it.
+const MAX_CUES: usize = 6000;
 
 /// Translate every cue's text into `target_lang` (a display name like "English"), preserving each
 /// cue's index/timing. Returns the same cues with translated `text`, or an error string.
@@ -35,6 +43,9 @@ pub async fn translate(
 ) -> Result<Vec<Cue>, String> {
     if cues.is_empty() {
         return Ok(Vec::new());
+    }
+    if cues.len() > MAX_CUES {
+        return Err(format!("subtitle too large: {} cues (max {MAX_CUES})", cues.len()));
     }
     let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Rolling context: the tail of already-translated pairs, refreshed as we go.
@@ -180,7 +191,9 @@ async fn call_chat(
         Provider::DeepL => return Err("DeepL does not use the chat path".to_string()),
     };
 
-    let mut req = client.post(&url).json(&body);
+    // Override the client's default timeout upward: an LLM completion is legitimately slower than an
+    // OpenSubtitles call, but still must be bounded so a stuck provider can't hang the request.
+    let mut req = client.post(&url).timeout(LLM_TIMEOUT).json(&body);
     req = match auth {
         Auth::Bearer => req.bearer_auth(&llm.api_key),
         Auth::AnthropicKey => req
@@ -192,10 +205,10 @@ async fn call_chat(
     let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
     if !resp.status().is_success() {
         let code = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::fetch::capped_text(resp, 64 * 1024).await.unwrap_or_default();
         return Err(format!("provider {code}: {}", truncate(&body, 200)));
     }
-    let v: Value = resp.json().await.map_err(|e| format!("bad json: {e}"))?;
+    let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
     extract_text(llm.provider, &v).ok_or_else(|| "no text in provider response".to_string())
 }
 
@@ -227,6 +240,7 @@ async fn deepl_translate(
     let body = json!({ "text": sources, "target_lang": deepl_code(target_lang) });
     let resp = client
         .post("https://api-free.deepl.com/v2/translate")
+        .timeout(LLM_TIMEOUT)
         .header("Authorization", format!("DeepL-Auth-Key {}", llm.api_key))
         .json(&body)
         .send()
@@ -235,7 +249,7 @@ async fn deepl_translate(
     if !resp.status().is_success() {
         return Err(format!("deepl {}", resp.status()));
     }
-    let v: Value = resp.json().await.map_err(|e| format!("bad json: {e}"))?;
+    let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
     let arr = v["translations"].as_array().ok_or("no translations")?;
     Ok(arr.iter().filter_map(|t| t["text"].as_str().map(str::to_string)).collect())
 }

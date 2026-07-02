@@ -2,6 +2,7 @@
 //! from `Config` and cloned (behind `Arc`) into every connection.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cache::Cache;
 use crate::config::Config;
@@ -9,17 +10,30 @@ use crate::sync::SyncTools;
 
 pub struct AppState {
     pub cfg: Config,
-    pub http: reqwest::Client,
+    /// The pooled HTTP client. `None` if TLS init failed at boot — health/manifest/configure still
+    /// serve; the subtitle/translate routes 503 instead of the whole process refusing to boot.
+    pub http: Option<reqwest::Client>,
     pub cache: Cache,
     pub sync: SyncTools,
 }
 
 impl AppState {
     pub fn new(cfg: Config) -> Arc<AppState> {
-        let http = reqwest::Client::builder()
+        // Bounded so an upstream (OpenSubtitles / LLM) that never responds can't pin a request task
+        // forever. The connect bound is tight; the overall bound is generous because a translation
+        // batch on a slow model is legitimately slow (per-request LLM calls override it upward).
+        let http = match reqwest::Client::builder()
             .user_agent("den-subtitles/0.1")
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
-            .expect("http client");
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("warning: HTTP client init failed ({e}) — subtitle/translate routes will 503");
+                None
+            }
+        };
         let sync = SyncTools {
             ffsubsync: cfg.ffsubsync.clone(),
             alass: cfg.alass.clone(),
