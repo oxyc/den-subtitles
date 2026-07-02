@@ -63,9 +63,8 @@ pub struct UserConfig {
     pub opensubtitles_token: Option<String>,
     /// Translation credential. `None` → subtitles-only (fetch + sync, no AI translation).
     pub llm: Option<LlmConfig>,
-    /// Auto-sync every result through the cheap tiers (hash + reference). On by default.
-    /// Consumed once the sync ladder is wired into the request path (next increment).
-    #[allow(dead_code)]
+    /// Auto-sync non-hash results through Tier-1 reference alignment (`?ref=`). On by default; when
+    /// off, the subtitle proxy still serves and caches, just without the automatic alignment.
     pub auto_sync: bool,
 }
 

@@ -56,14 +56,29 @@ cargo run                     # local (needs alass/ffsubsync on PATH for the syn
 docker build -t den-subtitles . && docker run -p 8093:8093 --env-file .env den-subtitles
 ```
 
-`cargo test` covers the SRT round-trip, config decode/validate, the JSON-array parse, and the
-OpenSubtitles result ordering.
+`cargo test` covers the SRT round-trip, config decode/validate, the JSON-array parse, the
+OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` SSRF guard, and the
+sync subprocess orchestration (spawn → arg contract → read-back → cleanup, against fake binaries).
 
 ## Status
 
 Working: manifest + `/configure`, OpenSubtitles hash-matched search, cached subtitle proxy, the full
-BYOK translation harness (all providers), the cache, the Docker image.
+BYOK translation harness (all providers), the cache, the Docker image, and the **sync ladder**
+(`src/sync.rs`) — now wired into the request path:
 
-Wired but not yet invoked from the request path (next increment): the **sync ladder**
-(`src/sync.rs`) — Tier 1 reference-align on the subtitle proxy when a trusted reference exists, and
-a Tier 2 `/resync` endpoint that runs `alass` against the audio. See the ticket.
+- **Tier 1 (automatic).** When a search returns a hash-matched sub, every other sub is handed back
+  with `?ref=<id>` and reference-aligned to that anchor on fetch (`ffsubsync`, no audio).
+- **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
+  non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon runs `alass`
+  against the stream audio server-side and the app swaps in the re-synced track.
+
+Known gap: Tier 1 needs a hash-matched anchor in the results. When the search returns *no* hash
+match — the common out-of-sync case — there is no trusted reference, so Tier 1 stays off and the sub
+is served as-is; only the Tier-2 resync closes it. See the ticket.
+
+Deploy note: the addon builds the `/subtitle` and `/translate` URLs it hands back to the app from
+its own origin. On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host`
+header is fine — leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients
+(i.e. exposed publicly), set `PUBLIC_BASE_URL` to the real origin (see `.env.example`): a client
+controls its own `Host` header, so an unset origin lets a forged header steer those URLs at an
+attacker's server.
