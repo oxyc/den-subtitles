@@ -177,19 +177,19 @@ pub async fn handle_subtitles(
     opensubtitles::rank(&mut subs, filename.as_deref());
 
     let base = self_base(state, headers, config);
-    // Tier 1 auto-sync reference: the (any-language) hash-matched sub is authored against this exact
-    // file, so it's a trusted timing reference for aligning the non-hash-matched subs.
-    let reference = subs.iter().find(|s| s.hash_match).map(|s| s.file_id);
+    // Tier-1 auto-sync anchor: any hash-matched sub is a trusted, already-in-sync timing reference
+    // for the rest. `None` when auto-sync is off for this install, or when the search returned no
+    // hash match at all — the out-of-sync gap Tier-1 can't close (see `tier1_reference`); either way
+    // those subs are served as-is and only the Tier-2 audio resync (a user action) can fix them.
+    let reference = if cfg.auto_sync { tier1_reference(&subs) } else { None };
     let out: Vec<Value> = subs
         .iter()
         .map(|s| {
-            // Non-hash subs get `?ref=<id>` so the proxy reference-aligns them on fetch; a hash match
-            // is already in sync and served as-is.
+            // A sub that needs Tier-1 gets `?ref=<id>` so the proxy reference-aligns it on fetch; a
+            // hash match (or anything, when there's no anchor) is served as-is.
             let mut url = format!("{base}/subtitle/{}.srt", s.file_id);
-            if !s.hash_match {
-                if let Some(ref_id) = reference.filter(|&r| r != s.file_id) {
-                    url = format!("{url}?ref={ref_id}");
-                }
+            if let Some(ref_id) = tier1_ref_for(s, reference) {
+                url = format!("{url}?ref={ref_id}");
             }
             // Standard Stremio fields (id/url/lang) plus Den-specific detail the app renders in the
             // subtitle picker; a generic client ignores the unknown fields.
@@ -211,6 +211,28 @@ pub async fn handle_subtitles(
     httputil::json(StatusCode::OK, &json!({"subtitles": out}), "public, max-age=3600")
 }
 
+/// The `file_id` of a trusted timing reference for Tier-1 reference alignment: any hash-matched sub,
+/// authored against this exact encode, so its timing is correct by construction (language doesn't
+/// matter — timing is language-independent).
+///
+/// `None` when the search produced no hash match at all. That is the gap behind the out-of-sync
+/// complaint: with no trusted anchor we deliberately do NOT align to an untrusted sub (that could
+/// make timing worse), so those subs are served as-is and only the Tier-2 audio resync — a user
+/// action, see `is_safe_resync_url` — can fix them.
+fn tier1_reference(subs: &[opensubtitles::Subtitle]) -> Option<i64> {
+    subs.iter().find(|s| s.hash_match).map(|s| s.file_id)
+}
+
+/// The reference `s` should be Tier-1 aligned against on fetch (`?ref=`), or `None` when it needs no
+/// alignment: a hash match is already in sync, a sub can't be aligned to itself, and with no anchor
+/// nothing is aligned.
+fn tier1_ref_for(s: &opensubtitles::Subtitle, reference: Option<i64>) -> Option<i64> {
+    if s.hash_match {
+        return None;
+    }
+    reference.filter(|&r| r != s.file_id)
+}
+
 /// GET /<config>/subtitle/<file_id>.srt[?ref=<id>|?resync=<url>] — download one OpenSubtitles file,
 /// optionally auto-sync it (Tier 1 against a reference sub, or Tier 2 against the stream audio),
 /// cache, serve. Any sync failure falls back to the raw sub — a slightly-off sub beats none.
@@ -225,11 +247,7 @@ pub async fn handle_subtitle_file(
         return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
-    let cache_key = match (&resync_url, ref_id) {
-        (Some(url), _) => format!("os:{file_id}:resync:{}", short_hash(url)),
-        (None, Some(r)) => format!("os:{file_id}:ref:{r}"),
-        (None, None) => format!("os:{file_id}"),
-    };
+    let cache_key = sync_cache_key(file_id, &resync_url, ref_id);
     if let Some(hit) = state.cache.get(&cache_key) {
         return httputil::srt(hit);
     }
@@ -303,9 +321,13 @@ fn is_safe_resync_url(u: &str) -> bool {
     let Some((_, rest)) = u.split_once("://") else { return false };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // Strip a :port (naive; fine for the hostnames/IPv4 we see — bracketed IPv6 handled below).
-    let host = host.trim_start_matches('[');
-    let host = host.split([']', ':']).next().unwrap_or(host);
+    // Unwrap the host from an optional `[IPv6]:port` / `host:port`. A bracketed literal must be read
+    // to its closing `]` (an IPv6 address is full of colons); only a bare host/IPv4 splits on `:`.
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
     let host_lc = host.to_ascii_lowercase();
     if host_lc == "localhost" || host_lc.ends_with(".localhost") {
         return false;
@@ -314,6 +336,18 @@ fn is_safe_resync_url(u: &str) -> bool {
         Ok(std::net::IpAddr::V4(v4)) => !(v4.is_loopback() || v4.is_link_local()),
         Ok(std::net::IpAddr::V6(v6)) => !v6.is_loopback(),
         Err(_) => true, // a hostname (not a literal IP) — allowed; we don't resolve it here
+    }
+}
+
+/// Cache key for one proxied subtitle, namespaced by sync mode so the raw / reference-aligned /
+/// audio-resynced variants of the same `file_id` never collide (else an aligned sub would be served
+/// from the raw entry, or vice versa). A resync URL takes precedence over a `ref` — it's the
+/// stronger Tier-2 correction — mirroring the dispatch in `handle_subtitle_file`.
+fn sync_cache_key(file_id: i64, resync_url: &Option<String>, ref_id: Option<i64>) -> String {
+    match (resync_url, ref_id) {
+        (Some(url), _) => format!("os:{file_id}:resync:{}", short_hash(url)),
+        (None, Some(r)) => format!("os:{file_id}:ref:{r}"),
+        (None, None) => format!("os:{file_id}"),
     }
 }
 
@@ -424,5 +458,95 @@ fn type_of(season: Option<i64>) -> &'static str {
         "series"
     } else {
         "movie"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opensubtitles::Subtitle;
+
+    fn sub(file_id: i64, hash_match: bool) -> Subtitle {
+        Subtitle {
+            file_id,
+            lang: "en".into(),
+            hash_match,
+            downloads: 0,
+            release: String::new(),
+            hd: false,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            ratings: 0.0,
+        }
+    }
+
+    #[test]
+    fn tier1_reference_is_the_hash_match_or_none() {
+        // No hash match anywhere → no anchor. This is the out-of-sync gap: Tier-1 can't run.
+        assert_eq!(tier1_reference(&[sub(1, false), sub(2, false)]), None);
+        // A hash match becomes the anchor (the first one encountered).
+        assert_eq!(tier1_reference(&[sub(1, false), sub(2, true), sub(3, true)]), Some(2));
+    }
+
+    #[test]
+    fn tier1_ref_for_skips_hash_matches_self_and_missing_anchor() {
+        let anchor = Some(2);
+        // A non-hash sub aligns to the anchor.
+        assert_eq!(tier1_ref_for(&sub(1, false), anchor), Some(2));
+        // The hash-matched anchor is already in sync — no alignment.
+        assert_eq!(tier1_ref_for(&sub(2, true), anchor), None);
+        // A sub is never aligned to itself (its own id as the anchor is a no-op).
+        assert_eq!(tier1_ref_for(&sub(2, false), anchor), None);
+        // With no anchor, nothing is aligned — the gap case, served as-is.
+        assert_eq!(tier1_ref_for(&sub(1, false), None), None);
+    }
+
+    #[test]
+    fn sync_cache_key_separates_raw_ref_and_resync() {
+        let raw = sync_cache_key(5, &None, None);
+        let aligned = sync_cache_key(5, &None, Some(9));
+        let resynced = sync_cache_key(5, &Some("http://host/s.mkv".into()), None);
+        assert_eq!(raw, "os:5");
+        assert_eq!(aligned, "os:5:ref:9");
+        assert!(resynced.starts_with("os:5:resync:"));
+        // The three variants must never collide — else an aligned sub is served from the raw entry.
+        assert_ne!(raw, aligned);
+        assert_ne!(raw, resynced);
+        assert_ne!(aligned, resynced);
+        // resync (Tier-2) takes precedence over a ref (Tier-1) when both are present.
+        let both = sync_cache_key(5, &Some("http://host/s.mkv".into()), Some(9));
+        assert_eq!(both, resynced);
+    }
+
+    #[test]
+    fn resync_guard_allows_lan_streams() {
+        // The stream lives on the user's LAN (den-scout on a private IP), so private ranges and
+        // ordinary hostnames must be reachable.
+        assert!(is_safe_resync_url("http://192.168.1.10:8080/stream.mkv"));
+        assert!(is_safe_resync_url("http://10.0.0.5/a.mkv"));
+        assert!(is_safe_resync_url("http://172.16.3.4/a.mkv"));
+        assert!(is_safe_resync_url("https://stream.example.com/a.mkv"));
+        // A public IPv6 stream host, bracketed with a port, is still reachable.
+        assert!(is_safe_resync_url("http://[2001:db8::1]:8080/a.mkv"));
+    }
+
+    #[test]
+    fn resync_guard_blocks_loopback_linklocal_and_bad_schemes() {
+        // Loopback / localhost / link-local (incl. the cloud-metadata endpoint) are refused.
+        assert!(!is_safe_resync_url("http://127.0.0.1/a.mkv"));
+        assert!(!is_safe_resync_url("http://localhost:8080/a.mkv"));
+        assert!(!is_safe_resync_url("http://sub.localhost/a.mkv"));
+        assert!(!is_safe_resync_url("http://169.254.169.254/latest/meta-data/"));
+        // IPv6 loopback, bracketed — the case the old naive `:`-split let through.
+        assert!(!is_safe_resync_url("http://[::1]/a.mkv"));
+        assert!(!is_safe_resync_url("http://[::1]:8080/a.mkv"));
+        // userinfo must not smuggle a blocked host past the check.
+        assert!(!is_safe_resync_url("http://user@127.0.0.1/a.mkv"));
+        // Only http(s); no file/ftp/empty.
+        assert!(!is_safe_resync_url("file:///etc/passwd"));
+        assert!(!is_safe_resync_url("ftp://host/a.mkv"));
+        assert!(!is_safe_resync_url(""));
     }
 }
