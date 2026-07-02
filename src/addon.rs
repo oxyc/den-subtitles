@@ -152,15 +152,17 @@ pub async fn handle_subtitles(
         // Ask for everything; the app filters/selects by its own preferred-language rules.
         match client.search(&imdb, season, episode, "all", hash.as_deref()).await {
             Ok(s) => {
+                state.os_fails.store(0, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(json) = serde_json::to_string(&s) {
                     state.cache.put(search_key, json, SEARCH_TTL);
                 }
                 s
             }
             // Empty-200 is the correct Stremio shape for "nothing", but log the cause (our error
-            // strings carry no key) so an upstream/quota failure isn't invisible.
+            // strings carry no key) and count it so /health can report `degraded` (ADDON-02).
             Err(e) => {
                 eprintln!("subtitles: opensubtitles search failed for {imdb}: {e}");
+                state.os_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
             }
         }

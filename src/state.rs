@@ -1,6 +1,7 @@
 //! Shared application state: one pooled HTTP client, the artifact cache, and the sync tools, wired
 //! from `Config` and cloned (behind `Arc`) into every connection.
 
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,8 @@ pub struct AppState {
     pub http: Option<reqwest::Client>,
     pub cache: Cache,
     pub sync: SyncTools,
+    /// Consecutive OpenSubtitles search failures — surfaced as `degraded` on /health (ADDON-02).
+    pub os_fails: AtomicU32,
 }
 
 impl AppState {
@@ -41,6 +44,6 @@ impl AppState {
         };
         // Disk tier under CACHE_DIR/store so a restart/redeploy doesn't cold-start the cache.
         let cache = Cache::new(cfg.cache_max_bytes as usize, Some(cfg.cache_dir.join("store")));
-        Arc::new(AppState { cfg, http, cache, sync })
+        Arc::new(AppState { cfg, http, cache, sync, os_fails: AtomicU32::new(0) })
     }
 }

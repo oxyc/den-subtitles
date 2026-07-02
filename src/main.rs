@@ -36,12 +36,24 @@ use crate::state::AppState;
 /// The /configure page, embedded so the binary is self-contained.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
 
+/// Consecutive OpenSubtitles failures before /health reports `degraded` (ADDON-02).
+const HEALTH_FAIL_THRESHOLD: u32 = 3;
+
 pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Incoming>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
     let path = parts.uri.path();
 
     match path {
-        "/health" => return httputil::text(StatusCode::OK, "ok"),
+        // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when OpenSubtitles has been
+        // failing so the app's Plugins screen can surface it.
+        "/health" => {
+            let body = if state.os_fails.load(std::sync::atomic::Ordering::Relaxed) >= HEALTH_FAIL_THRESHOLD {
+                serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "OpenSubtitles has been failing"})
+            } else {
+                serde_json::json!({"status": "ok"})
+            };
+            return httputil::json(StatusCode::OK, &body, "no-store");
+        }
         "/manifest.json" => return httputil::json(StatusCode::OK, &addon::manifest(false), "public, max-age=3600"),
         "/" | "/configure" | "/configure/" => {
             return httputil::html(StatusCode::OK, CONFIGURE_PAGE, "public, max-age=3600")
