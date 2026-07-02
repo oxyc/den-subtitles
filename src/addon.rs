@@ -11,6 +11,7 @@
 //! `<id>` is `tt<digits>` or `tt<digits>:<season>:<episode>`. `<extra>` is the Stremio query blob
 //! carrying `videoHash`/`videoSize` (the OSHash the app computed).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +29,9 @@ const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60); // 60 days �
 // Search results turn over as new subs are uploaded, so a short TTL — enough to spare repeated
 // round-trips when the app reopens a title, not so long that fresh uploads stay hidden.
 const SEARCH_TTL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
+
+/// Monotonic counter making sync scratch-file names unique per invocation.
+static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn manifest(configured: bool) -> Value {
     json!({
@@ -246,8 +250,10 @@ pub async fn handle_subtitle_file(
         }
     };
 
-    let tag = cache_key.replace(':', "-");
-    let synced: Option<String> = if let Some(url) = resync_url.filter(|u| is_http_url(u)) {
+    // Per-invocation unique temp tag: two concurrent requests for the same file must not share
+    // scratch paths (one would read the other's half-written output and cache it for 60 days).
+    let tag = format!("{}-{}", cache_key.replace(':', "-"), SYNC_SEQ.fetch_add(1, Ordering::Relaxed));
+    let synced: Option<String> = if let Some(url) = resync_url.filter(|u| is_safe_resync_url(u)) {
         // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
         match state.sync.sync_to_audio(&target, &url, &tag).await {
             Ok(s) => Some(s),
@@ -284,6 +290,31 @@ async fn subtitle_srt(state: &Arc<AppState>, client: &opensubtitles::Client<'_>,
 
 fn is_http_url(u: &str) -> bool {
     u.starts_with("http://") || u.starts_with("https://")
+}
+
+/// A resync target we're willing to fetch server-side (SSRF guard). The stream lives on the LAN
+/// (den-scout on a private IP), so we can't blanket-deny private ranges — but we DO deny loopback
+/// and link-local, which blocks the cloud-metadata endpoint (169.254.169.254) and localhost probes
+/// while still allowing the user's own 192.168/10/172.16 stream host.
+fn is_safe_resync_url(u: &str) -> bool {
+    if !is_http_url(u) {
+        return false;
+    }
+    let Some((_, rest)) = u.split_once("://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // Strip a :port (naive; fine for the hostnames/IPv4 we see — bracketed IPv6 handled below).
+    let host = host.trim_start_matches('[');
+    let host = host.split([']', ':']).next().unwrap_or(host);
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc == "localhost" || host_lc.ends_with(".localhost") {
+        return false;
+    }
+    match host_lc.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => !(v4.is_loopback() || v4.is_link_local()),
+        Ok(std::net::IpAddr::V6(v6)) => !v6.is_loopback(),
+        Err(_) => true, // a hostname (not a literal IP) — allowed; we don't resolve it here
+    }
 }
 
 fn short_hash(s: &str) -> u64 {

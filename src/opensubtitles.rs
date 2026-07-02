@@ -221,11 +221,21 @@ fn tokenize(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// The release group tag — the piece after the last '-', minus any file extension.
+/// The release group tag — the single token after the last '-'. Rejects a hyphen that's part of the
+/// *title* (e.g. "Spider-Man.2002.1080p.BluRay.x264" → tail "Man.2002.1080p…" has dots → not a
+/// group), which would otherwise force a bogus group match between unrelated encodes.
 fn release_group(s: &str) -> Option<String> {
-    let tail = s.rsplit_once('-')?.1;
-    let tail = tail.split(['.', ' ']).next().unwrap_or(tail).trim();
-    (!tail.is_empty()).then(|| tail.to_ascii_lowercase())
+    // Strip a trailing file extension so "…-GROUP.mkv" → "…-GROUP".
+    let stem = match s.rsplit_once('.') {
+        Some((head, ext)) if (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) => head,
+        _ => s,
+    };
+    let tail = stem.rsplit_once('-')?.1;
+    // A real group tag is one token — any '.' or space means the '-' was inside the title/metadata.
+    if tail.is_empty() || tail.contains('.') || tail.contains(' ') {
+        return None;
+    }
+    Some(tail.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -268,5 +278,24 @@ mod tests {
     }
     fn sub_ai(id: i64, lang: &str, dl: i64, release: &str) -> Subtitle {
         Subtitle { ai_translated: true, ..sub(id, lang, false, dl, release) }
+    }
+
+    #[test]
+    fn release_group_ignores_hyphens_in_titles() {
+        // A hyphen in the title must NOT be read as a release group.
+        assert_eq!(release_group("Spider-Man.2002.1080p.BluRay.x264.mkv"), None);
+        assert_eq!(release_group("Spider-Man.2002.480p.DVDRip"), None);
+        // A real trailing group tag still resolves (with or without extension).
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE"), Some("amiable".into()));
+        assert_eq!(release_group("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv"), Some("amiable".into()));
+    }
+
+    #[test]
+    fn spiderman_no_false_group_match() {
+        // The correct 1080p encode must outrank a wrong 480p one that shares the bogus "man" token.
+        let filename = Some("Spider-Man.2002.1080p.BluRay.x264-AMIABLE.mkv");
+        let correct = sub(1, "en", false, 5, "Spider-Man.2002.1080p.BluRay.x264-AMIABLE");
+        let wrong = sub(2, "en", false, 5, "Spider-Man.2002.480p.DVDRip");
+        assert!(fit_score(&correct, filename) > fit_score(&wrong, filename));
     }
 }
