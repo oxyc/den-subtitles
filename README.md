@@ -76,6 +76,9 @@ Known gap: Tier 1 needs a hash-matched anchor in the results. When the search re
 match — the common out-of-sync case — there is no trusted reference, so Tier 1 stays off and the sub
 is served as-is; only the Tier-2 resync closes it. See the ticket.
 
-Deploy note: set `PUBLIC_BASE_URL` in production (see `.env.example`) so the `/subtitle` and
-`/translate` URLs handed back to the app are pinned to the real origin rather than derived from a
-client-controlled `Host` / `X-Forwarded-Host` header.
+Deploy note: the addon builds the `/subtitle` and `/translate` URLs it hands back to the app from
+its own origin. On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host`
+header is fine — leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients
+(i.e. exposed publicly), set `PUBLIC_BASE_URL` to the real origin (see `.env.example`): a client
+controls its own `Host` header, so an unset origin lets a forged header steer those URLs at an
+attacker's server.
