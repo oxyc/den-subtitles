@@ -10,16 +10,28 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One search hit, reduced to what selection + download need. (De)serializable so a whole search
-/// result can be cached as JSON and rebuilt into a response later.
+/// One search hit, with the metadata needed to rank fit-to-stream and to show detail in the app
+/// picker. (De)serializable so a whole search result caches as JSON and rebuilds into a response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subtitle {
     pub file_id: i64,
     pub lang: String,
     /// True when this subtitle was matched to the exact file by hash → already in sync.
     pub hash_match: bool,
-    /// Download count — the tie-breaker when several subs share a language and none is a hash match.
+    /// Download count — a tie-breaker when several subs share a language and none is a hash match.
     pub downloads: i64,
+    /// The uploader's release string (e.g. "Fight.Club.1999.1080p.BluRay.x264-GROUP") — matched
+    /// against the playing file's name to judge fit.
+    pub release: String,
+    pub hd: bool,
+    /// Frame rate the sub was timed against (0 when unknown) — shown for context.
+    pub fps: f64,
+    pub from_trusted: bool,
+    /// Machine/AI-translated subs are low quality — demoted to the bottom of the ranking.
+    pub machine_translated: bool,
+    pub ai_translated: bool,
+    /// 0–10 community rating.
+    pub ratings: f64,
 }
 
 pub struct Client<'a> {
@@ -69,10 +81,9 @@ impl<'a> Client<'a> {
             return Err(format!("opensubtitles search {}", resp.status()));
         }
         let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
-        let mut subs = parse_search(&v);
-        // Hash matches first (already in sync), then most-downloaded (community-vetted timing).
-        subs.sort_by(|a, b| b.hash_match.cmp(&a.hash_match).then(b.downloads.cmp(&a.downloads)));
-        Ok(subs)
+        // Returned unranked (and cached that way — the ranking is filename-specific, so the handler
+        // ranks per request against the playing file).
+        Ok(parse_search(&v))
     }
 
     /// Resolve a `file_id` to a temporary download link, then fetch the subtitle text.
@@ -116,15 +127,105 @@ fn parse_search(v: &Value) -> Vec<Subtitle> {
             lang: attrs["language"].as_str().unwrap_or("").to_string(),
             hash_match: attrs["moviehash_match"].as_bool().unwrap_or(false),
             downloads: attrs["download_count"].as_i64().unwrap_or(0),
+            release: attrs["release"].as_str().unwrap_or("").to_string(),
+            hd: attrs["hd"].as_bool().unwrap_or(false),
+            fps: attrs["fps"].as_f64().unwrap_or(0.0),
+            from_trusted: attrs["from_trusted"].as_bool().unwrap_or(false),
+            machine_translated: attrs["machine_translated"].as_bool().unwrap_or(false),
+            ai_translated: attrs["ai_translated"].as_bool().unwrap_or(false),
+            ratings: attrs["ratings"].as_f64().unwrap_or(0.0),
         });
     }
     out
 }
 
-/// Pick the best subtitle for a wanted language: a hash match if any, else the most-downloaded.
-/// (`search` already sorts that way, so this is just the first match in `lang`.)
+/// Score a subtitle's fit to the playing file. A hash match is decisive; otherwise release/filename
+/// overlap dominates (same encode ⇒ same timing), with trust/ratings/downloads as tie-breakers.
+/// Machine/AI-translated subs are pushed below everything.
+pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
+    const HASH: i64 = 1_000_000;
+    const JUNK: i64 = 2_000_000; // demote machine/AI below even a no-info sub
+    let mut score = 0i64;
+    if s.hash_match {
+        score += HASH;
+    }
+    if let Some(f) = filename {
+        score += release_fit(f, &s.release);
+    }
+    if s.from_trusted {
+        score += 400;
+    }
+    score += (s.ratings.clamp(0.0, 10.0) * 100.0) as i64; // 0..1000
+    score += (((s.downloads.max(0) as f64).ln_1p()) * 60.0) as i64; // ~0..700
+    if s.machine_translated || s.ai_translated {
+        score -= JUNK;
+    }
+    score
+}
+
+/// Order subtitles for the picker: grouped by language, best-fit first within each language. The
+/// app's own dedupe-keep-first then naturally keeps the optimal sub per language.
+pub fn rank(subs: &mut [Subtitle], filename: Option<&str>) {
+    subs.sort_by(|a, b| {
+        a.lang
+            .cmp(&b.lang)
+            .then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
+    });
+}
+
+/// Best subtitle for a wanted language by fit score (hash match, then quality) — independent of any
+/// prior ordering.
 pub fn best_for<'s>(subs: &'s [Subtitle], lang: &str) -> Option<&'s Subtitle> {
-    subs.iter().find(|s| s.lang.eq_ignore_ascii_case(lang))
+    subs.iter()
+        .filter(|s| s.lang.eq_ignore_ascii_case(lang))
+        .max_by_key(|s| fit_score(s, None))
+}
+
+/// Significant release tokens shared between the file name and a sub's release string imply the same
+/// encode (hence the same timing). Weight resolution/source/codec, and reward a matching group tag.
+fn release_fit(filename: &str, release: &str) -> i64 {
+    if release.is_empty() {
+        return 0;
+    }
+    let f = tokenize(filename);
+    let r = tokenize(release);
+    let mut score = 0i64;
+    for (tok, weight) in SIGNIFICANT {
+        if f.iter().any(|t| t == tok) && r.iter().any(|t| t == tok) {
+            score += weight;
+        }
+    }
+    // The release group (the tag after the last '-') is the strongest same-encode signal.
+    if let (Some(gf), Some(gr)) = (release_group(filename), release_group(release)) {
+        if gf == gr {
+            score += 3000;
+        }
+    }
+    score
+}
+
+/// Resolution/source/codec tokens and their weights (higher = stronger same-encode evidence).
+const SIGNIFICANT: &[(&str, i64)] = &[
+    ("2160p", 800), ("1080p", 800), ("720p", 800), ("480p", 800),
+    ("bluray", 600), ("blu", 600), ("bdrip", 600), ("brrip", 600), ("remux", 600),
+    ("web", 500), ("webrip", 500), ("webdl", 500), ("hdtv", 500), ("dvdrip", 500), ("hdrip", 500),
+    ("x264", 200), ("x265", 200), ("h264", 200), ("h265", 200), ("hevc", 200), ("avc", 200),
+];
+
+/// Lowercase alphanumeric tokens.
+fn tokenize(s: &str) -> Vec<String> {
+    s.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The release group tag — the piece after the last '-', minus any file extension.
+fn release_group(s: &str) -> Option<String> {
+    let tail = s.rsplit_once('-')?.1;
+    let tail = tail.split(['.', ' ']).next().unwrap_or(tail).trim();
+    (!tail.is_empty()).then(|| tail.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -133,16 +234,39 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parses_and_orders_results() {
+    fn parses_results() {
         let v = json!({"data": [
             {"attributes": {"language": "en", "moviehash_match": false, "download_count": 10,
-                "release": "WEB", "files": [{"file_id": 1}]}},
-            {"attributes": {"language": "sv", "moviehash_match": true, "download_count": 2,
-                "release": "BluRay", "files": [{"file_id": 2}]}},
+                "release": "Fight.Club.1999.1080p.BluRay.x264-AMIABLE", "files": [{"file_id": 1}]}},
+            {"attributes": {"language": "en", "moviehash_match": false, "download_count": 999,
+                "release": "Fight.Club.720p.WEB", "ai_translated": true, "files": [{"file_id": 2}]}},
         ]});
-        let mut subs = parse_search(&v);
-        subs.sort_by(|a, b| b.hash_match.cmp(&a.hash_match).then(b.downloads.cmp(&a.downloads)));
-        assert_eq!(subs[0].file_id, 2); // hash match first
-        assert_eq!(best_for(&subs, "en").unwrap().file_id, 1);
+        let subs = parse_search(&v);
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].release, "Fight.Club.1999.1080p.BluRay.x264-AMIABLE");
+    }
+
+    #[test]
+    fn ranks_hash_then_stream_fit_and_demotes_machine() {
+        let hashed = sub(1, "en", true, 5, "whatever");
+        let fits = sub(2, "en", false, 5, "Fight.Club.1999.1080p.BluRay.x264-AMIABLE");
+        let popular_junk = sub_ai(3, "en", 99999, "Fight.Club.1999.1080p.BluRay.x264-AMIABLE");
+        let filename = Some("Fight.Club.1999.1080p.BluRay.x264-AMIABLE.mkv");
+        // hash match beats a perfect release match
+        assert!(fit_score(&hashed, filename) > fit_score(&fits, filename));
+        // a release/group match beats an unrelated sub
+        assert!(fit_score(&fits, filename) > fit_score(&sub(9, "en", false, 5, "Random.CAM"), filename));
+        // machine/AI is demoted below a plain sub despite huge downloads
+        assert!(fit_score(&popular_junk, filename) < fit_score(&sub(9, "en", false, 0, ""), filename));
+    }
+
+    fn sub(id: i64, lang: &str, hash: bool, dl: i64, release: &str) -> Subtitle {
+        Subtitle {
+            file_id: id, lang: lang.into(), hash_match: hash, downloads: dl, release: release.into(),
+            hd: false, fps: 0.0, from_trusted: false, machine_translated: false, ai_translated: false, ratings: 0.0,
+        }
+    }
+    fn sub_ai(id: i64, lang: &str, dl: i64, release: &str) -> Subtitle {
+        Subtitle { ai_translated: true, ..sub(id, lang, false, dl, release) }
     }
 }

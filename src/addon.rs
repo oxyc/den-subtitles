@@ -89,11 +89,13 @@ fn parse_id(id: &str) -> Option<(String, Option<i64>, Option<i64>)> {
     Some((imdb.to_string(), season, episode))
 }
 
-/// Pull `videoHash` out of the Stremio extra-args blob (already `.json`-stripped).
-fn extra_hash(extra: &str) -> Option<String> {
+/// Pull a `key=value` field out of the Stremio extra-args blob (already `.json`-stripped). The
+/// client sends `videoHash`, `videoSize`, and `filename` here.
+fn extra_field(extra: &str, key: &str) -> Option<String> {
     let decoded = percent_decode(extra);
+    let prefix = format!("{key}=");
     for pair in decoded.split('&') {
-        if let Some(v) = pair.strip_prefix("videoHash=") {
+        if let Some(v) = pair.strip_prefix(&prefix) {
             if !v.is_empty() {
                 return Some(v.to_string());
             }
@@ -125,15 +127,17 @@ pub async fn handle_subtitles(
 
     // Cache the search result itself (config-independent: file_ids/langs are the same for everyone),
     // keyed by the query params incl. the file hash. Short TTL — new subs get uploaded — but enough
-    // to spare a live round-trip every time the app reopens a title.
-    let hash = extra_hash(extra);
+    // to spare a live round-trip every time the app reopens a title. Ranking is filename-specific, so
+    // it is NOT baked into the cached list — we rank per request below.
+    let hash = extra_field(extra, "videoHash");
+    let filename = extra_field(extra, "filename");
     let search_key = format!(
         "search:{imdb}:{}:{}:{}",
         season.unwrap_or(0),
         episode.unwrap_or(0),
         hash.as_deref().unwrap_or("")
     );
-    let subs: Vec<opensubtitles::Subtitle> = if let Some(hit) = state
+    let mut subs: Vec<opensubtitles::Subtitle> = if let Some(hit) = state
         .cache
         .get(&search_key)
         .and_then(|h| serde_json::from_str(&h).ok())
@@ -162,14 +166,28 @@ pub async fn handle_subtitles(
         }
     };
 
+    // Rank for THIS stream: hash-match, then release/filename fit, then quality; grouped by language
+    // best-first. Machine/AI subs sink to the bottom.
+    opensubtitles::rank(&mut subs, filename.as_deref());
+
     let base = self_base(state, headers, config);
     let out: Vec<Value> = subs
         .iter()
         .map(|s| {
+            // Standard Stremio fields (id/url/lang) plus Den-specific detail the app renders in the
+            // subtitle picker; a generic client ignores the unknown fields.
             json!({
                 "id": format!("os-{}", s.file_id),
                 "url": format!("{base}/subtitle/{}.srt", s.file_id),
                 "lang": s.lang,
+                "release": s.release,
+                "hd": s.hd,
+                "fps": s.fps,
+                "hashMatch": s.hash_match,
+                "trusted": s.from_trusted,
+                "downloads": s.downloads,
+                "machineTranslated": s.machine_translated,
+                "aiTranslated": s.ai_translated,
             })
         })
         .collect();
