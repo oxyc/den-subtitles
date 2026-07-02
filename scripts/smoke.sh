@@ -35,11 +35,15 @@ curl -s "$BASE/manifest.json" | python3 -m json.tool | sed 's/^/    /'
 
 echo "→ subtitles search for $IMDB (hash-matches sort first):"
 SUBS=$(curl -s "$BASE/subtitles/movie/$IMDB.json")
+# NOTE: the url embeds the config blob, which is base64 (not encryption) of your keys — so we
+# redact it to <config> here. Addon URLs are bearer secrets; never print or log them.
 echo "$SUBS" | python3 -c '
-import json,sys
+import json,sys,re
 d=json.load(sys.stdin); subs=d.get("subtitles",[])
-print(f"    {len(subs)} results")
-for s in subs[:8]: print(f"    - {s[\"lang\"]:5} {s[\"id\"]:12} {s[\"url\"]}")
+print("    %d results" % len(subs))
+for s in subs[:8]:
+    safe = re.sub(r"/[A-Za-z0-9_-]{20,}/", "/<config>/", s["url"])
+    print("    - %-5s %-14s %s" % (s["lang"], s["id"], safe))
 '
 
 FIRST=$(echo "$SUBS" | python3 -c 'import json,sys; s=json.load(sys.stdin)["subtitles"]; print(s[0]["url"] if s else "")')
