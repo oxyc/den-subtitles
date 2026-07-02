@@ -7,10 +7,12 @@
 //! construction. The Den app computes the OSHash of the playing file and sends it as `videoHash`;
 //! we forward it straight through and float the matches to the top.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One search hit, reduced to what selection + download need.
-#[derive(Debug, Clone)]
+/// One search hit, reduced to what selection + download need. (De)serializable so a whole search
+/// result can be cached as JSON and rebuilt into a response later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subtitle {
     pub file_id: i64,
     pub lang: String,

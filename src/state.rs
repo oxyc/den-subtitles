@@ -39,7 +39,8 @@ impl AppState {
             alass: cfg.alass.clone(),
             work_dir: cfg.cache_dir.join("sync"),
         };
-        let cache = Cache::new(cfg.cache_max_bytes as usize);
+        // Disk tier under CACHE_DIR/store so a restart/redeploy doesn't cold-start the cache.
+        let cache = Cache::new(cfg.cache_max_bytes as usize, Some(cfg.cache_dir.join("store")));
         Arc::new(AppState { cfg, http, cache, sync })
     }
 }

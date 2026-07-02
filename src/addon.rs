@@ -25,6 +25,9 @@ use crate::userconfig::{self, LlmConfig, UserConfig};
 use crate::{srt, translate};
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60); // 60 days — mirrors the app cache
+// Search results turn over as new subs are uploaded, so a short TTL — enough to spare repeated
+// round-trips when the app reopens a title, not so long that fresh uploads stay hidden.
+const SEARCH_TTL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
 
 pub fn manifest(configured: bool) -> Value {
     json!({
@@ -120,22 +123,42 @@ pub async fn handle_subtitles(
         return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
     };
 
-    let client = opensubtitles::Client {
-        http,
-        api_key: &cfg.opensubtitles_key,
-        token: cfg.opensubtitles_token.as_deref(),
-    };
-    // Ask for everything; the app filters/selects by its own preferred-language rules.
-    let subs = match client
-        .search(&imdb, season, episode, "all", extra_hash(extra).as_deref())
-        .await
+    // Cache the search result itself (config-independent: file_ids/langs are the same for everyone),
+    // keyed by the query params incl. the file hash. Short TTL — new subs get uploaded — but enough
+    // to spare a live round-trip every time the app reopens a title.
+    let hash = extra_hash(extra);
+    let search_key = format!(
+        "search:{imdb}:{}:{}:{}",
+        season.unwrap_or(0),
+        episode.unwrap_or(0),
+        hash.as_deref().unwrap_or("")
+    );
+    let subs: Vec<opensubtitles::Subtitle> = if let Some(hit) = state
+        .cache
+        .get(&search_key)
+        .and_then(|h| serde_json::from_str(&h).ok())
     {
-        Ok(s) => s,
-        // Empty-200 is the correct Stremio shape for "nothing", but log the cause (our error strings
-        // carry no key) so an upstream/quota failure isn't invisible.
-        Err(e) => {
-            eprintln!("subtitles: opensubtitles search failed for {imdb}: {e}");
-            return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
+        hit
+    } else {
+        let client = opensubtitles::Client {
+            http,
+            api_key: &cfg.opensubtitles_key,
+            token: cfg.opensubtitles_token.as_deref(),
+        };
+        // Ask for everything; the app filters/selects by its own preferred-language rules.
+        match client.search(&imdb, season, episode, "all", hash.as_deref()).await {
+            Ok(s) => {
+                if let Ok(json) = serde_json::to_string(&s) {
+                    state.cache.put(search_key, json, SEARCH_TTL);
+                }
+                s
+            }
+            // Empty-200 is the correct Stremio shape for "nothing", but log the cause (our error
+            // strings carry no key) so an upstream/quota failure isn't invisible.
+            Err(e) => {
+                eprintln!("subtitles: opensubtitles search failed for {imdb}: {e}");
+                return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
+            }
         }
     };
 
