@@ -12,10 +12,8 @@
 //! Each tier shells out to a binary (`ffsubsync`, `alass`) exactly like reel drives yt-dlp/ffmpeg —
 //! the CPU work lives in the subprocess, not this runtime.
 //!
-//! Staged: this module is built and tested but not yet invoked from the request path — Tier 1 wires
-//! into the subtitle proxy and Tier 2 into a `/resync` endpoint in the next increment. The
-//! allow(dead_code) keeps the addon-level `clippy -D warnings` green until then.
-#![allow(dead_code)]
+//! Wired into the subtitle proxy: a `?ref=<file_id>` on `/subtitle/…` runs Tier 1 against that
+//! (hash-matched) reference; a `?resync=<stream-url>` runs Tier 2 against the audio.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -24,13 +22,6 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
-
-/// Which alignment engine ran, for logging/telemetry and so the caller can label the result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tier {
-    Reference,
-    Audio,
-}
 
 /// Binary paths + work dir, from env. Defaults assume the binaries are on PATH (the container
 /// installs them).

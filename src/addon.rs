@@ -173,14 +173,25 @@ pub async fn handle_subtitles(
     opensubtitles::rank(&mut subs, filename.as_deref());
 
     let base = self_base(state, headers, config);
+    // Tier 1 auto-sync reference: the (any-language) hash-matched sub is authored against this exact
+    // file, so it's a trusted timing reference for aligning the non-hash-matched subs.
+    let reference = subs.iter().find(|s| s.hash_match).map(|s| s.file_id);
     let out: Vec<Value> = subs
         .iter()
         .map(|s| {
+            // Non-hash subs get `?ref=<id>` so the proxy reference-aligns them on fetch; a hash match
+            // is already in sync and served as-is.
+            let mut url = format!("{base}/subtitle/{}.srt", s.file_id);
+            if !s.hash_match {
+                if let Some(ref_id) = reference.filter(|&r| r != s.file_id) {
+                    url = format!("{url}?ref={ref_id}");
+                }
+            }
             // Standard Stremio fields (id/url/lang) plus Den-specific detail the app renders in the
             // subtitle picker; a generic client ignores the unknown fields.
             json!({
                 "id": format!("os-{}", s.file_id),
-                "url": format!("{base}/subtitle/{}.srt", s.file_id),
+                "url": url,
                 "lang": s.lang,
                 "release": s.release,
                 "hd": s.hd,
@@ -196,12 +207,25 @@ pub async fn handle_subtitles(
     httputil::json(StatusCode::OK, &json!({"subtitles": out}), "public, max-age=3600")
 }
 
-/// GET /<config>/subtitle/<file_id>.srt — download one OpenSubtitles file, cache, serve.
-pub async fn handle_subtitle_file(state: &Arc<AppState>, config: &str, file_id: i64) -> Response<Body> {
+/// GET /<config>/subtitle/<file_id>.srt[?ref=<id>|?resync=<url>] — download one OpenSubtitles file,
+/// optionally auto-sync it (Tier 1 against a reference sub, or Tier 2 against the stream audio),
+/// cache, serve. Any sync failure falls back to the raw sub — a slightly-off sub beats none.
+pub async fn handle_subtitle_file(
+    state: &Arc<AppState>,
+    config: &str,
+    file_id: i64,
+    ref_id: Option<i64>,
+    resync_url: Option<String>,
+) -> Response<Body> {
     let Some(cfg) = userconfig::decode(config) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
     };
-    let cache_key = format!("os:{file_id}");
+    // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
+    let cache_key = match (&resync_url, ref_id) {
+        (Some(url), _) => format!("os:{file_id}:resync:{}", short_hash(url)),
+        (None, Some(r)) => format!("os:{file_id}:ref:{r}"),
+        (None, None) => format!("os:{file_id}"),
+    };
     if let Some(hit) = state.cache.get(&cache_key) {
         return httputil::srt(hit);
     }
@@ -213,17 +237,60 @@ pub async fn handle_subtitle_file(state: &Arc<AppState>, config: &str, file_id: 
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
     };
-    match client.download(file_id).await {
-        Ok(body) => {
-            state.cache.put(cache_key, body.clone(), CACHE_TTL);
-            httputil::srt(body)
-        }
-        // An upstream/quota failure is a bad-gateway condition, not a missing resource.
+
+    let target = match subtitle_srt(state, &client, file_id).await {
+        Ok(body) => body,
         Err(e) => {
             eprintln!("subtitle: download of file {file_id} failed: {e}");
-            httputil::text(StatusCode::BAD_GATEWAY, "upstream subtitle fetch failed")
+            return httputil::text(StatusCode::BAD_GATEWAY, "upstream subtitle fetch failed");
         }
+    };
+
+    let tag = cache_key.replace(':', "-");
+    let synced: Option<String> = if let Some(url) = resync_url.filter(|u| is_http_url(u)) {
+        // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
+        match state.sync.sync_to_audio(&target, &url, &tag).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("subtitle: resync {file_id} failed: {e}");
+                None
+            }
+        }
+    } else if let Some(r) = ref_id {
+        // Tier 1 — reference-align against the hash-matched sub (no audio needed).
+        match subtitle_srt(state, &client, r).await {
+            Ok(reference) => state.sync.sync_to_reference(&target, &reference, &tag).await.ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let body = synced.unwrap_or(target);
+    state.cache.put(cache_key, body.clone(), CACHE_TTL);
+    httputil::srt(body)
+}
+
+/// Fetch a subtitle's SRT, cached by file id (the raw, un-synced text — reused as a sync input).
+async fn subtitle_srt(state: &Arc<AppState>, client: &opensubtitles::Client<'_>, file_id: i64) -> Result<String, String> {
+    let key = format!("os:{file_id}");
+    if let Some(hit) = state.cache.get(&key) {
+        return Ok(hit);
     }
+    let body = client.download(file_id).await?;
+    state.cache.put(key, body.clone(), CACHE_TTL);
+    Ok(body)
+}
+
+fn is_http_url(u: &str) -> bool {
+    u.starts_with("http://") || u.starts_with("https://")
+}
+
+fn short_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// GET /<config>/translate/<type>/<id>/<lang>.(json|srt) — the app-driven translation flow. The app

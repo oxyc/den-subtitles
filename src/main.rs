@@ -82,10 +82,15 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
             addon::handle_subtitles(&state, &parts.headers, config, id, extra).await
         }
         "subtitle" => {
-            // /<config>/subtitle/<file_id>.srt
+            // /<config>/subtitle/<file_id>.srt[?ref=<id>|?resync=<stream-url>]
             let file = segs.get(2).copied().unwrap_or("");
             match file.strip_suffix(".srt").and_then(|n| n.parse::<i64>().ok()) {
-                Some(file_id) => addon::handle_subtitle_file(&state, config, file_id).await,
+                Some(file_id) => {
+                    let query = parts.uri.query().unwrap_or("");
+                    let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
+                    let resync = query_get(query, "resync");
+                    addon::handle_subtitle_file(&state, config, file_id, ref_id, resync).await
+                }
                 None => httputil::text(StatusCode::BAD_REQUEST, "bad file id"),
             }
         }
@@ -111,6 +116,15 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
 
 fn split_path(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// Percent-decoded value of a query parameter, or None.
+fn query_get(query: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix(&prefix))
+        .map(httputil::percent_decode)
 }
 
 fn strip_json(seg: &str) -> Option<&str> {
