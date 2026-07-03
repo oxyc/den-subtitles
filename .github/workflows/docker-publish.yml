@@ -26,6 +26,9 @@ jobs:
 
   build:
     needs: test
+    # Publish only on a v* tag (a deliberate release) or a manual run — NOT every main push. `test`
+    # still runs on every push; the box updates only when you cut a tag.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,14 +48,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          # main → :latest ; a v1.2.3 tag → :1.2.3, :1.2, :1 ; every build → :sha
+          # a v1.2.3 tag → :1.2.3, :1.2, :1, :latest (+ :sha). Publish runs on tags only, so :latest
+          # is unconditional — the newest release is what the box's :latest pull gets.
           tags: |
-            type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest
 
       - uses: docker/setup-buildx-action@v3
 
