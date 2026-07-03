@@ -118,7 +118,7 @@ pub async fn handle_subtitles(
     id: &str,
     extra: &str,
 ) -> Response<Body> {
-    let Some(cfg) = userconfig::decode(config) else {
+    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_config"}), "no-store");
     };
     let Some((imdb, season, episode)) = parse_id(id) else {
@@ -243,7 +243,7 @@ pub async fn handle_subtitle_file(
     ref_id: Option<i64>,
     resync_url: Option<String>,
 ) -> Response<Body> {
-    let Some(cfg) = userconfig::decode(config) else {
+    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
@@ -369,7 +369,7 @@ pub async fn handle_translate(
     lang: &str,
     want_json: bool,
 ) -> Response<Body> {
-    let Some(cfg) = userconfig::decode(config) else {
+    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Translation needs the (optional) LLM credential — a subtitles-only install has none.

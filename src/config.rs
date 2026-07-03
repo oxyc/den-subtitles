@@ -14,6 +14,10 @@ pub struct Config {
     pub public_base_url: Option<String>,
     pub ffsubsync: String,
     pub alass: String,
+    /// Sealed config-in-URL (den-scout/docs/SEALED-CONFIG.md). `config_key` = current X25519 private key
+    /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
+    pub config_key: String,
+    pub config_keys_prev: String,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -37,6 +41,8 @@ impl Config {
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ffsubsync: env_opt("FFSUBSYNC_PATH").unwrap_or_else(|| "ffsubsync".to_string()),
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
+            config_key: env_opt("SUBS_CONFIG_KEY").unwrap_or_default(),
+            config_keys_prev: env_opt("SUBS_CONFIG_KEYS_PREV").unwrap_or_default(),
         }
     }
 }

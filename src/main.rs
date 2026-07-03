@@ -15,6 +15,7 @@ mod config;
 mod fetch;
 mod httputil;
 mod opensubtitles;
+mod seal;
 mod srt;
 mod state;
 mod sync;
@@ -64,6 +65,16 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
         "/" | "/configure" | "/configure/" => {
             return httputil::html(StatusCode::OK, CONFIGURE_PAGE, "public, max-age=3600")
         }
+        // The current X25519 public key (base64) so /configure can seal the config to it; 404 when
+        // sealed configs are disabled (no key) — the page then keeps plaintext (SEALED-CONFIG.md).
+        "/config-key" => {
+            return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
+                Some(pub_b64) if !pub_b64.is_empty() => {
+                    httputil::json(StatusCode::OK, &serde_json::json!({"key": pub_b64}), "public, max-age=3600")
+                }
+                _ => httputil::json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "no_key"}), "no-store"),
+            };
+        }
         _ => {}
     }
 
@@ -72,7 +83,7 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
     let resource = segs.get(1).copied().unwrap_or("");
 
     match resource {
-        "manifest.json" => match userconfig::decode(config) {
+        "manifest.json" => match userconfig::decode(state.config_keyring.as_ref(), config) {
             Some(_) => httputil::json(StatusCode::OK, &addon::manifest(true), "public, max-age=3600"),
             None => httputil::json(StatusCode::BAD_REQUEST, &serde_json::json!({"error": "bad_config"}), "no-store"),
         },

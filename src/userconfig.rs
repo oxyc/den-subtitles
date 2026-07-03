@@ -85,10 +85,17 @@ struct RawConfig {
     auto_sync: Option<bool>,
 }
 
-/// Decode the base64url blob into a validated config, or `None` (→ 400). Mirrors den-scout's
-/// decode → strict-whitelist → clamp seam so an opaque `configId` can slot in later.
-pub fn decode(blob: &str) -> Option<UserConfig> {
+/// Decode the config path segment into a validated config, or `None` (→ 400). The decoded bytes are
+/// either a SEALED blob (first byte == `SEALED_VERSION` → decrypt with the keyring) or a legacy plaintext
+/// JSON config (first byte `{`). Sealed with no keyring, or a decrypt failure, fails CLOSED — never a
+/// partial/empty config. Mirrors den-scout (den-scout/docs/SEALED-CONFIG.md).
+pub fn decode(keyring: Option<&crate::seal::Keyring>, blob: &str) -> Option<UserConfig> {
     let data = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(blob).ok()?;
+    let data = if data.first() == Some(&crate::seal::SEALED_VERSION) {
+        keyring?.open(&data[1..])? // sealed but no key, or decrypt fail → None
+    } else {
+        data // legacy plaintext
+    };
     let raw: RawConfig = serde_json::from_slice(&data).ok()?;
     validate(raw)
 }
@@ -141,7 +148,7 @@ mod tests {
     #[test]
     fn decodes_and_defaults_the_model() {
         let blob = encode(r#"{"provider":"openai","apiKey":"sk-test","osKey":"os-test"}"#);
-        let cfg = decode(&blob).unwrap();
+        let cfg = decode(None, &blob).unwrap();
         let llm = cfg.llm.unwrap();
         assert_eq!(llm.provider, Provider::OpenAI);
         assert_eq!(llm.model, "gpt-4o-mini");
@@ -151,7 +158,7 @@ mod tests {
 
     #[test]
     fn llm_is_optional_when_only_opensubtitles_is_given() {
-        let cfg = decode(&encode(r#"{"osKey":"os-test"}"#)).unwrap();
+        let cfg = decode(None, &encode(r#"{"osKey":"os-test"}"#)).unwrap();
         assert!(cfg.llm.is_none());
         assert_eq!(cfg.opensubtitles_key, "os-test");
     }
@@ -159,10 +166,29 @@ mod tests {
     #[test]
     fn rejects_bad_input() {
         // OpenSubtitles key is always required.
-        assert!(decode(&encode(r#"{"provider":"openai","apiKey":"x"}"#)).is_none());
+        assert!(decode(None, &encode(r#"{"provider":"openai","apiKey":"x"}"#)).is_none());
         // A half-filled AI section (provider, no key) is rejected, not silently dropped.
-        assert!(decode(&encode(r#"{"provider":"openai","osKey":"o"}"#)).is_none());
+        assert!(decode(None, &encode(r#"{"provider":"openai","osKey":"o"}"#)).is_none());
         // Unknown provider.
-        assert!(decode(&encode(r#"{"provider":"acme","apiKey":"x","osKey":"o"}"#)).is_none());
+        assert!(decode(None, &encode(r#"{"provider":"acme","apiKey":"x","osKey":"o"}"#)).is_none());
+    }
+
+    #[test]
+    fn decodes_a_sealed_segment_minted_by_the_browser() {
+        // A fixed segment MINTED by the /configure browser bundle (tweetnacl + blake2b crypto_box_seal),
+        // sealing {osKey, provider, apiKey} to the vector key — the JS→Rust interop gate + full decode
+        // path. Regenerate with scratch/sealsrc/entry.js's denSeal() if the wire format ever changes.
+        const VEC_PRIV: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        const JS_SEG: &str = "Ac3WWHzRZKV9OjdSgIPaNFFhaE9UY0vwxgSO6F5Ghug1nyjlKUodEQmhhlPhX-j1KffJnpj58HPhlpePWcbnuX9GL9rGMsdki1hGXSzRG94ON_aYocvFkl9bSU2QZa8o3waeHHm9wmjLQg";
+        let kr = crate::seal::Keyring::from_env(VEC_PRIV, "").unwrap().unwrap();
+
+        let cfg = decode(Some(&kr), JS_SEG).expect("sealed segment decodes");
+        assert_eq!(cfg.opensubtitles_key, "os-js-ok");
+        assert_eq!(cfg.llm.unwrap().provider, Provider::OpenAI);
+
+        // Fail CLOSED: a sealed segment with no keyring configured.
+        assert!(decode(None, JS_SEG).is_none());
+        // Back-compat: legacy plaintext still decodes with a keyring present.
+        assert!(decode(Some(&kr), &encode(r#"{"osKey":"os-legacy"}"#)).is_some());
     }
 }
