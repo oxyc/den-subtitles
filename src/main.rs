@@ -50,7 +50,9 @@ fn health_body(os_fails: u32) -> serde_json::Value {
     }
 }
 
-pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Incoming>) -> Response<Body> {
+// Generic over the request body: this handler routes on path/query only and discards the body, so tests
+// can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
+pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
     let path = parts.uri.path();
 
@@ -209,6 +211,80 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    // Same fixed vector key + browser-minted sealed segment the seal/userconfig unit tests use, so the
+    // HTTP layer is exercised against a real crypto_box_seal blob, not a mock.
+    const VEC_PRIV_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const VEC_PUB_B64: &str = "j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8=";
+    const JS_SEG: &str = "Ac3WWHzRZKV9OjdSgIPaNFFhaE9UY0vwxgSO6F5Ghug1nyjlKUodEQmhhlPhX-j1KffJnpj58HPhlpePWcbnuX9GL9rGMsdki1hGXSzRG94ON_aYocvFkl9bSU2QZa8o3waeHHm9wmjLQg";
+
+    fn test_state(config_key: &str) -> Arc<AppState> {
+        let cfg = Config {
+            port: 0,
+            cache_dir: std::env::temp_dir().join("den-subtitles-test-cache"),
+            cache_max_bytes: 8 * 1024 * 1024,
+            public_base_url: None,
+            ffsubsync: "ffsubsync".to_string(),
+            alass: "alass".to_string(),
+            config_key: config_key.to_string(),
+            config_keys_prev: String::new(),
+        };
+        AppState::new(cfg)
+    }
+
+    async fn body_string(resp: Response<Body>) -> String {
+        use http_body_util::BodyExt;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // The HTTP-level mirror of den-scout's TestRoutesSealedConfig: drive the real router so a future
+    // refactor that returns the wrong status/body for the sealed, legacy, or /config-key arms fails CI.
+
+    #[tokio::test]
+    async fn config_key_serves_the_pubkey_when_keyring_set() {
+        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/config-key").body(()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp).await.contains(VEC_PUB_B64), "/config-key must serve the derived pubkey");
+    }
+
+    #[tokio::test]
+    async fn config_key_404s_when_sealing_disabled() {
+        let resp = handle_request(test_state(""), Request::builder().uri("/config-key").body(()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sealed_manifest_resolves_end_to_end() {
+        let uri = format!("/{JS_SEG}/manifest.json");
+        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "a sealed URL must resolve the manifest");
+    }
+
+    #[tokio::test]
+    async fn sealed_manifest_fails_closed_without_a_keyring() {
+        let uri = format!("/{JS_SEG}/manifest.json");
+        let resp = handle_request(test_state(""), Request::builder().uri(uri).body(()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "sealed URL with no key must fail closed, not open");
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_manifest_still_resolves_with_a_keyring_present() {
+        let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-legacy"}"#);
+        let uri = format!("/{seg}/manifest.json");
+        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK, "legacy plaintext config must still resolve (back-compat)");
+    }
+
+    #[tokio::test]
+    async fn configure_page_renders_with_the_seal_bundle() {
+        // Guards against a truncated/corrupt include_str! shipping silently (audit finding B).
+        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/configure").body(()).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page = body_string(resp).await;
+        assert!(page.contains("DenSeal"), "the /configure page must inline the seal bundle");
+    }
 
     #[test]
     fn health_ok_below_threshold() {

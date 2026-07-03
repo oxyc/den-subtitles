@@ -40,9 +40,13 @@ impl Keyring {
             keys.push(SecretKey::from(arr));
             Ok(())
         };
-        add(current)?;
+        add(current).map_err(|e| format!("current: {e}"))?; // a bad CURRENT key is a real misconfig
+        // A malformed PRIOR key is skipped, not fatal — a typo in one rotation entry must not disable the
+        // whole ring (which would silently take sealing offline for the good current key too).
         for p in prev.split(',') {
-            add(p)?;
+            if let Err(e) = add(p) {
+                eprintln!("den-subtitles: skipping a malformed SUBS_CONFIG_KEYS_PREV entry: {e}");
+            }
         }
         Ok(Some(Keyring { keys }))
     }
@@ -118,5 +122,15 @@ mod tests {
     fn empty_current_disables() {
         assert!(Keyring::from_env("", "").unwrap().is_none());
         assert!(Keyring::from_env("not-base64-@@@", "").is_err() || Keyring::from_env("AAAA", "").is_err());
+    }
+
+    #[test]
+    fn a_malformed_prior_key_is_skipped_not_fatal() {
+        // A typo in one rotation entry must not disable the whole ring — the current key still opens.
+        let kr = Keyring::from_env(VEC_PRIV_B64, "not-base64-@@@,also!!bad")
+            .unwrap()
+            .expect("current key valid → ring built despite bad prior entries");
+        let ct = base64::engine::general_purpose::STANDARD.decode(VEC_CT_B64).unwrap();
+        assert_eq!(String::from_utf8(kr.open(&ct).unwrap()).unwrap(), VEC_PLAIN);
     }
 }

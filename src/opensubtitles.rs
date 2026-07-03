@@ -1,6 +1,7 @@
-//! OpenSubtitles REST client (api.opensubtitles.com). The addon holds its own API-consumer key (an
-//! addon-level env secret, not the user's), so downloads draw on one managed quota and we can cache
-//! the fetched SRT under our own stable URL — dodging the per-IP anonymous download cap.
+//! OpenSubtitles REST client (api.opensubtitles.com). The API-consumer key is the user's own BYOK key
+//! (`UserConfig::opensubtitles_key`, entered at /configure and carried — sealed — in the install URL);
+//! no OpenSubtitles credential lives in the addon environment. We cache the fetched SRT under our own
+//! stable URL so a given file resolves fast and dodges the per-IP anonymous download cap.
 //!
 //! The one thing that makes subtitles well-synced is passing the file's `moviehash`: OpenSubtitles
 //! flags results authored against that exact encode with `moviehash_match`, and those are correct by
