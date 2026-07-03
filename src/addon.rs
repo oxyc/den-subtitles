@@ -36,7 +36,9 @@ static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
 pub fn manifest(configured: bool) -> Value {
     json!({
         "id": "fi.oxy.den-subtitles",
-        "version": "0.1.0",
+        // Single source of truth: the Cargo package version (CI asserts it == the v* tag). So the
+        // manifest can't drift from Cargo.toml, nor the tag from either.
+        "version": env!("CARGO_PKG_VERSION"),
         "name": "Den Subtitles",
         "description": if configured {
             "OpenSubtitles (hash-matched + auto-synced) with optional BYOK AI translation for Den."
