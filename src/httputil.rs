@@ -98,6 +98,14 @@ pub fn apply_conditional(resp: Response<Body>, req_headers: &HeaderMap) -> Respo
     b.body(Full::new(Bytes::new())).unwrap()
 }
 
+/// A HEAD response must not carry a body (RFC 9110 §9.3.2) — drop it, keeping every header (including
+/// the `Content-Length` a GET would have returned). The router builds full-body responses regardless of
+/// method and hyper does not auto-strip, so the HEAD path must do it explicitly.
+pub fn strip_body(resp: Response<Body>) -> Response<Body> {
+    let (parts, _body) = resp.into_parts();
+    Response::from_parts(parts, Full::new(Bytes::new()))
+}
+
 /// RFC 9110 `If-None-Match`: `*` matches anything; otherwise any entry in the comma-separated list
 /// that equals the ETag matches. Our ETags are strong, but we compare with the weak-validator
 /// prefix (`W/`) stripped from both sides so a proxy that weakened it still gets its 304.

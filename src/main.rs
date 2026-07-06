@@ -58,7 +58,13 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
     // collapses to a 304. Unsafe methods (none served today) keep their full response.
     if matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) {
-        httputil::apply_conditional(resp, &parts.headers)
+        let resp = httputil::apply_conditional(resp, &parts.headers);
+        // HEAD must not carry a body (the router builds one regardless of method).
+        if parts.method == hyper::Method::HEAD {
+            httputil::strip_body(resp)
+        } else {
+            resp
+        }
     } else {
         resp
     }
