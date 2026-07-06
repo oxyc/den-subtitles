@@ -1,6 +1,6 @@
 [package]
 name = "den-subtitles"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Den subtitles, one container: Stremio subtitles addon that fetches (OpenSubtitles, hash-matched), AI-translates (BYOK), and auto-syncs (alass/ffsubsync) SRTs for the Den Apple TV app"
 publish = false
