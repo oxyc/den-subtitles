@@ -12,10 +12,15 @@ pub type Body = Full<Bytes>;
 /// `DefaultHasher`) is plenty — an ETag only needs to change when the bytes change, not resist an
 /// adversary. Length is folded in as a cheap extra guard against hash collisions.
 fn etag_of(bytes: &[u8]) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    format!("\"{:016x}-{:x}\"", h.finish(), bytes.len())
+    // FNV-1a-64: a FIXED, non-crypto hash — deterministic across restarts AND toolchain versions
+    // (unlike std's DefaultHasher, whose algorithm std may change between compiler releases, which
+    // would shift every ETag once). Length is folded in as a cheap extra guard against collisions.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("\"{h:016x}-{:x}\"", bytes.len())
 }
 
 /// Whether a response is a cacheable success that should carry a validator (ETag): a 200 with a
