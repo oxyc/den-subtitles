@@ -275,7 +275,12 @@ pub async fn handle_subtitle_file(
     // Per-invocation unique temp tag: two concurrent requests for the same file must not share
     // scratch paths (one would read the other's half-written output and cache it for 60 days).
     let tag = format!("{}-{}", cache_key.replace(':', "-"), SYNC_SEQ.fetch_add(1, Ordering::Relaxed));
-    let synced: Option<String> = if let Some(url) = resync_url.filter(|u| is_safe_resync_url(u)) {
+    // SSRF guard is async (it resolves a hostname target), so vet before the branch, not via `filter`.
+    let resync_url = match resync_url {
+        Some(u) if is_safe_resync_url(&u).await => Some(u),
+        _ => None,
+    };
+    let synced: Option<String> = if let Some(url) = resync_url {
         // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
         match state.sync.sync_to_audio(&target, &url, &tag).await {
             Ok(s) => Some(s),
@@ -318,7 +323,7 @@ fn is_http_url(u: &str) -> bool {
 /// (den-scout on a private IP), so we can't blanket-deny private ranges — but we DO deny loopback
 /// and link-local, which blocks the cloud-metadata endpoint (169.254.169.254) and localhost probes
 /// while still allowing the user's own 192.168/10/172.16 stream host.
-fn is_safe_resync_url(u: &str) -> bool {
+async fn is_safe_resync_url(u: &str) -> bool {
     if !is_http_url(u) {
         return false;
     }
@@ -337,9 +342,37 @@ fn is_safe_resync_url(u: &str) -> bool {
         return false;
     }
     match host_lc.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => !(v4.is_loopback() || v4.is_link_local()),
-        Ok(std::net::IpAddr::V6(v6)) => !v6.is_loopback(),
-        Err(_) => true, // a hostname (not a literal IP) — allowed; we don't resolve it here
+        Ok(ip) => !is_blocked_ip(ip),
+        // A HOSTNAME (not a literal IP): RESOLVE it and refuse if ANY resolved address is internal —
+        // otherwise an attacker-controlled name that resolves to 169.254.169.254 (cloud metadata) or
+        // 127.0.0.1 (DNS rebinding) sails through. Fail closed on a resolve error. (LAN/private ranges stay
+        // allowed — the stream legitimately lives on the LAN; only loopback/link-local/unspecified are refused.)
+        Err(_) => match tokio::net::lookup_host((host_lc.as_str(), 0u16)).await {
+            Ok(addrs) => {
+                let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+                !ips.is_empty() && !ips.iter().any(|ip| is_blocked_ip(*ip))
+            }
+            Err(_) => false,
+        },
+    }
+}
+
+/// Addresses we refuse to fetch server-side (SSRF): loopback, link-local (incl. the 169.254 cloud-metadata
+/// endpoint), and unspecified — plus their IPv4-mapped-IPv6 forms. Private LAN ranges (RFC1918 / IPv6 ULA)
+/// are DELIBERATELY allowed: Tier-2 resync fetches the user's stream, which lives on the LAN.
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(IpAddr::V4(v4));
+            }
+            v6.segments()[0] & 0xffc0 == 0xfe80 // link-local fe80::/10
+        }
     }
 }
 
@@ -524,33 +557,36 @@ mod tests {
         assert_eq!(both, resynced);
     }
 
-    #[test]
-    fn resync_guard_allows_lan_streams() {
-        // The stream lives on the user's LAN (den-scout on a private IP), so private ranges and
-        // ordinary hostnames must be reachable.
-        assert!(is_safe_resync_url("http://192.168.1.10:8080/stream.mkv"));
-        assert!(is_safe_resync_url("http://10.0.0.5/a.mkv"));
-        assert!(is_safe_resync_url("http://172.16.3.4/a.mkv"));
-        assert!(is_safe_resync_url("https://stream.example.com/a.mkv"));
-        // A public IPv6 stream host, bracketed with a port, is still reachable.
-        assert!(is_safe_resync_url("http://[2001:db8::1]:8080/a.mkv"));
+    #[tokio::test]
+    async fn resync_guard_allows_lan_and_public_streams() {
+        // The stream lives on the user's LAN (den-scout on a private IP), so private ranges stay reachable;
+        // a public literal is fine too. (Hostnames are vetted by resolution at runtime, not asserted here.)
+        assert!(is_safe_resync_url("http://192.168.1.10:8080/stream.mkv").await);
+        assert!(is_safe_resync_url("http://10.0.0.5/a.mkv").await);
+        assert!(is_safe_resync_url("http://172.16.3.4/a.mkv").await);
+        assert!(is_safe_resync_url("http://8.8.8.8/a.mkv").await); // public literal
+        assert!(is_safe_resync_url("http://[2001:db8::1]:8080/a.mkv").await);
+        assert!(is_safe_resync_url("http://[fc00::1]/a.mkv").await); // IPv6 ULA = LAN, allowed
     }
 
-    #[test]
-    fn resync_guard_blocks_loopback_linklocal_and_bad_schemes() {
-        // Loopback / localhost / link-local (incl. the cloud-metadata endpoint) are refused.
-        assert!(!is_safe_resync_url("http://127.0.0.1/a.mkv"));
-        assert!(!is_safe_resync_url("http://localhost:8080/a.mkv"));
-        assert!(!is_safe_resync_url("http://sub.localhost/a.mkv"));
-        assert!(!is_safe_resync_url("http://169.254.169.254/latest/meta-data/"));
-        // IPv6 loopback, bracketed — the case the old naive `:`-split let through.
-        assert!(!is_safe_resync_url("http://[::1]/a.mkv"));
-        assert!(!is_safe_resync_url("http://[::1]:8080/a.mkv"));
+    #[tokio::test]
+    async fn resync_guard_blocks_internal_and_bad_schemes() {
+        // Loopback / localhost / link-local (incl. the 169.254 cloud-metadata endpoint) / unspecified.
+        assert!(!is_safe_resync_url("http://127.0.0.1/a.mkv").await);
+        assert!(!is_safe_resync_url("http://localhost:8080/a.mkv").await);
+        assert!(!is_safe_resync_url("http://sub.localhost/a.mkv").await);
+        assert!(!is_safe_resync_url("http://169.254.169.254/latest/meta-data/").await);
+        assert!(!is_safe_resync_url("http://0.0.0.0/a.mkv").await); // unspecified
+        // IPv6 loopback / link-local / IPv4-mapped-loopback, bracketed.
+        assert!(!is_safe_resync_url("http://[::1]/a.mkv").await);
+        assert!(!is_safe_resync_url("http://[::1]:8080/a.mkv").await);
+        assert!(!is_safe_resync_url("http://[fe80::1]/a.mkv").await);
+        assert!(!is_safe_resync_url("http://[::ffff:127.0.0.1]/a.mkv").await);
         // userinfo must not smuggle a blocked host past the check.
-        assert!(!is_safe_resync_url("http://user@127.0.0.1/a.mkv"));
+        assert!(!is_safe_resync_url("http://user@127.0.0.1/a.mkv").await);
         // Only http(s); no file/ftp/empty.
-        assert!(!is_safe_resync_url("file:///etc/passwd"));
-        assert!(!is_safe_resync_url("ftp://host/a.mkv"));
-        assert!(!is_safe_resync_url(""));
+        assert!(!is_safe_resync_url("file:///etc/passwd").await);
+        assert!(!is_safe_resync_url("ftp://host/a.mkv").await);
+        assert!(!is_safe_resync_url("").await);
     }
 }
