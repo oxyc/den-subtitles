@@ -54,6 +54,17 @@ fn health_body(os_fails: u32) -> serde_json::Value {
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
+    let resp = route(&state, &parts).await;
+    // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
+    // collapses to a 304. Unsafe methods (none served today) keep their full response.
+    if matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) {
+        httputil::apply_conditional(resp, &parts.headers)
+    } else {
+        resp
+    }
+}
+
+async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
     let path = parts.uri.path();
 
     match path {
@@ -98,7 +109,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
             };
             let id = strip_json(id_seg).unwrap_or(id_seg);
             let extra = strip_json(extra).unwrap_or(extra);
-            addon::handle_subtitles(&state, &parts.headers, config, id, extra).await
+            addon::handle_subtitles(state, &parts.headers, config, id, extra).await
         }
         "subtitle" => {
             // /<config>/subtitle/<file_id>.srt[?ref=<id>|?resync=<stream-url>]
@@ -108,7 +119,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
                     let query = parts.uri.query().unwrap_or("");
                     let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
                     let resync = query_get(query, "resync");
-                    addon::handle_subtitle_file(&state, config, file_id, ref_id, resync).await
+                    addon::handle_subtitle_file(state, config, file_id, ref_id, resync).await
                 }
                 None => httputil::text(StatusCode::BAD_REQUEST, "bad file id"),
             }
@@ -127,7 +138,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
             } else {
                 return httputil::text(StatusCode::NOT_FOUND, "not found");
             };
-            addon::handle_translate(&state, &parts.headers, config, id, lang, want_json).await
+            addon::handle_translate(state, &parts.headers, config, id, lang, want_json).await
         }
         _ => httputil::text(StatusCode::NOT_FOUND, "not found"),
     }
@@ -284,6 +295,49 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let page = body_string(resp).await;
         assert!(page.contains("DenSeal"), "the /configure page must inline the seal bundle");
+    }
+
+    #[tokio::test]
+    async fn manifest_carries_a_strong_etag_and_honors_if_none_match() {
+        use hyper::header::{ETAG, IF_NONE_MATCH};
+        // A cacheable 200 must carry a strong (quoted, unweakened) ETag.
+        let resp = handle_request(
+            test_state(VEC_PRIV_B64),
+            Request::builder().uri("/manifest.json").body(()).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp.headers().get(ETAG).expect("manifest must carry an ETag").clone();
+        let etag_str = etag.to_str().unwrap().to_string();
+        assert!(etag_str.starts_with('"') && etag_str.ends_with('"'), "ETag must be quoted/strong");
+
+        // Re-request with that ETag → 304 Not Modified, no body, same validator + Cache-Control.
+        let resp = handle_request(
+            test_state(VEC_PRIV_B64),
+            Request::builder()
+                .uri("/manifest.json")
+                .header(IF_NONE_MATCH, &etag_str)
+                .body(())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers().get(ETAG).unwrap(), &etag);
+        assert!(resp.headers().get(hyper::header::CACHE_CONTROL).is_some());
+        assert!(body_string(resp).await.is_empty(), "a 304 has an empty body");
+    }
+
+    #[tokio::test]
+    async fn no_store_replies_carry_no_etag_and_never_304() {
+        use hyper::header::{ETAG, IF_NONE_MATCH};
+        // /health is no-store — it must not get an ETag, and a wildcard If-None-Match can't 304 it.
+        let resp = handle_request(
+            test_state(VEC_PRIV_B64),
+            Request::builder().uri("/health").header(IF_NONE_MATCH, "*").body(()).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(ETAG).is_none(), "no-store bodies get no ETag");
     }
 
     #[test]

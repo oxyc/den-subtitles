@@ -210,7 +210,9 @@ pub async fn handle_subtitles(
             })
         })
         .collect();
-    httputil::json(StatusCode::OK, &json!({"subtitles": out}), "public, max-age=3600")
+    // A strong ETag (hash of this serialized ranked list) is attached by `json()`; add
+    // stale-while-revalidate so a client can serve the last list instantly while refreshing.
+    httputil::json(StatusCode::OK, &json!({"subtitles": out}), "public, max-age=3600, stale-while-revalidate=3600")
 }
 
 /// The `file_id` of a trusted timing reference for Tier-1 reference alignment: any hash-matched sub,
