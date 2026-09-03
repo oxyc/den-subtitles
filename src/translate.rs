@@ -79,9 +79,6 @@ async fn run_translation(
         // Calls were counted but never timed, and batches run in sequence at up to LLM_TIMEOUT
         // each — so the permitted ceiling was measured in hours, long after the viewer gave up,
         // still spending their key.
-        if budget.spent() {
-            return Err("translation took too long".to_string());
-        }
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
         let translated = translate_batch(upstream, &sources, &context, &budget).await?;
         for (cue, text) in batch.iter().zip(translated) {
@@ -141,9 +138,9 @@ fn unusable(kept: usize, seen: usize) -> bool {
 
 
 
-/// Upstream calls a run may make. The happy path is one per batch; a wrong-length reply splits into
-/// 2n-1, and the ratio gate only catches that when the fallbacks are frequent enough — at exactly a
-/// quarter it fired never and cost 8,850 calls on one request. This bounds the bill regardless.
+/// Upstream calls a run may make: about twenty times the happy path's one-per-batch. Reaching it
+/// does not fail the run — it stops the spending and hands the remaining cues back as source text,
+/// where the ratio decides whether that is still a translation.
 fn call_budget(cues: usize) -> usize {
     20 * cues.div_ceil(BATCH) + 40
 }
@@ -238,14 +235,18 @@ async fn translate_batch(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    if budget.calls.fetch_add(1, Ordering::Relaxed) >= budget.max_calls {
-        return Err("translation exceeded its upstream call budget".to_string());
-    }
-    // Checked HERE, not just between batches: one wrong-length batch splits into up to 2n-1 calls
-    // without the outer loop regaining control, so a deadline enforced only out there was hours of
-    // slack in practice — the exact ceiling it was added to remove.
-    if budget.spent() {
-        return Err("translation took too long".to_string());
+    // Out of money or out of time: stop paying, keep the source for what is left, and let the ratio
+    // deliver the verdict. Failing outright here made the cost ceiling a STRICTER quality gate than
+    // the quality gate — the budget was sized against a 25% bar and the bar is now two thirds, so a
+    // film with scattered wrong-length replies (blank cues a model declines to echo back, say) hit
+    // the ceiling around 5-10% dead and was refused, at a ratio the code goes out of its way to
+    // accept. Cost and quality are separate questions and only one of them is the verdict.
+    //
+    // The deadline is checked HERE rather than only between batches because one wrong-length batch
+    // splits into up to 2n-1 calls without the outer loop regaining control.
+    if budget.calls.fetch_add(1, Ordering::Relaxed) >= budget.max_calls || budget.spent() {
+        budget.untranslated.fetch_add(sources.len(), Ordering::Relaxed);
+        return Ok(sources.to_vec());
     }
     let result = upstream.call(sources, context).await;
 
@@ -927,13 +928,13 @@ mod contract_tests {
         }
         // 400 cues is 10 batches at 20ms each; the deadline expires partway, far under the budget.
         let up = Slow(Mutex::new(0));
-        let err = run_translation(&up, &cues(400), Duration::from_millis(50))
-            .await
-            .expect_err("a run past its deadline must stop");
-        assert!(err.contains("too long"), "unexpected error: {err}");
-        // One 40-cue batch splits into up to 79 calls; a deadline checked only between batches
-        // would let all of them run before it looked again.
+        let out = run_translation(&up, &cues(400), Duration::from_millis(50)).await;
+        // It stops CALLING — that is the deadline's whole job. One 40-cue batch splits into up to
+        // 79 calls, so a deadline checked only between batches would let all of them run first.
         assert!(*up.0.lock().unwrap() < 20, "it kept calling past the deadline");
+        // Whether the run then fails is the ratio's decision, not the clock's. This fake is
+        // wrong-length throughout, so everything fell back to source and the ratio refuses it.
+        assert!(out.is_err(), "a run that translated almost nothing must not be served");
     }
 
     /// A forced-narrative track is mostly place names and proper nouns that legitimately come back
@@ -1033,6 +1034,27 @@ mod contract_tests {
         let out = run_translation_t(&up, &cues(1200)).await.expect("a rough opening must not abort it");
         assert_eq!(out.len(), 1200);
         assert_eq!(out[1000].text, "T:line 1000");
+    }
+
+    /// The cost ceiling must not become a stricter quality gate than the quality gate. A film with
+    /// scattered wrong-length replies — a model that declines to echo back the blank cues real SRTs
+    /// carry — splits often enough to exhaust the budget at well under a tenth of cues dead, and
+    /// that used to hard-fail a film the two-thirds bar is explicitly written to accept.
+    #[tokio::test]
+    async fn exhausting_the_budget_does_not_refuse_an_acceptable_film() {
+        // One cue in ten comes back wrong-length, so every batch splits to isolate four of them.
+        let up = fake(|s: &[String]| {
+            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n.is_multiple_of(10))) {
+                Ok(vec!["junk".to_string(); s.len() + 1])
+            } else {
+                Ok(s.iter().map(|t| format!("T:{t}")).collect())
+            }
+        });
+        let out = run_translation_t(&up, &cues(2000)).await;
+        assert!(out.is_ok(), "the cost ceiling refused a film the ratio accepts: {out:?}");
+        assert_eq!(out.unwrap().len(), 2000);
+        // And it did stop paying.
+        assert!(*up.calls.lock().unwrap() <= call_budget(2000));
     }
 
     /// The budget is the guard for the case the ratio cannot see: a model wrong on exactly a

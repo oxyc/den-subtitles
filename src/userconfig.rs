@@ -121,7 +121,7 @@ fn validate(raw: RawConfig) -> Option<UserConfig> {
         }
         let model = if raw.model.trim().is_empty() {
             provider.default_model().to_string()
-        } else if raw.model.len() > 128 {
+        } else if raw.model.trim().len() > 128 {
             return None;
         } else {
             raw.model.trim().to_string()
@@ -154,6 +154,26 @@ mod tests {
         assert_eq!(llm.model, "gpt-4o-mini");
         assert_eq!(cfg.opensubtitles_key, "os-test");
         assert!(cfg.auto_sync);
+    }
+
+    /// The model is stored trimmed and its emptiness is judged trimmed, so its length must be too.
+    /// Measuring the untrimmed string rejected the WHOLE config — every route 400s — over padding
+    /// that was about to be thrown away.
+    #[test]
+    fn a_padded_model_name_is_judged_on_what_is_kept() {
+        let padded = format!("{}gpt-4o-mini{}", " ".repeat(80), " ".repeat(80));
+        let blob = encode(&format!(
+            r#"{{"provider":"openai","apiKey":"sk-test","osKey":"os-test","model":"{padded}"}}"#
+        ));
+        let cfg = decode(None, &blob).expect("padding is not a reason to reject a config");
+        assert_eq!(cfg.llm.unwrap().model, "gpt-4o-mini");
+
+        // A genuinely over-long model is still refused.
+        let long = "m".repeat(129);
+        let blob = encode(&format!(
+            r#"{{"provider":"openai","apiKey":"sk-test","osKey":"os-test","model":"{long}"}}"#
+        ));
+        assert!(decode(None, &blob).is_none(), "an over-long model name must be refused");
     }
 
     #[test]
