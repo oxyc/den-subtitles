@@ -44,7 +44,16 @@ impl SyncTools {
         tag: &str,
     ) -> Result<String, String> {
         let target = self.write_temp(tag, "target.srt", target_srt.as_bytes()).await?;
-        let reference = self.write_temp(tag, "reference.srt", reference_srt.as_bytes()).await?;
+        // If the SECOND write fails, `finish` — the only cleanup — is never reached, and the first
+        // file stays forever: the sync work dir has no sweep. Disk pressure is exactly when the
+        // second write fails, so the leak compounds the condition that caused it.
+        let reference = match self.write_temp(tag, "reference.srt", reference_srt.as_bytes()).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&target).await;
+                return Err(e);
+            }
+        };
         let out = self.temp_path(tag, "synced.srt");
         // ffsubsync <reference> -i <unsynced> -o <out>. Reference-mode skips audio extraction.
         let run_result = self
@@ -146,11 +155,12 @@ impl SyncTools {
             .map_err(|e| format!("mkdir work: {e}"))?;
         let path = self.temp_path(tag, name);
         let mut f = tokio::fs::File::create(&path).await.map_err(|e| format!("create temp: {e}"))?;
-        f.write_all(bytes).await.map_err(|e| format!("write temp: {e}"))?;
-        // tokio's File buffers: write_all returns Ok and stashes the real error for the next
-        // write or flush. Without this an ENOSPC handed the tier binary an empty file and called
-        // it a success.
-        f.flush().await.map_err(|e| format!("write temp: {e}"))?;
+        // A failed write leaves the file `create` already made; nothing else ever removes it.
+        if let Err(e) = write_all_and_flush(&mut f, bytes).await {
+            drop(f);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(format!("write temp: {e}"));
+        }
         Ok(path)
     }
 }
@@ -232,6 +242,22 @@ mod tests {
         }
     }
 
+    /// The second write failing skips `finish`, the only cleanup — and the sync work dir has no
+    /// sweep, so the first file stays forever. Disk pressure is exactly when a second write fails,
+    /// so the leak feeds the condition that caused it.
+    #[tokio::test]
+    async fn a_failed_second_write_does_not_leak_the_first() {
+        let dir = work_dir("t1-write-fail");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // A directory where the reference file needs to be: `File::create` on it fails.
+        tokio::fs::create_dir_all(dir.join("tag-wf-reference.srt")).await.unwrap();
+
+        let out = tools(&dir, "unused".into()).sync_to_reference(SUB, REF, "tag-wf").await;
+        assert!(out.is_err(), "the write should have failed");
+        assert!(!dir.join("tag-wf-target.srt").exists(), "the first temp was left behind");
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
     #[tokio::test]
     async fn missing_binary_errors_and_still_removes_input_temps() {
         let dir = work_dir("t1-nobin");
@@ -259,4 +285,12 @@ mod tests {
         assert!(!dir.join("tag-t2-synced.srt").exists());
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
+}
+
+/// tokio's File buffers: `write_all` returns Ok and stashes the real error for the next write or
+/// flush, so without the flush an ENOSPC handed the tier binary an empty file and called it a
+/// success.
+async fn write_all_and_flush(f: &mut tokio::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    f.write_all(bytes).await?;
+    f.flush().await
 }

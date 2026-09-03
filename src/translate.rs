@@ -71,14 +71,15 @@ async fn run_translation(
         untranslated: AtomicUsize::new(0),
         calls: AtomicUsize::new(0),
         max_calls: call_budget(cues.len()),
+        started: std::time::Instant::now(),
+        deadline,
     };
-    let started = std::time::Instant::now();
 
     for batch in cues.chunks(BATCH) {
         // Calls were counted but never timed, and batches run in sequence at up to LLM_TIMEOUT
         // each — so the permitted ceiling was measured in hours, long after the viewer gave up,
         // still spending their key.
-        if started.elapsed() > deadline {
+        if budget.spent() {
             return Err("translation took too long".to_string());
         }
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
@@ -147,6 +148,14 @@ struct Budget {
     untranslated: AtomicUsize,
     calls: AtomicUsize,
     max_calls: usize,
+    started: std::time::Instant,
+    deadline: Duration,
+}
+
+impl Budget {
+    fn spent(&self) -> bool {
+        self.started.elapsed() > self.deadline
+    }
 }
 
 /// Why a call did not produce a usable batch.
@@ -227,6 +236,12 @@ async fn translate_batch(
     if budget.calls.fetch_add(1, Ordering::Relaxed) >= budget.max_calls {
         return Err("translation exceeded its upstream call budget".to_string());
     }
+    // Checked HERE, not just between batches: one wrong-length batch splits into up to 2n-1 calls
+    // without the outer loop regaining control, so a deadline enforced only out there was hours of
+    // slack in practice — the exact ceiling it was added to remove.
+    if budget.spent() {
+        return Err("translation took too long".to_string());
+    }
     let result = upstream.call(sources, context).await;
 
     match result {
@@ -303,27 +318,23 @@ async fn llm_translate(
     user.push_str("Translate this JSON array:\n");
     user.push_str(&serde_json::to_string(sources).map_err(|e| CallError::Upstream(e.to_string()))?);
 
-    let text = call_chat(client, llm, &system, &user).await?;
+    let text = call_chat_typed(client, llm, &system, &user).await?;
     parse_json_array(&text)
         .ok_or_else(|| CallError::Contract("model did not return a JSON array".to_string()))
 }
 
 /// Dispatch a single (system, user) chat turn to the configured provider and return the assistant
 /// text. Bodies are built as `Value` so the three request shapes stay readable side by side.
-async fn call_chat(
+async fn call_chat_typed(
     client: &reqwest::Client,
     llm: &LlmConfig,
     system: &str,
     user: &str,
-) -> Result<String, String> {
+) -> Result<String, CallError> {
     let (url, body, auth) = match llm.provider {
         // OpenAI-compatible chat/completions: OpenAI, xAI, OpenRouter.
         Provider::OpenAI | Provider::Xai | Provider::OpenRouter => {
-            let base = match llm.provider {
-                Provider::OpenAI => "https://api.openai.com/v1",
-                Provider::Xai => "https://api.x.ai/v1",
-                _ => "https://openrouter.ai/api/v1",
-            };
+            let base = chat_base(llm.provider);
             (
                 format!("{base}/chat/completions"),
                 json!({
@@ -360,7 +371,7 @@ async fn call_chat(
             }),
             Auth::GoogleKey,
         ),
-        Provider::DeepL => return Err("DeepL does not use the chat path".to_string()),
+        Provider::DeepL => return Err(CallError::Upstream("DeepL does not use the chat path".into())),
     };
 
     // Override the client's default timeout upward: an LLM completion is legitimately slower than an
@@ -380,10 +391,15 @@ async fn call_chat(
         // The status only. This string is logged, and the body is the PROVIDER's text about a
         // request that carried the user's key — OpenAI's 401 quotes a masked form of it back, and a
         // self-hosted gateway is under no obligation to mask anything.
-        return Err(format!("provider {code}"));
+        return Err(CallError::Upstream(format!("provider {code}")));
     }
     let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
-    extract_text(llm.provider, &v).ok_or_else(|| "no text in provider response".to_string())
+    // Contract, not Upstream: a 200 with no usable text is a safety filter or an empty candidate
+    // list, and both are about THIS batch's dialogue — film dialogue trips content filters routinely.
+    // As an Upstream it propagated, so one filtered batch killed the whole film instead of falling
+    // back to source text for those cues.
+    extract_text(llm.provider, &v)
+        .ok_or_else(|| CallError::Contract("no text in provider response".to_string()))
 }
 
 enum Auth {
@@ -393,6 +409,28 @@ enum Auth {
 }
 
 /// Pull the assistant text out of each provider's response envelope.
+/// OpenAI-compatible chat root. A function rather than a literal so a test can drive the real
+/// request/response path — the classification of an empty reply lives at that call site, and
+/// mis-classifying it there is what killed whole films twice.
+#[cfg(not(test))]
+fn chat_base(provider: Provider) -> String {
+    match provider {
+        Provider::OpenAI => "https://api.openai.com/v1".to_string(),
+        Provider::Xai => "https://api.x.ai/v1".to_string(),
+        _ => "https://openrouter.ai/api/v1".to_string(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHAT_BASE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn chat_base(_provider: Provider) -> String {
+    CHAT_BASE.with(|b| b.borrow().clone()).unwrap_or_else(|| "http://127.0.0.1:1".to_string())
+}
+
 fn extract_text(provider: Provider, v: &Value) -> Option<String> {
     match provider {
         Provider::OpenAI | Provider::Xai | Provider::OpenRouter => {
@@ -447,57 +485,116 @@ fn deepl_code(lang: &str) -> String {
 /// Extract a JSON string array from model output, tolerating markdown code fences and leading prose
 /// by scanning for the first `[` … matching `]`.
 fn parse_json_array(text: &str) -> Option<Vec<String>> {
-    // Each `[` is closed at its OWN matching `]`, and a candidate that turns out not to be an array
-    // is skipped whole rather than re-entered one byte along. Retrying from every `[` re-scanned the
-    // same interior over and over — 64k open brackets took 1.7s and the reply body is capped at
-    // 12 MiB, so a provider answering with junk could hold the one runtime thread indefinitely.
+    // Two linear passes, and they are not interchangeable.
     //
-    // Taking the first `[` to the LAST `]` was the earlier bug: a bracket in the surrounding prose
-    // ("[sic]", "I [will] translate:") produced no array at all, which then failed a whole film.
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'[' {
-            i += 1;
-            continue;
-        }
-        let mut depth = 0usize;
-        let mut in_string = false;
-        let mut escaped = false;
-        let mut end = None;
-        for (offset, &b) in bytes[i..].iter().enumerate() {
-            if in_string {
-                match b {
-                    _ if escaped => escaped = false,
-                    b'\\' => escaped = true,
-                    b'"' => in_string = false,
-                    _ => {}
+    // The first takes spans where the bracket depth returns to zero — the outermost array wins, so
+    // a nested one can never answer with a fragment of itself.
+    //
+    // The second exists because an UNMATCHED `[` earlier in the text (a model echoing a cue like
+    // "[MUSIC PLAYING" with no closing bracket) means depth never returns to zero, and the whole
+    // reply was discarded even though a perfectly good array sat right after it. It pairs brackets
+    // on a stack instead, so an unbalanced prefix costs nothing.
+    //
+    // Both walk each byte once. Retrying from every `[` — the obvious way to write this — rescans
+    // the same interior per candidate, which was quadratic and could hold the one runtime thread.
+    top_level_array(text).or_else(|| innermost_array(text)).flatten()
+}
+
+/// Spans that open at depth 0 and close back to it, tried left to right.
+fn top_level_array(text: &str) -> Option<Option<Vec<String>>> {
+    let mut scan = Scan::new();
+    let mut start = None;
+    for (i, &b) in text.as_bytes().iter().enumerate() {
+        match (scan.step(b), start) {
+            (Step::Open(1), _) => start = Some(i),
+            (Step::Close(0), Some(s)) => {
+                start = None;
+                if let Some(reply) = reply_at(&text[s..=i]) {
+                    return Some(reply);
                 }
-                continue;
             }
-            match b {
-                b'"' => in_string = true,
-                b'[' => depth += 1,
-                b']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i + offset);
-                        break;
-                    }
-                }
-                _ => {}
-            }
+            _ => {}
         }
-        // Nothing closes this one, so nothing later closes either.
-        let e = end?;
-        // A well-formed array here IS the reply, and whether every element is a string decides
-        // whether it is valid — descending into a nested one would answer with a fragment of it.
-        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text[i..=e]) {
-            return arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect();
-        }
-        i = e + 1;
     }
     None
+}
+
+/// Every balanced pair, innermost-first. For text whose depth never returns to zero — an unmatched
+/// `[` earlier in the reply, which the pass above cannot see past.
+fn innermost_array(text: &str) -> Option<Option<Vec<String>>> {
+    let mut scan = Scan::new();
+    let mut opens: Vec<usize> = Vec::new();
+    for (i, &b) in text.as_bytes().iter().enumerate() {
+        match scan.step(b) {
+            Step::Open(_) => opens.push(i),
+            Step::Close(_) => {
+                if let Some(s) = opens.pop() {
+                    if let Some(reply) = reply_at(&text[s..=i]) {
+                        return Some(reply);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Is this span the reply?
+///
+/// `None` means it is not a JSON array at all, so the caller keeps looking. `Some` means it IS the
+/// reply — and the inner `Option` says whether it is a valid one, because a well-formed array of
+/// non-strings is a bad reply rather than a reason to carry on and answer with something nested
+/// inside it.
+fn reply_at(slice: &str) -> Option<Option<Vec<String>>> {
+    let arr: Vec<Value> = serde_json::from_str(slice).ok()?;
+    Some(arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect())
+}
+
+enum Step {
+    Open(usize),
+    Close(usize),
+    Other,
+}
+
+/// Bracket depth that ignores anything inside a JSON string, escapes included.
+struct Scan {
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl Scan {
+    fn new() -> Scan {
+        Scan { depth: 0, in_string: false, escaped: false }
+    }
+
+    fn step(&mut self, b: u8) -> Step {
+        if self.in_string {
+            match b {
+                _ if self.escaped => self.escaped = false,
+                b'\\' => self.escaped = true,
+                b'"' => self.in_string = false,
+                _ => {}
+            }
+            return Step::Other;
+        }
+        match b {
+            b'"' => {
+                self.in_string = true;
+                Step::Other
+            }
+            b'[' => {
+                self.depth += 1;
+                Step::Open(self.depth)
+            }
+            b']' if self.depth > 0 => {
+                self.depth -= 1;
+                Step::Close(self.depth)
+            }
+            _ => Step::Other,
+        }
+    }
 }
 
 
@@ -566,6 +663,8 @@ mod contract_tests {
             untranslated: AtomicUsize::new(0),
             calls: AtomicUsize::new(0),
             max_calls: call_budget(n),
+            started: std::time::Instant::now(),
+            deadline: Duration::from_secs(600),
         };
         translate_batch(upstream, &src, &[], &budget).await
     }
@@ -633,6 +732,30 @@ mod contract_tests {
         assert_eq!(parse_json_array(escaped).unwrap(), vec!["a\"]b"]);
         // Unbalanced: nothing to find, and it must say so rather than scan forever.
         assert!(parse_json_array("[[[[[[").is_none());
+
+        // An UNMATCHED `[` before the array — a model echoing a cue like "[MUSIC PLAYING" with no
+        // closing bracket — used to discard the whole reply, because depth never returned to zero
+        // and the scan concluded nothing later could close either. It can: a later span pairs its
+        // own brackets regardless of what came before it.
+        for chatty in [
+            r#"[ this is an unclosed bracket in my prose ["a","b"]"#,
+            r#"note [unbalanced then ["a","b"]"#,
+            r#"[MUSIC PLAYING becomes ["a","b"]"#,
+        ] {
+            assert_eq!(
+                parse_json_array(chatty).as_deref(),
+                Some(&["a".to_string(), "b".to_string()][..]),
+                "an unmatched bracket discarded a valid array: {chatty:?}"
+            );
+        }
+        // Outermost-wins is a guarantee of the first pass, and holds for any BALANCED reply — which
+        // is every reply a working model sends.
+        assert!(parse_json_array(r#"[["a"],["b"]]"#).is_none());
+        // The fallback pass is best-effort by construction: it pairs brackets on a stack, so for
+        // input the first pass cannot see past it answers innermost-first and may return a nested
+        // fragment. That is a wrong length, which splits and ends at the source text — the same
+        // place any other malformed reply ends up, and better than discarding the film.
+        assert_eq!(parse_json_array(r#"[[["a"],["b"]]"#).as_deref(), Some(&["a".to_string()][..]));
     }
 
     /// A model that answers with prose instead of an array is breaking the SAME contract as one
@@ -667,7 +790,10 @@ mod contract_tests {
                 _context: &[(String, String)],
             ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
                 *self.0.lock().unwrap() += 1;
-                let out: Vec<String> = sources.iter().map(|t| format!("T:{t}")).collect();
+                // Wrong length, so every batch splits — the deadline has to be enforced INSIDE the
+                // recursion, not just between batches. A correct-length fake here never recurses,
+                // and so only ever exercised the one check that was never broken.
+                let out: Vec<String> = vec!["junk".to_string(); sources.len() + 1];
                 Box::pin(async move {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     Ok(out)
@@ -680,7 +806,9 @@ mod contract_tests {
             .await
             .expect_err("a run past its deadline must stop");
         assert!(err.contains("too long"), "unexpected error: {err}");
-        assert!(*up.0.lock().unwrap() < 10, "it kept calling past the deadline");
+        // One 40-cue batch splits into up to 79 calls; a deadline checked only between batches
+        // would let all of them run before it looked again.
+        assert!(*up.0.lock().unwrap() < 20, "it kept calling past the deadline");
     }
 
     /// A forced-narrative track is mostly place names and proper nouns that legitimately come back
@@ -922,5 +1050,76 @@ mod contract_tests {
     async fn an_upstream_error_still_fails() {
         let up = fake(|_: &[String]| Err(CallError::Upstream("provider 401: bad key".into())));
         assert!(run(&up, 4).await.is_err(), "an upstream failure must not become an untranslated film");
+    }
+}
+
+#[cfg(test)]
+mod provider_reply_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-shot chat endpoint answering with a canned body.
+    async fn provider(status: &'static str, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn call(body: &'static str, status: &'static str) -> Result<Vec<String>, CallError> {
+        let base = provider(status, body).await;
+        CHAT_BASE.with(|b| *b.borrow_mut() = Some(base));
+        let http = reqwest::Client::new();
+        let llm = LlmConfig {
+            provider: Provider::OpenAI,
+            api_key: "k".into(),
+            model: "m".into(),
+        };
+        llm_translate(&http, &llm, &["a".to_string()], "Swedish", &[]).await
+    }
+
+    /// A 200 whose envelope carries no text is a safety filter or an empty candidate list, and both
+    /// are about THIS batch's dialogue — film dialogue trips content filters routinely. Classified
+    /// as Upstream it propagated and killed the whole film; it has to degrade like any other reply
+    /// the model got wrong.
+    #[tokio::test]
+    async fn an_empty_reply_is_a_contract_violation_not_a_refusal() {
+        let err = call(r#"{"choices":[]}"#, "200 OK").await.unwrap_err();
+        assert!(
+            matches!(err, CallError::Contract(_)),
+            "an empty provider reply must degrade, not propagate: {err:?}"
+        );
+    }
+
+    /// A reply that is text but not an array is the model misbehaving too.
+    #[tokio::test]
+    async fn prose_instead_of_an_array_is_a_contract_violation() {
+        let body = r#"{"choices":[{"message":{"content":"I cannot help with that."}}]}"#;
+        assert!(matches!(call(body, "200 OK").await.unwrap_err(), CallError::Contract(_)));
+    }
+
+    /// But a provider REFUSING is upstream, and must not be split-retried.
+    #[tokio::test]
+    async fn a_provider_status_error_is_an_upstream_failure() {
+        let err = call(r#"{"error":"nope"}"#, "429 Too Many Requests").await.unwrap_err();
+        assert!(matches!(err, CallError::Upstream(_)), "a 429 must propagate: {err:?}");
+    }
+
+    /// And a good reply still comes back.
+    #[tokio::test]
+    async fn a_well_formed_reply_parses() {
+        let body = r#"{"choices":[{"message":{"content":"[\"Hej\"]"}}]}"#;
+        assert_eq!(call(body, "200 OK").await.unwrap(), vec!["Hej"]);
     }
 }
