@@ -17,25 +17,42 @@ pub struct Cue {
 pub fn parse(input: &str) -> Vec<Cue> {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut cues = Vec::new();
-    // Blocks are separated by a blank line. Normalise CRLF first so the split is uniform.
+    // Normalise CRLF first so a line break is one character everywhere below.
     let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
-    for block in normalized.split("\n\n") {
-        let block = block.trim_matches('\n');
-        if block.is_empty() {
-            continue;
+    // A separator is a line with nothing but whitespace on it — not the literal "\n\n".
+    //
+    // Real OpenSubtitles files carry separator lines holding a space or a tab, and splitting on
+    // "\n\n" does not see those: the next cue stays inside the previous block, where the index and
+    // timing lines are already taken, so its timecode is joined onto the previous cue's dialogue.
+    // The result is not a dropped line but a wrong one — cue 2 vanishes, its words display at cue
+    // 1's timestamp, and "00:00:05,000 --> 00:00:06,000" renders on screen as a line of dialogue
+    // and is sent to the translator as text. One stray space silently eats the rest of the block.
+    let mut block: Vec<&str> = Vec::new();
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            push_cue(&mut cues, &block);
+            block.clear();
+        } else {
+            block.push(line);
         }
-        let mut lines = block.lines();
-        let Some(first) = lines.next() else { continue };
-        // First line is the index; some files omit it and lead with the timecode — tolerate both.
-        let (index, timing_line) = match first.trim().parse::<u32>() {
-            Ok(n) => (n, lines.next().unwrap_or("")),
-            Err(_) => (cues.len() as u32 + 1, first),
-        };
-        let Some((start, end)) = parse_timing(timing_line) else { continue };
-        let text = lines.collect::<Vec<_>>().join("\n");
-        cues.push(Cue { index, start, end, text });
     }
+    push_cue(&mut cues, &block);
     cues
+}
+
+/// Turn one block's lines into a cue, skipping anything malformed — a single bad cue shouldn't
+/// lose the movie.
+fn push_cue(cues: &mut Vec<Cue>, block: &[&str]) {
+    let mut lines = block.iter().copied();
+    let Some(first) = lines.next() else { return };
+    // First line is the index; some files omit it and lead with the timecode — tolerate both.
+    let (index, timing_line) = match first.trim().parse::<u32>() {
+        Ok(n) => (n, lines.next().unwrap_or("")),
+        Err(_) => (cues.len() as u32 + 1, first),
+    };
+    let Some((start, end)) = parse_timing(timing_line) else { return };
+    let text = lines.collect::<Vec<_>>().join("\n");
+    cues.push(Cue { index, start, end, text });
 }
 
 /// Serialize cues back to a well-formed SRT (LF newlines, blank-line separated, trailing newline).
@@ -122,5 +139,50 @@ mod tests {
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "line one\nline two");
         assert_eq!(cues[1].index, 2);
+    }
+}
+
+#[cfg(test)]
+mod separator_tests {
+    use super::*;
+
+    /// A separator line carrying a space or a tab is still a separator. Splitting on the literal
+    /// "\n\n" missed those and swallowed the following cue whole — so this asserts the cue count,
+    /// the recovered cue's OWN timing, and that no timecode leaked into anyone's dialogue. The
+    /// count alone would pass on a parser that kept two cues but glued the text to the wrong one.
+    #[test]
+    fn a_whitespace_only_line_separates_cues() {
+        for sep in ["   ", "\t", " \t ", ""] {
+            let input = format!(
+                "1\n00:00:01,000 --> 00:00:02,000\nfirst\n{sep}\n2\n00:00:05,000 --> 00:00:06,000\nsecond\n"
+            );
+            let cues = parse(&input);
+            assert_eq!(cues.len(), 2, "separator {sep:?} did not separate");
+            assert_eq!(cues[0].text, "first", "separator {sep:?}");
+            assert_eq!(cues[1].text, "second", "separator {sep:?}");
+            // The second cue keeps its own timing rather than inheriting the first's.
+            assert_eq!((cues[1].start, cues[1].end), (5000, 6000), "separator {sep:?}");
+            for c in &cues {
+                assert!(!c.text.contains("-->"), "a timecode became dialogue: {:?}", c.text);
+            }
+        }
+    }
+
+    /// The same file with CRLF line endings, since normalisation runs before the split.
+    #[test]
+    fn a_whitespace_only_line_separates_cues_with_crlf() {
+        let input = "1\r\n00:00:01,000 --> 00:00:02,000\r\nfirst\r\n \r\n2\r\n00:00:05,000 --> 00:00:06,000\r\nsecond\r\n";
+        let cues = parse(input);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[1].start, 5000);
+    }
+
+    /// Runs of blank lines are not empty cues, and a file that ends without a trailing newline
+    /// still yields its last cue — the final block is flushed after the loop, not by a separator.
+    #[test]
+    fn blank_runs_and_a_missing_trailing_newline() {
+        let cues = parse("1\n00:00:01,000 --> 00:00:02,000\nfirst\n\n \n\n2\n00:00:05,000 --> 00:00:06,000\nlast");
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[1].text, "last");
     }
 }
