@@ -35,11 +35,16 @@ pub struct Subtitle {
     pub ratings: f64,
 }
 
+/// Live API root. A field rather than a literal so the two-hop download flow — the API call, then
+/// the CDN link it hands back — can be driven against a local server in tests.
+pub const API: &str = "https://api.opensubtitles.com/api/v1";
+
 pub struct Client<'a> {
     pub http: &'a reqwest::Client,
     pub api_key: &'a str,
     /// Optional service-account bearer (raises the download quota above anonymous).
     pub token: Option<&'a str>,
+    pub api_base: &'a str,
 }
 
 impl<'a> Client<'a> {
@@ -71,7 +76,7 @@ impl<'a> Client<'a> {
 
         let resp = self
             .http
-            .get("https://api.opensubtitles.com/api/v1/subtitles")
+            .get(format!("{}/subtitles", self.api_base))
             .header("Api-Key", self.api_key)
             .header("User-Agent", "den-subtitles v0.1")
             .query(&query)
@@ -91,7 +96,7 @@ impl<'a> Client<'a> {
     pub async fn download(&self, file_id: i64) -> Result<String, String> {
         let mut req = self
             .http
-            .post("https://api.opensubtitles.com/api/v1/download")
+            .post(format!("{}/download", self.api_base))
             .header("Api-Key", self.api_key)
             .header("User-Agent", "den-subtitles v0.1")
             .json(&serde_json::json!({ "file_id": file_id }));
@@ -111,7 +116,20 @@ impl<'a> Client<'a> {
             .send()
             .await
             .map_err(|e| format!("fetch link failed: {e}"))?;
-        crate::fetch::capped_text(resp, crate::fetch::MAX_BODY).await
+        // The API call above is status-checked and this one was not, so a CDN 403/404/429 (an
+        // expired or rate-limited link) returned its HTML error page AS the subtitle — cached under
+        // the file id for 60 days and served `immutable`. One transient blip, one track that
+        // silently shows nothing forever.
+        if !resp.status().is_success() {
+            return Err(format!("subtitle link {}", resp.status()));
+        }
+        let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY).await?;
+        // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
+        // enough. Anything with no cue in it cannot be one.
+        if crate::srt::parse(&body).is_empty() {
+            return Err("subtitle link returned no cues".to_string());
+        }
+        Ok(body)
     }
 }
 
@@ -298,5 +316,68 @@ mod tests {
         let correct = sub(1, "en", false, 5, "Spider-Man.2002.1080p.BluRay.x264-AMIABLE");
         let wrong = sub(2, "en", false, 5, "Spider-Man.2002.480p.DVDRip");
         assert!(fit_score(&correct, filename) > fit_score(&wrong, filename));
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-shot server: answers the API call with a link back to itself, then answers that link
+    /// with whatever the case under test wants the CDN to say.
+    async fn upstream(cdn_status: &'static str, cdn_body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = if req.starts_with("POST") {
+                    ("200 OK".to_string(), format!(r#"{{"link":"http://{addr}/cdn"}}"#))
+                } else {
+                    (cdn_status.to_string(), cdn_body.to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn download_from(status: &'static str, body: &'static str) -> Result<String, String> {
+        let base = upstream(status, body).await;
+        let http = reqwest::Client::new();
+        Client { http: &http, api_key: "k", token: None, api_base: &base }.download(1).await
+    }
+
+    /// The API call was status-checked and the CDN fetch that follows it was not, so an expired or
+    /// rate-limited link returned its error page AS the subtitle — stored under the file id for 60
+    /// days and served `immutable`. One blip, one track that silently shows nothing forever.
+    #[tokio::test]
+    async fn a_failed_link_fetch_is_not_a_subtitle() {
+        let err = download_from("403 Forbidden", "<html><body>Forbidden</body></html>")
+            .await
+            .expect_err("a 403 from the CDN must not become the subtitle");
+        assert!(err.contains("403"), "unexpected error: {err}");
+    }
+
+    /// And a 200 is not proof either — a CDN interstitial is a 200 often enough.
+    #[tokio::test]
+    async fn a_link_body_with_no_cues_is_not_a_subtitle() {
+        assert!(download_from("200 OK", "<html>just a page</html>").await.is_err());
+        assert!(download_from("200 OK", "").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_real_subtitle_comes_back_intact() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
+        assert_eq!(download_from("200 OK", srt).await.unwrap(), srt);
     }
 }

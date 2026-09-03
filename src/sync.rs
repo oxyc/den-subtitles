@@ -115,9 +115,17 @@ impl SyncTools {
         inputs: [&PathBuf; N],
     ) -> Result<String, String> {
         let result = match run_result {
-            Ok(status) if status.success() => {
-                tokio::fs::read_to_string(out).await.map_err(|e| format!("read synced: {e}"))
-            }
+            Ok(status) if status.success() => match tokio::fs::read_to_string(out).await {
+                // Exit 0 is the binary's opinion, not a result. ffsubsync and alass both exit 0
+                // having written nothing usable when handed a target they can't parse, and that
+                // empty string was cached for 60 days as the finished alignment — worse than the
+                // raw sub, which at least plays.
+                Ok(body) if crate::srt::parse(&body).is_empty() => {
+                    Err("sync produced no cues".to_string())
+                }
+                Ok(body) => Ok(body),
+                Err(e) => Err(format!("read synced: {e}")),
+            },
             Ok(status) => Err(format!("sync exited {status}")),
             Err(e) => Err(e),
         };
@@ -139,6 +147,10 @@ impl SyncTools {
         let path = self.temp_path(tag, name);
         let mut f = tokio::fs::File::create(&path).await.map_err(|e| format!("create temp: {e}"))?;
         f.write_all(bytes).await.map_err(|e| format!("write temp: {e}"))?;
+        // tokio's File buffers: write_all returns Ok and stashes the real error for the next
+        // write or flush. Without this an ENOSPC handed the tier binary an empty file and called
+        // it a success.
+        f.flush().await.map_err(|e| format!("write temp: {e}"))?;
         Ok(path)
     }
 }
@@ -174,14 +186,18 @@ mod tests {
         SyncTools { ffsubsync, alass: "alass-unused".into(), work_dir: dir.to_path_buf() }
     }
 
+    /// A real cue, because the tiers now have to return something that parses as a subtitle.
+    const SUB: &str = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
+    const REF: &str = "1\n00:00:03,000 --> 00:00:04,000\nreference\n";
+
     #[tokio::test]
     async fn tier1_success_returns_synced_output_and_removes_temps() {
         let dir = work_dir("t1-ok");
         // ffsubsync's contract is `<reference> -i <target> -o <out>`; positional $3=target, $5=out.
         // The fake "aligns" by copying the target through, so we can assert the round-trip.
         let bin = fake_bin(&dir, "fake-ffsubsync", r#"cp "$3" "$5""#).await;
-        let out = tools(&dir, bin).sync_to_reference("SUB-BODY", "REF-BODY", "tag-ok").await;
-        assert_eq!(out.unwrap(), "SUB-BODY");
+        let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-ok").await;
+        assert_eq!(out.unwrap(), SUB);
         // Inputs and the output scratch file are all cleaned up on success.
         assert!(!dir.join("tag-ok-target.srt").exists());
         assert!(!dir.join("tag-ok-reference.srt").exists());
@@ -193,7 +209,7 @@ mod tests {
     async fn tier1_nonzero_exit_errors_and_removes_input_temps() {
         let dir = work_dir("t1-fail");
         let bin = fake_bin(&dir, "fake-ffsubsync", "exit 1").await;
-        let out = tools(&dir, bin).sync_to_reference("SUB", "REF", "tag-fail").await;
+        let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-fail").await;
         assert!(out.is_err());
         // A failed alignment must not leave its inputs behind for the next caller to trip over.
         assert!(!dir.join("tag-fail-target.srt").exists());
@@ -201,11 +217,26 @@ mod tests {
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
 
+    /// Exit 0 is the binary's opinion, not a result. Both tiers exit 0 having written nothing
+    /// usable when the target won't parse, and that empty output was cached for 60 days as the
+    /// finished alignment — an empty subtitle track, where the raw sub would at least have played.
+    #[tokio::test]
+    async fn a_zero_exit_with_no_cues_is_not_an_alignment() {
+        for (name, body) in [("empty", r#": > "$5""#), ("html", r#"echo '<html>nope</html>' > "$5""#)] {
+            let dir = work_dir(&format!("t1-junk-{name}"));
+            let bin = fake_bin(&dir, "fake-ffsubsync", body).await;
+            let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-junk").await;
+            assert!(out.is_err(), "{name} output was accepted as an alignment: {out:?}");
+            assert!(!dir.join("tag-junk-target.srt").exists(), "{name} leaked its inputs");
+            tokio::fs::remove_dir_all(&dir).await.ok();
+        }
+    }
+
     #[tokio::test]
     async fn missing_binary_errors_and_still_removes_input_temps() {
         let dir = work_dir("t1-nobin");
         let out = tools(&dir, "/nonexistent/xyzzy-ffsubsync".into())
-            .sync_to_reference("SUB", "REF", "tag-nobin")
+            .sync_to_reference(SUB, REF, "tag-nobin")
             .await;
         assert!(out.is_err());
         // A spawn failure produced no exit status, but the temp inputs written before the spawn must
@@ -222,8 +253,8 @@ mod tests {
         let bin = fake_bin(&dir, "fake-alass", r#"cp "$2" "$3""#).await;
         let mut t = tools(&dir, "ffsubsync-unused".into());
         t.alass = bin;
-        let out = t.sync_to_audio("SUB-BODY", "http://192.168.1.9/s.mkv", "tag-t2").await;
-        assert_eq!(out.unwrap(), "SUB-BODY");
+        let out = t.sync_to_audio(SUB, "http://192.168.1.9/s.mkv", "tag-t2").await;
+        assert_eq!(out.unwrap(), SUB);
         assert!(!dir.join("tag-t2-target.srt").exists());
         assert!(!dir.join("tag-t2-synced.srt").exists());
         tokio::fs::remove_dir_all(&dir).await.ok();

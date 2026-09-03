@@ -157,6 +157,7 @@ pub async fn handle_subtitles(
             http,
             api_key: &cfg.opensubtitles_key,
             token: cfg.opensubtitles_token.as_deref(),
+            api_base: opensubtitles::API,
         };
         // Ask for everything; the app filters/selects by its own preferred-language rules.
         match client.search(&imdb, season, episode, "all", hash.as_deref()).await {
@@ -277,6 +278,7 @@ pub async fn handle_subtitle_file(
         http,
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
+        api_base: opensubtitles::API,
     };
 
     let target = match subtitle_srt(state, &client, file_id).await {
@@ -508,6 +510,7 @@ async fn produce_translation(
         http,
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
+        api_base: opensubtitles::API,
     };
     // Prefer an English source (best-resourced), else whatever exists.
     let subs = client.search(imdb, season, episode, "en", None).await?;
