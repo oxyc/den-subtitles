@@ -498,8 +498,11 @@ pub async fn handle_translate(
         // forms are two requests, so the app's own flow retries once by design — and nothing was
         // remembered about the failure, so each attempt paid in full again, with no backoff. Same
         // marker the sync path uses, in the same namespace.
+        // Said differently from a fresh failure on purpose: from the outside the two are the same
+        // 502, and the difference — "we just tried" versus "we are backing off" — is the first
+        // thing you want to know when a translation stops working.
         if state.cache.get(&failed_recently).is_some() {
-            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
         }
         if let Err(e) = produce_translation(state, &cfg, llm, &imdb, season, episode, lang, &cache_key).await {
             // Log the detail (no key in these strings); hand the client a generic message rather than
@@ -745,6 +748,97 @@ mod sync_fallback_tests {
         assert_eq!(
             extra_field(plus, "filename").as_deref(),
             Some("Movie.2013.2160p.HDR10+.WEB-DL.mkv")
+        );
+    }
+}
+
+#[cfg(test)]
+mod translate_retry_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    /// A state with its own cache directory. The disk tier is real and persists between runs, so a
+    /// shared directory would carry one test's markers into another's preconditions.
+    fn state(name: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("den-subs-translate-retry-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        AppState::new(Config {
+            port: 0,
+            cache_dir: dir,
+            cache_max_bytes: 1 << 20,
+            public_base_url: None,
+            ffsubsync: "ffsubsync".into(),
+            alass: "alass".into(),
+            config_key: String::new(),
+            config_keys_prev: String::new(),
+        })
+    }
+
+    /// A config segment with an LLM key, so `handle_translate` gets past its own guards.
+    fn config_segment() -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"osKey":"os-test","provider":"openai","apiKey":"llm-test","model":"m"}"#)
+    }
+
+    /// A film's LLM bill must not be re-paid on every tap. The `.json` and `.srt` forms are two
+    /// requests, so the app retries once by design, and nothing was remembered about a failure.
+    /// The marker has to short-circuit — and it must never be mistaken for the subtitle itself:
+    /// its key is in the `syncfail:` namespace, and every body read uses a `translate:` key.
+    #[tokio::test]
+    async fn a_remembered_failure_short_circuits_without_being_served() {
+        let state = state("short-circuit");
+        let config = config_segment();
+        let cfg = userconfig::decode(state.config_keyring.as_ref(), &config).expect("test config decodes");
+        let llm = cfg.llm.as_ref().expect("test config carries an llm");
+        let cache_key = format!("translate:tt0111161:0:0:Swedish:{}:{}", provider_tag(llm), llm.model);
+        state.cache.put(format!("{SYNCFAIL}{cache_key}"), "1".into(), SYNC_RETRY_TTL);
+
+        // No HTTP client is configured in this state, so reaching the upstream would fail
+        // differently — a 502 here means the marker short-circuited before any of that.
+        let resp = handle_translate(
+            &state,
+            &HeaderMap::new(),
+            &config,
+            "tt0111161",
+            "Swedish",
+            false,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        // The marker's value must never reach the client as a subtitle.
+        let body = String::from_utf8_lossy(
+            &http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes(),
+        )
+        .to_string();
+        assert_ne!(body.trim(), "1", "the retry marker was served as the response body");
+        // "recently" is what says the marker short-circuited rather than a fresh attempt failing:
+        // with no HTTP client both paths end in a 502, so the status alone proves nothing.
+        assert!(body.contains("recently"), "the marker did not short-circuit; body: {body}");
+    }
+
+    /// And the marker is scoped to the translation it belongs to: another language is a different
+    /// job and must still be attempted. Proven by the marker the ATTEMPT leaves behind — this state
+    /// has no HTTP client, so a Finnish run gets as far as failing on that and recording it, which
+    /// a short-circuit would never do.
+    #[tokio::test]
+    async fn a_remembered_failure_does_not_block_a_different_translation() {
+        let state = state("scoping");
+        let config = config_segment();
+        let cfg = userconfig::decode(state.config_keyring.as_ref(), &config).unwrap();
+        let llm = cfg.llm.as_ref().unwrap();
+        let key_for = |lang: &str| format!("translate:tt0111161:0:0:{lang}:{}:{}", provider_tag(llm), llm.model);
+        state.cache.put(format!("{SYNCFAIL}{}", key_for("Swedish")), "1".into(), SYNC_RETRY_TTL);
+
+        let finnish_marker = format!("{SYNCFAIL}{}", key_for("Finnish"));
+        assert!(state.cache.get(&finnish_marker).is_none(), "precondition: Finnish is unmarked");
+        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "Finnish", false).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            state.cache.get(&finnish_marker).is_some(),
+            "Finnish was short-circuited by Swedish's marker instead of being attempted"
         );
     }
 }
