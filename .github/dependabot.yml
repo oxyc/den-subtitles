@@ -1,0 +1,31 @@
+# Weekly dependency PRs, grouped so a refresh is one reviewable PR rather than twenty.
+#
+# Does NOT cover the tools we download by URL and pin by checksum (yt-dlp, deno) — dependabot has no
+# ecosystem for those, which is why they have their own workflows.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch/minor together: they are the ones that should be boring to review.
+      rust-minor:
+        update-types: [minor, patch]
+    labels: [dependencies]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    labels: [dependencies]
