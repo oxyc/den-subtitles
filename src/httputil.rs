@@ -135,6 +135,16 @@ fn if_none_match_matches(inm: &HeaderValue, etag: &HeaderValue) -> bool {
 
 /// Minimal percent-decode (`%XX` + `+`→space) — enough for the extra-args a Stremio client sends.
 pub fn percent_decode(s: &str) -> String {
+    decode(s, true)
+}
+
+/// Percent-decoding for a PATH segment, where `+` is a literal plus. Form-decoding a path turns
+/// "HDR10+.WEB-DL" into "HDR10 .WEB-DL", which is then what the release name is ranked on.
+pub fn percent_decode_path(s: &str) -> String {
+    decode(s, false)
+}
+
+fn decode(s: &str, plus_is_space: bool) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -151,7 +161,7 @@ pub fn percent_decode(s: &str) -> String {
                 out.push(b'%');
                 i += 1;
             }
-            b'+' => {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }

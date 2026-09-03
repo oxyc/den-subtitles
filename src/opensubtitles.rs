@@ -128,7 +128,7 @@ impl<'a> Client<'a> {
         let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY).await?;
         // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
         // enough. Anything with no cue in it cannot be one.
-        if crate::srt::parse(&body).is_empty() {
+        if !crate::srt::has_a_cue(&body) {
             return Err("subtitle link returned no cues".to_string());
         }
         Ok(body)

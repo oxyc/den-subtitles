@@ -120,7 +120,7 @@ impl SyncTools {
                 // having written nothing usable when handed a target they can't parse, and that
                 // empty string was cached for 60 days as the finished alignment — worse than the
                 // raw sub, which at least plays.
-                Ok(body) if crate::srt::parse(&body).is_empty() => {
+                Ok(body) if !crate::srt::has_a_cue(&body) => {
                     Err("sync produced no cues".to_string())
                 }
                 Ok(body) => Ok(body),

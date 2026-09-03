@@ -12,6 +12,31 @@ pub struct Cue {
     pub text: String,
 }
 
+/// Does this look like a subtitle at all? Answers the one-bit question without building the
+/// document: `parse` allocates a `Vec<&str>` over every line (~16 bytes per line, ~260 MB on a
+/// 12 MiB body of short lines) and the callers that ask this throw the cues away.
+pub fn has_a_cue(input: &str) -> bool {
+    // Mirrors `parse`'s rule for where a cue may start — a timing line, or an index line followed
+    // by one — but streams, stops at the first hit, and allocates nothing. It is deliberately the
+    // more eager of the two about block boundaries: this only ever answers "is this a subtitle at
+    // all, or an error page", so never rejecting a real one is what matters.
+    let mut at_block_start = true;
+    let mut after_index = false;
+    for line in input.split(['\n', '\r']) {
+        if line.trim().is_empty() {
+            at_block_start = true;
+            after_index = false;
+            continue;
+        }
+        if (at_block_start || after_index) && parse_timing(line).is_some() {
+            return true;
+        }
+        after_index = at_block_start && line.trim().parse::<u32>().is_ok();
+        at_block_start = false;
+    }
+    false
+}
+
 /// Parse an SRT document. Tolerant of CRLF, a UTF-8 BOM, and blank runs; a malformed block is
 /// skipped rather than aborting the whole file (a single bad cue shouldn't lose the movie).
 pub fn parse(input: &str) -> Vec<Cue> {
@@ -95,8 +120,10 @@ pub fn serialize(cues: &[Cue]) -> String {
         // Blank lines are dropped, not written: one inside a cue's text ENDS that cue for every
         // reader downstream, silently losing the rest of it. A translation model's output reaches
         // here verbatim, so this is the only place that can guarantee a parseable document.
+        // Split the way `parse` will read it back: `str::lines` ignores a lone `\r`, but `parse`
+        // promotes every one to a line break, so a cue holding "a\r\rb" would come back truncated.
         let mut first = true;
-        for line in c.text.lines().filter(|l| !l.trim().is_empty()) {
+        for line in c.text.split(['\n', '\r']).filter(|l| !l.trim().is_empty()) {
             if !first {
                 out.push('\n');
             }
@@ -158,6 +185,30 @@ mod tests {
         assert_eq!(serialize(&cues), src);
     }
 
+    /// The cheap gate must agree with the parser on what is and is not a subtitle — it stands in
+    /// for it on every downloaded body, so a false negative rejects a real subtitle outright.
+    #[test]
+    fn has_a_cue_agrees_with_the_parser() {
+        let cases = [
+            "1\n00:00:01,000 --> 00:00:02,000\nhi\n",
+            "00:00:01,000 --> 00:00:02,000\nno index\n",
+            "\n\n1\n00:00:01,000 --> 00:00:02,000\nleading blanks\n",
+            "1\r\n00:00:01,000 --> 00:00:02,000\r\ncrlf\r\n",
+            "1\n00:00:01.000 --> 00:00:02.000\ndot millis\n",
+            "<html><body>Forbidden</body></html>",
+            "",
+            "just some prose with no timings in it at all",
+            "1\n2\n3\n",
+        ];
+        for input in cases {
+            assert_eq!(
+                has_a_cue(input),
+                !parse(input).is_empty(),
+                "the cheap gate and the parser disagree on {input:?}"
+            );
+        }
+    }
+
     /// A cue whose text carries a blank line — which a translation model can return, since its
     /// output reaches serialize verbatim — must not end the cue early. It used to: everything after
     /// the blank line was lost, and the truncated document was cached for 60 days.
@@ -171,6 +222,26 @@ mod tests {
         assert_eq!(round_tripped.len(), 2, "a cue was lost");
         assert_eq!(round_tripped[0].text, "Hej.\nHur mår du?", "dialogue after the blank line went missing");
         assert_eq!(round_tripped[1].text, "Bra.");
+    }
+
+    /// `str::lines` ignores a lone `\r` but `parse` promotes every one to a line break, so
+    /// splitting on `\n` alone let "a\r\rb" through as one physical line that read back as a cue
+    /// broken in half. A model returning a bare CR is legal JSON.
+    #[test]
+    fn a_lone_carriage_return_does_not_truncate_a_cue() {
+        for text in ["Hej.\r\rHur mår du?", "Hej.\n\rHur mår du?", "Hej.\r\n\rHur mår du?"] {
+            let cues = vec![
+                Cue { index: 1, start: 1000, end: 2000, text: text.into() },
+                Cue { index: 2, start: 3000, end: 4000, text: "Bra.".into() },
+            ];
+            let round_tripped = parse(&serialize(&cues));
+            assert_eq!(round_tripped.len(), 2, "a cue was lost for {text:?}");
+            assert!(
+                round_tripped[0].text.contains("Hur mår du?"),
+                "dialogue after the CR went missing for {text:?}: {:?}",
+                round_tripped[0].text
+            );
+        }
     }
 
     #[test]

@@ -63,11 +63,15 @@ async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Res
     // A wrong-length reply degrades to keeping the source text, which is right for one stray cue and
     // wrong for a film: a consistently misbehaving model hits that leaf for every cue and returns the
     // untranslated original, which then caches for 60 days as a successful translation.
-    let untranslated = AtomicUsize::new(0);
+    let budget = Budget {
+        untranslated: AtomicUsize::new(0),
+        calls: AtomicUsize::new(0),
+        max_calls: call_budget(cues.len()),
+    };
 
     for batch in cues.chunks(BATCH) {
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let translated = translate_batch(upstream, &sources, &context, &untranslated).await?;
+        let translated = translate_batch(upstream, &sources, &context, &budget).await?;
         for (cue, text) in batch.iter().zip(translated) {
             context.push((cue.text.clone(), text.clone()));
             out.push(Cue { text, ..cue.clone() });
@@ -79,13 +83,13 @@ async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Res
         // 2n-1 calls a batch, so running to the end means thousands of paid calls to learn what the
         // opening showed. Only after a real sample, though — the first batch is title cards and
         // song lyrics, the harshest forty cues in the film.
-        let kept = untranslated.load(Ordering::Relaxed);
-        if out.len() >= MIN_GATE_SAMPLE && unusable(kept, out.len()) {
+        let kept = budget.untranslated.load(Ordering::Relaxed);
+        if out.len() >= MIN_GATE_SAMPLE && hopeless(kept, out.len()) {
             return Err(format!("model returned unusable output for {kept} of {} cues", out.len()));
         }
     }
     // The verdict for the film as a whole, which is also the only gate a short track ever meets.
-    let kept = untranslated.load(Ordering::Relaxed);
+    let kept = budget.untranslated.load(Ordering::Relaxed);
     if unusable(kept, cues.len()) {
         return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
     }
@@ -95,12 +99,34 @@ async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Res
 
 /// Cues that must be seen before the ratio is allowed to abort a run mid-film.
 const MIN_GATE_SAMPLE: usize = 120;
+/// Fallbacks below this never condemn a run, however small it is. A signs-only track is mostly
+/// proper nouns and place names, and those legitimately come back unchanged.
+const MIN_UNUSABLE: usize = 8;
 
-/// Has too much come back unusable to call this a translation? A single stray cue never trips it —
-/// that one is what the keep-the-source fallback is for — but a model wrong more than a quarter of
+/// Has too much come back unusable to call this a translation? A model wrong more than a quarter of
 /// the time is not translating, and its output must not be cached as though it were.
 fn unusable(kept: usize, seen: usize) -> bool {
-    kept > 1 && kept * 4 > seen
+    kept >= MIN_UNUSABLE && kept * 4 > seen
+}
+
+/// The mid-run bail is deliberately harsher than the verdict: it exists to stop paying for a run
+/// that is clearly lost, and a film is only judged in full at the end.
+fn hopeless(kept: usize, seen: usize) -> bool {
+    kept >= MIN_UNUSABLE && kept * 2 > seen
+}
+
+/// Upstream calls a run may make. The happy path is one per batch; a wrong-length reply splits into
+/// 2n-1, and the ratio gate only catches that when the fallbacks are frequent enough — at exactly a
+/// quarter it fired never and cost 8,850 calls on one request. This bounds the bill regardless.
+fn call_budget(cues: usize) -> usize {
+    20 * cues.div_ceil(BATCH) + 40
+}
+
+/// What a run is allowed to spend, and what it has spent.
+struct Budget {
+    untranslated: AtomicUsize,
+    calls: AtomicUsize,
+    max_calls: usize,
 }
 
 /// One upstream call: a batch of source lines in, the same number of translated lines out (or an
@@ -144,10 +170,13 @@ async fn translate_batch(
     upstream: &(dyn BatchCall + Sync),
     sources: &[String],
     context: &[(String, String)],
-    untranslated: &AtomicUsize,
+    budget: &Budget,
 ) -> Result<Vec<String>, String> {
     if sources.is_empty() {
         return Ok(Vec::new());
+    }
+    if budget.calls.fetch_add(1, Ordering::Relaxed) >= budget.max_calls {
+        return Err("translation exceeded its upstream call budget".to_string());
     }
     let result = upstream.call(sources, context).await;
 
@@ -160,9 +189,9 @@ async fn translate_batch(
             let dead = v
                 .iter()
                 .zip(sources.iter())
-                .filter(|(t, s)| !s.trim().is_empty() && (t.trim().is_empty() || t == s))
+                .filter(|(t, s)| !s.trim().is_empty() && (t.trim().is_empty() || t.trim() == s.trim()))
                 .count();
-            untranslated.fetch_add(dead, Ordering::Relaxed);
+            budget.untranslated.fetch_add(dead, Ordering::Relaxed);
             Ok(v)
         }
         // Only a CONTRACT violation splits. An upstream error is not one — splitting on it spent six
@@ -172,8 +201,8 @@ async fn translate_batch(
             // don't thread the first half's output into the second here — keeps the split simple.
             let mid = sources.len() / 2;
             // Box the recursive futures — an async fn can't hold an unboxed future of itself.
-            let mut left = Box::pin(translate_batch(upstream, &sources[..mid], context, untranslated)).await?;
-            let right = Box::pin(translate_batch(upstream, &sources[mid..], context, untranslated)).await?;
+            let mut left = Box::pin(translate_batch(upstream, &sources[..mid], context, budget)).await?;
+            let right = Box::pin(translate_batch(upstream, &sources[mid..], context, budget)).await?;
             left.extend(right);
             Ok(left)
         }
@@ -181,7 +210,7 @@ async fn translate_batch(
         // whole film (one untranslated line beats no subtitles). Counted, because a model that is
         // consistently wrong drives EVERY cue to this leaf and returns the source film verbatim.
         Ok(_) => {
-            untranslated.fetch_add(sources.len(), Ordering::Relaxed);
+            budget.untranslated.fetch_add(sources.len(), Ordering::Relaxed);
             Ok(sources.to_vec())
         }
         Err(e) => Err(e),
@@ -426,8 +455,12 @@ mod contract_tests {
 
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, String> {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
-        let untranslated = AtomicUsize::new(0);
-        translate_batch(upstream, &src, &[], &untranslated).await
+        let budget = Budget {
+            untranslated: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            max_calls: call_budget(n),
+        };
+        translate_batch(upstream, &src, &[], &budget).await
     }
 
     /// A reply of the right LENGTH but the wrong SHAPE must not be accepted. `as_str()` on a non-string
@@ -467,12 +500,42 @@ mod contract_tests {
 
     /// A model that is consistently wrong-length drives EVERY cue to that same leaf, and the result is
     /// the untranslated film returned as a success. `translate` must refuse it rather than cache it.
+    /// A model wrong at every size drives the split to every leaf, so every cue keeps its source —
+    /// the untranslated film. It must fail, and it must stop paying to find that out. Which of the
+    /// two guards trips is not the point; that neither lets it through, and that the bill is
+    /// bounded, is.
     #[tokio::test]
     async fn a_wholly_unusable_model_is_an_error_not_an_untranslated_film() {
-        // Wrong length at every size, so the split bottoms out on every cue and each keeps its source.
         let up = fake(|s: &[String]| Ok(vec!["junk".to_string(); s.len() + 1]));
-        let err = run_translation(&up, &cues(60)).await.unwrap_err();
-        assert!(err.contains("unusable"), "unexpected error: {err}");
+        assert!(run_translation(&up, &cues(60)).await.is_err(), "an untranslated film was returned");
+        assert!(
+            *up.calls.lock().unwrap() <= call_budget(60),
+            "spent {} calls against a budget of {}",
+            up.calls.lock().unwrap(),
+            call_budget(60)
+        );
+    }
+
+    /// The budget is the guard for the case the ratio cannot see: a model wrong on exactly a
+    /// quarter of cues never trips `unusable` (`kept * 4 > seen` is false at exactly a quarter) and
+    /// used to run to the end at ~60 calls a batch — 8,850 on one request the viewer is waiting on.
+    #[tokio::test]
+    async fn a_run_cannot_outspend_its_call_budget() {
+        let up = fake(|s: &[String]| {
+            // Wrong-length whenever the batch holds a cue whose number is divisible by 4.
+            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n % 4 == 0)) {
+                Ok(vec!["junk".to_string(); s.len() + 1])
+            } else {
+                Ok(s.iter().map(|t| format!("T:{t}")).collect())
+            }
+        });
+        let budget = call_budget(2000);
+        let _ = run_translation(&up, &cues(2000)).await;
+        assert!(
+            *up.calls.lock().unwrap() <= budget,
+            "spent {} calls against a budget of {budget}",
+            up.calls.lock().unwrap()
+        );
     }
 
     /// A short track must not be failed by one odd line. `kept * 4 > seen` alone fails a 3-cue
@@ -519,13 +582,45 @@ mod contract_tests {
     /// original language, the blanks show nothing at all.
     #[tokio::test]
     async fn a_right_length_reply_that_translated_nothing_is_refused() {
-        let echo = fake(|s: &[String]| Ok(s.to_vec()));
-        let err = run_translation(&echo, &cues(200)).await.unwrap_err();
-        assert!(err.contains("unusable"), "an echo of the source was accepted: {err}");
+        // An exact echo, and the four ways a model dresses one up. Comparing byte-exact caught only
+        // the first: a trailing newline is the commonest shape of LLM string output, and
+        // `srt::serialize` strips it, so the cached artifact was byte-identical to the source.
+        for (name, decorate) in [
+            ("exact", "" as &str),
+            ("trailing newline", "\n"),
+            ("trailing space", " "),
+            ("trailing tab", "\t"),
+        ] {
+            let echo = fake(move |s: &[String]| Ok(s.iter().map(|t| format!("{t}{decorate}")).collect()));
+            let err = run_translation(&echo, &cues(200)).await.unwrap_err();
+            assert!(err.contains("unusable"), "an echo ({name}) was accepted: {err}");
+        }
+        // A leading space is the same trick from the other end.
+        let echo = fake(|s: &[String]| Ok(s.iter().map(|t| format!(" {t}")).collect()));
+        assert!(run_translation(&echo, &cues(200)).await.is_err(), "a leading-space echo was accepted");
 
         let blanks = fake(|s: &[String]| Ok(vec![String::new(); s.len()]));
         let err = run_translation(&blanks, &cues(200)).await.unwrap_err();
         assert!(err.contains("unusable"), "a reply of empty strings was accepted: {err}");
+    }
+
+    /// A signs-only or forced-narrative track is mostly proper nouns and place names, which
+    /// legitimately come back unchanged. The ratio alone rejected four matches in a twelve-cue
+    /// track — and a rejection costs the full LLM bill and caches nothing, so every retry re-pays.
+    #[tokio::test]
+    async fn a_short_track_of_mostly_names_still_translates() {
+        for (total, matching) in [(8usize, 3usize), (12, 4), (20, 6)] {
+            let up = fake(move |s: &[String]| {
+                Ok(s.iter()
+                    .map(|t| {
+                        let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
+                        if n < matching { t.clone() } else { format!("T:{t}") }
+                    })
+                    .collect())
+            });
+            let out = run_translation(&up, &cues(total)).await;
+            assert!(out.is_ok(), "{matching} names in a {total}-cue track was rejected: {out:?}");
+        }
     }
 
     /// A handful of cues that legitimately come back unchanged — names, numbers, "OK" — must not

@@ -19,7 +19,7 @@ use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
 use serde_json::{json, Value};
 
-use crate::httputil::{self, percent_decode, Body};
+use crate::httputil::{self, Body};
 use crate::opensubtitles;
 use crate::state::AppState;
 use crate::userconfig::{self, LlmConfig, UserConfig};
@@ -113,7 +113,7 @@ fn extra_field(extra: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     for pair in extra.split('&') {
         if let Some(v) = pair.strip_prefix(&prefix) {
-            let v = percent_decode(v);
+            let v = httputil::percent_decode_path(v);
             if !v.is_empty() {
                 return Some(v);
             }
@@ -711,5 +711,13 @@ mod sync_fallback_tests {
         // And a value cannot forge a field the client never sent.
         let forged = "filename=movie%26videoHash%3Dcafebabecafebabe.mkv";
         assert_eq!(extra_field(forged, "videoHash"), None, "a filename forged a videoHash");
+
+        // The extras arrive as a PATH segment, where `+` is a literal plus. Form-decoding it turned
+        // every HDR10+ / DTS-HD 7.1+ release name into one the ranker scores differently.
+        let plus = "filename=Movie.2013.2160p.HDR10+.WEB-DL.mkv";
+        assert_eq!(
+            extra_field(plus, "filename").as_deref(),
+            Some("Movie.2013.2160p.HDR10+.WEB-DL.mkv")
+        );
     }
 }

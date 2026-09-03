@@ -338,22 +338,26 @@ mod tests {
     #[test]
     fn the_sweep_bounds_the_disk_tier() {
         let dir = tmpdir("sweep");
-        // Budget fits roughly two entries, so a third must push the oldest out.
-        let c = Cache::new(120, Some(dir.clone()));
+        // Budget fits one entry, so after the expired one is dropped the oldest must still go.
+        let c = Cache::new(60, Some(dir.clone()));
         c.put("expired".into(), "x".repeat(40), Duration::from_secs(0));
         c.put("old".into(), "x".repeat(40), HOUR);
         std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime has 1s resolution
         c.put("new".into(), "x".repeat(40), HOUR);
 
         let expired_path = c.disk_path("expired").unwrap();
+        let old_path = c.disk_path("old").unwrap();
         c.sweep();
+        // Both branches must have run: dropping the expired entry alone left the store under
+        // budget, so this test used to return before the eviction loop it exists to cover.
+        assert!(!old_path.exists(), "the eviction loop did not run — the oldest entry survived");
         // Assert the FILE is gone, not that `get` misses — `disk_get` expires lazily on read, so a
         // `get` returning None passes whether or not the sweep did anything at all.
         assert!(!expired_path.exists(), "the sweep left an expired entry on disk");
-        let fresh = Cache::new(120, Some(dir.clone()));
+        let fresh = Cache::new(60, Some(dir.clone()));
         assert_eq!(fresh.get("new"), Some("x".repeat(40)), "the newest entry must survive");
         let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
-        assert!(bytes <= 120, "the sweep left {bytes} bytes on disk, over the 120 budget");
+        assert!(bytes <= 60, "the sweep left {bytes} bytes on disk, over the 60 budget");
     }
 
     /// A sweep must never remove a live entry while it is still under budget — evicting eagerly
