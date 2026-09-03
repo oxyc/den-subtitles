@@ -179,6 +179,21 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     println!("den-subtitles on :{port} (keys are per-install; build one at /configure)");
 
+    // Reclaim the disk cache hourly. `Cache::new` sweeps at boot, which bounds the store across
+    // restarts but not within one — a container that stays up keeps writing entries that only a
+    // repeat request for the same key would ever expire.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.tick().await; // fires immediately; the boot sweep already ran
+            loop {
+                tick.tick().await;
+                state.cache.sweep();
+            }
+        });
+    }
+
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(pair) => pair,
