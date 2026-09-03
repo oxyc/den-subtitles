@@ -65,15 +65,23 @@ pub fn json<T: Serialize>(status: StatusCode, value: &T, cache_control: &str) ->
     b.body(Full::new(Bytes::from(bytes))).unwrap()
 }
 
-/// A subtitle payload served as text (SRT). Cached hard and `immutable` — a given file_id/sync
-/// variant is byte-stable forever, so the client never needs to revalidate it. Carries a strong
-/// ETag anyway so a conditional request can still collapse to a 304.
+/// A settled subtitle: this file_id/sync variant is byte-stable forever, so `immutable` and a year.
 pub fn srt(body: String) -> Response<Body> {
+    srt_cached(body, "public, max-age=31536000, immutable")
+}
+
+/// A subtitle we may yet serve differently — the requested alignment failed and this is the raw
+/// fallback. `immutable` would pin the client to it for a year, so it must revalidate instead.
+pub fn srt_provisional(body: String) -> Response<Body> {
+    srt_cached(body, "public, max-age=60, must-revalidate")
+}
+
+fn srt_cached(body: String, cache_control: &str) -> Response<Body> {
     let etag = etag_of(body.as_bytes());
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/x-subrip; charset=utf-8")
-        .header(CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(CACHE_CONTROL, cache_control)
         .header(ETAG, etag)
         .body(Full::new(Bytes::from(body)))
         .unwrap()
