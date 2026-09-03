@@ -125,23 +125,29 @@ impl Cache {
     fn disk_get(&self, key: &str) -> Option<(String, Duration)> {
         let path = self.disk_path(key)?;
         let raw = std::fs::read_to_string(&path).ok()?;
-        // Format: "<expiry-unix-secs> <value-bytes>\n<value>". The length is what makes a torn file
-        // detectable: without it any prefix carrying a newline parses as a complete entry, so a
-        // half-written file is hoisted into memory and served for the rest of its TTL.
+        match Self::parse_entry(&raw) {
+            Some(fresh) => Some(fresh),
+            // Expired, torn, or written by an older format. All three are unusable, and all three
+            // are dropped — an unreadable file left in place is never reclaimed by anything.
+            None => {
+                let _ = std::fs::remove_file(&path);
+                None
+            }
+        }
+    }
+
+    /// Format: "<expiry-unix-secs> <value-bytes>\n<value>". The length is what makes a torn file
+    /// detectable: without it any prefix carrying a newline parses as a complete entry, so a
+    /// half-written file is hoisted into memory and served for the rest of its TTL.
+    fn parse_entry(raw: &str) -> Option<(String, Duration)> {
         let (head, value) = raw.split_once('\n')?;
         let (expiry, len) = head.split_once(' ')?;
         let expiry: u64 = expiry.parse().ok()?;
-        let len: usize = len.parse().ok()?;
-        if value.len() != len {
-            let _ = std::fs::remove_file(&path);
+        if value.len() != len.parse::<usize>().ok()? {
             return None;
         }
         let now = unix_now();
-        if expiry <= now {
-            let _ = std::fs::remove_file(&path);
-            return None;
-        }
-        Some((value.to_string(), Duration::from_secs(expiry - now)))
+        (expiry > now).then(|| (value.to_string(), Duration::from_secs(expiry - now)))
     }
 
     fn disk_put(&self, key: &str, value: &str, ttl: Duration) {
@@ -222,6 +228,22 @@ mod tests {
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(files.len(), 1, "a put left scratch behind: {:?}", files.iter().map(|f| f.file_name()).collect::<Vec<_>>());
         assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v2".into()));
+    }
+
+    /// An entry this build cannot read is deleted, not left behind. The format changed to carry a
+    /// length, so every pre-upgrade file is unreadable — on a persistent volume with no disk budget,
+    /// leaving them is a leak that nothing ever reclaims.
+    #[test]
+    fn an_unreadable_entry_is_reclaimed() {
+        let dir = tmpdir("stale");
+        let c = Cache::new(1 << 20, Some(dir.clone()));
+        c.put("k".into(), "v".into(), HOUR);
+        let path = c.disk_path("k").unwrap();
+        for raw in ["999999999999\nold format, no length", "", "garbage"] {
+            std::fs::write(&path, raw).unwrap();
+            assert_eq!(Cache::new(1 << 20, Some(dir.clone())).get("k"), None, "served {raw:?}");
+            assert!(!path.exists(), "left an unreadable entry on disk: {raw:?}");
+        }
     }
 
     #[test]

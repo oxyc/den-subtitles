@@ -19,25 +19,42 @@ pub fn parse(input: &str) -> Vec<Cue> {
     let mut cues = Vec::new();
     // Normalise CRLF first so a line break is one character everywhere below.
     let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
-    // A separator is a line with nothing but whitespace on it — not the literal "\n\n".
+    // An empty line always separates cues. A line holding only whitespace separates only when a cue
+    // header follows it.
     //
-    // Real OpenSubtitles files carry separator lines holding a space or a tab, and splitting on
-    // "\n\n" does not see those: the next cue stays inside the previous block, where the index and
-    // timing lines are already taken, so its timecode is joined onto the previous cue's dialogue.
-    // The result is not a dropped line but a wrong one — cue 2 vanishes, its words display at cue
-    // 1's timestamp, and "00:00:05,000 --> 00:00:06,000" renders on screen as a line of dialogue
-    // and is sent to the translator as text. One stray space silently eats the rest of the block.
+    // Real OpenSubtitles files carry separator lines with a space or a tab on them, and splitting on
+    // "\n\n" missed those: the next cue stayed inside the previous block, where the index and timing
+    // lines were already taken, so its timecode was joined onto the previous cue's dialogue — cue 2
+    // gone, its words shown at cue 1's timestamp, its timecode rendered as dialogue. But treating
+    // every blank-ish line as a separator is the same bug mirrored: a padded line INSIDE a cue would
+    // truncate it and drop the dialogue after it. Only the lookahead tells the two apart.
+    let lines: Vec<&str> = normalized.split('\n').collect();
     let mut block: Vec<&str> = Vec::new();
-    for line in normalized.split('\n') {
-        if line.trim().is_empty() {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.is_empty() || (line.trim().is_empty() && starts_a_cue(&lines[i + 1..])) {
             push_cue(&mut cues, &block);
             block.clear();
-        } else {
-            block.push(line);
+            while i < lines.len() && lines[i].trim().is_empty() {
+                i += 1;
+            }
+            continue;
         }
+        block.push(line);
+        i += 1;
     }
     push_cue(&mut cues, &block);
     cues
+}
+
+/// Does the next non-blank line begin a cue — an index followed by a timing line, or a bare timing
+/// line? Used only to decide whether a whitespace-padded line is a separator or part of the text.
+fn starts_a_cue(rest: &[&str]) -> bool {
+    let mut it = rest.iter().skip_while(|l| l.trim().is_empty());
+    let Some(first) = it.next() else { return true }; // trailing padding ends the file
+    parse_timing(first).is_some()
+        || (first.trim().parse::<u32>().is_ok() && it.next().is_some_and(|l| parse_timing(l).is_some()))
 }
 
 /// Turn one block's lines into a cue, skipping anything malformed — a single bad cue shouldn't
@@ -175,6 +192,30 @@ mod separator_tests {
         let cues = parse(input);
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[1].start, 5000);
+    }
+
+    /// The converse of the rule above, and the case the first version of this fix regressed: a
+    /// padded line INSIDE a cue is dialogue, not a separator. Treating it as one truncated the cue
+    /// and dropped everything after it — cue A rendered blank, its second line gone.
+    #[test]
+    fn a_padded_line_inside_a_cue_keeps_the_dialogue_after_it() {
+        let cues = parse("1\n00:00:01,000 --> 00:00:04,000\n \n- Hello there.\n\n2\n00:00:05,000 --> 00:00:06,000\nsecond\n");
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, " \n- Hello there.", "the dialogue after the padded line was dropped");
+        assert_eq!(cues[1].text, "second");
+
+        let cues = parse("1\n00:00:01,000 --> 00:00:04,000\nHello.\n \nGoodbye.\n\n2\n00:00:05,000 --> 00:00:06,000\nsecond\n");
+        assert_eq!(cues[0].text, "Hello.\n \nGoodbye.");
+        assert_eq!(cues.len(), 2);
+    }
+
+    /// An EMPTY line always separates, whatever follows — that is the format, and it is how a
+    /// malformed block gets skipped rather than folded into its neighbour's dialogue.
+    #[test]
+    fn an_empty_line_separates_even_before_garbage() {
+        let cues = parse("1\n00:00:01,000 --> 00:00:02,000\nline one\n\nGARBAGE\n\n2\n00:00:03,000 --> 00:00:04,000\nnext\n");
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "line one", "garbage was folded into the cue text");
     }
 
     /// Runs of blank lines are not empty cues, and a file that ends without a trailing newline

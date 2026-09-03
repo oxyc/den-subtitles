@@ -75,13 +75,23 @@ async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Res
         if context.len() > CONTEXT_WINDOW {
             context.drain(..context.len() - CONTEXT_WINDOW);
         }
-    }
-    let kept = untranslated.load(Ordering::Relaxed);
-    if kept * 4 > cues.len() {
-        return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
+        // Checked per batch, not once at the end: a wrong-length model costs 2n-1 calls per batch
+        // (79 for a 40-cue batch), so waiting for the whole film means ~3000 paid calls to learn
+        // what the first batch already showed.
+        let kept = untranslated.load(Ordering::Relaxed);
+        if unusable(kept, out.len()) {
+            return Err(format!("model returned unusable output for {kept} of {} cues", out.len()));
+        }
     }
     debug_assert_eq!(out.len(), cues.len());
     Ok(out)
+}
+
+/// Has too much come back unusable to call this a translation? A single stray cue never trips it —
+/// that one is what the keep-the-source fallback is for — but a model wrong more than a quarter of
+/// the time is not translating, and its output must not be cached as though it were.
+fn unusable(kept: usize, seen: usize) -> bool {
+    kept > 1 && kept * 4 > seen
 }
 
 /// One upstream call: a batch of source lines in, the same number of translated lines out (or an
@@ -441,6 +451,25 @@ mod contract_tests {
         let up = fake(|s: &[String]| Ok(vec!["junk".to_string(); s.len() + 1]));
         let err = run_translation(&up, &cues(60)).await.unwrap_err();
         assert!(err.contains("unusable"), "unexpected error: {err}");
+    }
+
+    /// A short track must not be failed by one odd line. `kept * 4 > seen` alone fails a 3-cue
+    /// forced-narrative track on a single fallback, which is precisely the case the fallback exists
+    /// to serve.
+    #[tokio::test]
+    async fn one_bad_cue_never_fails_a_short_track() {
+        let up = fake(|s: &[String]| {
+            if s.len() == 1 && s[0] == "line 1" {
+                Ok(vec!["junk".into(), "junk".into()])
+            } else if s.iter().any(|t| t == "line 1") {
+                Ok(vec!["junk".to_string(); s.len() + 1])
+            } else {
+                Ok(s.iter().map(|t| format!("T:{t}")).collect())
+            }
+        });
+        let out = run_translation(&up, &cues(3)).await.expect("one odd line must not fail a 3-cue track");
+        assert_eq!(out[1].text, "line 1", "the odd cue keeps its source");
+        assert_eq!(out[0].text, "T:line 0");
     }
 
     /// The gate must not fire on a film that mostly translated — a handful of odd lines is the case

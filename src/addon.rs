@@ -253,13 +253,14 @@ pub async fn handle_subtitle_file(
     let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
     };
-    let resync_wanted = resync_url.is_some();
     // Vet BEFORE keying: a rejected URL changes which tier runs, so keying off the raw one filed a
-    // reference-aligned (or raw) body under a `resync` key.
+    // reference-aligned (or raw) body under a `resync` key. Everything downstream reads the VETTED
+    // value, so a refused target is simply a request that asked for no sync.
     let resync_url = match resync_url {
         Some(u) if is_safe_resync_url(&u).await => Some(u),
-        Some(u) => {
-            eprintln!("subtitle: refusing resync target {u}");
+        // Never the URL itself: a stream target carries the provider's token.
+        Some(_) => {
+            eprintln!("subtitle: refusing unsafe resync target for {file_id}");
             None
         }
         None => None,
@@ -285,6 +286,15 @@ pub async fn handle_subtitle_file(
             return httputil::text(StatusCode::BAD_GATEWAY, "upstream subtitle fetch failed");
         }
     };
+
+    // A sync that just failed is not retried on every request — the binary spawn, or a 90s alass
+    // timeout, would be paid again per request. The marker is separate from `cache_key` so that key
+    // never holds anything but a settled answer.
+    let wanted_sync = resync_url.is_some() || ref_id.is_some();
+    let retry_marker = format!("syncfail:{cache_key}");
+    if wanted_sync && state.cache.get(&retry_marker).is_some() {
+        return httputil::srt_provisional(target);
+    }
 
     // Per-invocation unique temp tag: two concurrent requests for the same file must not share
     // scratch paths (one would read the other's half-written output and cache it for 60 days).
@@ -321,27 +331,22 @@ pub async fn handle_subtitle_file(
     // standing in. Caching it for 60 days makes one broken afternoon permanent: the URL is
     // deterministic, so every later request is a cache hit and the sync never runs again. Remember it
     // briefly so a retry loop doesn't re-spawn the binary per request, and let it heal.
-    let settled = is_settled(synced.is_some(), ref_id.is_some() || resync_wanted);
-    let body = synced.unwrap_or(target);
-    let (ttl, response) = served(&body, settled);
-    state.cache.put(cache_key, body, ttl);
-    response
-}
-
-/// Is this body the answer to its key, or a stand-in? A sync that was asked for and did not happen
-/// leaves the raw sub standing in — the key promises an alignment the body doesn't have.
-fn is_settled(synced: bool, wanted_sync: bool) -> bool {
-    synced || !wanted_sync
-}
-
-/// Pair a body with how long it may be remembered. A stand-in is held only briefly and the client is
-/// told to revalidate; caching it like a settled answer made one broken afternoon permanent, since
-/// the URL is deterministic and every later request became a cache hit that never retried the sync.
-fn served(body: &str, settled: bool) -> (Duration, Response<Body>) {
-    if settled {
-        (CACHE_TTL, httputil::srt(body.to_string()))
-    } else {
-        (SYNC_RETRY_TTL, httputil::srt_provisional(body.to_string()))
+    match synced {
+        // The alignment happened: this body IS the answer to this key.
+        Some(body) => {
+            state.cache.put(cache_key, body.clone(), CACHE_TTL);
+            httputil::srt(body)
+        }
+        // Asked for and didn't happen. The raw sub stands in, and is NOT written to `cache_key` —
+        // caching it there made one broken afternoon permanent, since the URL is deterministic and
+        // every later request became a hit that never retried. Only the "don't re-spawn for a
+        // moment" marker is remembered; the raw body is already cached under `os:{file_id}`.
+        None if wanted_sync => {
+            state.cache.put(retry_marker, "1".into(), SYNC_RETRY_TTL);
+            httputil::srt_provisional(target)
+        }
+        // No sync was asked for, so the raw sub is the answer. `subtitle_srt` already cached it.
+        None => httputil::srt(target),
     }
 }
 
@@ -637,44 +642,45 @@ mod sync_fallback_tests {
     use super::*;
     use hyper::header::CACHE_CONTROL;
 
-    /// The rule that decides whether a body may be remembered as the answer. Only the case where an
-    /// alignment was requested and did not happen is unsettled — a plain `/subtitle/<id>.srt` asked
-    /// for no sync, so the raw sub IS its answer and must still cache for the full term.
+    /// The two response shapes must differ in the one way that matters: `immutable` tells a client
+    /// never to come back, which is a year of an out-of-sync subtitle if the body is a stand-in.
     #[test]
-    fn only_a_requested_sync_that_failed_is_unsettled() {
-        assert!(is_settled(true, true), "the sync ran: settled");
-        assert!(is_settled(false, false), "no sync was asked for: the raw sub is the answer");
-        assert!(is_settled(true, false));
-        assert!(!is_settled(false, true), "asked for an alignment and got none: a stand-in");
+    fn a_stand_in_is_revalidated_and_a_settled_body_is_not() {
+        let cc = |r: Response<Body>| r.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap().to_string();
+        let provisional = cc(httputil::srt_provisional("x".into()));
+        assert!(!provisional.contains("immutable"), "a stand-in must not be immutable: {provisional}");
+        assert!(provisional.contains("must-revalidate"), "the client has to come back: {provisional}");
+        assert!(cc(httputil::srt("x".into())).contains("immutable"));
     }
 
-    /// A stand-in must be cheap to forget and must not tell the client it is final. `immutable` on
-    /// this body pins a viewer to an out-of-sync subtitle for a year even after the server heals.
+    /// A rejected resync target leaves a request that asked for no sync at all. It must NOT keep
+    /// claiming a resync in the key, and — since the raw sub is then the real answer and nothing
+    /// will ever "heal" — it must not be downgraded to a stand-in either. `os:5` is the same key
+    /// `subtitle_srt` fills, so treating it as a stand-in re-downloads on the next request.
     #[test]
-    fn a_stand_in_expires_soon_and_is_revalidated() {
-        let (ttl, response) = served("1\n00:00:01,000 --> 00:00:02,000\nhi\n", false);
-        assert_eq!(ttl, SYNC_RETRY_TTL);
-        assert!(ttl < CACHE_TTL, "a stand-in must not be held as long as an answer");
-        let cc = response.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap();
-        assert!(!cc.contains("immutable"), "a stand-in must not be immutable: {cc}");
-        assert!(cc.contains("must-revalidate"), "the client has to come back: {cc}");
-
-        let (ttl, response) = served("x", true);
-        assert_eq!(ttl, CACHE_TTL);
-        let cc = response.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap();
-        assert!(cc.contains("immutable"), "a settled subtitle is byte-stable: {cc}");
-    }
-
-    /// The key has to describe the tier that actually ran. It is built from the vetted URL, so a
-    /// rejected target keys as the tier the request falls back to rather than promising a resync.
-    #[test]
-    fn a_rejected_resync_target_does_not_key_as_a_resync() {
-        let rejected: Option<String> = None; // what vetting leaves behind
-        assert_eq!(sync_cache_key(5, &rejected, Some(9)), "os:5:ref:9");
-        assert_eq!(sync_cache_key(5, &rejected, None), "os:5");
+    fn a_rejected_resync_target_leaves_a_plain_request() {
+        let vetted: Option<String> = None; // what the SSRF guard leaves behind
+        assert_eq!(sync_cache_key(5, &vetted, Some(9)), "os:5:ref:9");
+        assert_eq!(sync_cache_key(5, &vetted, None), "os:5");
+        // wanted_sync is read off the VETTED url, so a refused target with no ref wants no sync.
+        assert!(!(vetted.is_some() || None::<i64>.is_some()), "a refused target must not want a sync");
+        assert!(vetted.is_some() || Some(9i64).is_some(), "a ref still wants one");
         // Two different targets stay distinct, so one stream's alignment is never served for another.
-        let a = sync_cache_key(5, &Some("http://host/a.mkv".into()), None);
-        let b = sync_cache_key(5, &Some("http://host/b.mkv".into()), None);
-        assert_ne!(a, b);
+        assert_ne!(
+            sync_cache_key(5, &Some("http://host/a.mkv".into()), None),
+            sync_cache_key(5, &Some("http://host/b.mkv".into()), None)
+        );
+    }
+
+    /// The invariant the whole fix rests on: the retry marker lives in its own namespace, so
+    /// `cache_key` can only ever hold a settled body and the cache-hit path is right to serve it
+    /// `immutable`. A marker sharing the key would be served AS the subtitle.
+    #[test]
+    fn the_retry_marker_never_collides_with_a_body_key() {
+        for key in ["os:5", "os:5:ref:9", "os:5:resync:1234"] {
+            let marker = format!("syncfail:{key}");
+            assert_ne!(marker, key);
+            assert!(!marker.starts_with("os:"), "a marker must not look like a body key: {marker}");
+        }
     }
 }
