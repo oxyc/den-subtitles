@@ -47,10 +47,62 @@ impl Cache {
                 None
             }
         });
-        Cache {
+        let cache = Cache {
             inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, tick: 0 }),
             max_bytes,
             dir,
+        };
+        cache.sweep();
+        cache
+    }
+
+    /// Bound the disk tier. `max_bytes` caps memory only, and nothing else reclaims disk: an entry
+    /// is deleted lazily by `disk_get`, which needs someone to ask for that exact key again — and
+    /// search keys carry a per-file hash, so once a title is watched its entry is never re-read.
+    /// On a persistent volume that grows forever.
+    ///
+    /// Expired first, then oldest-written until under budget. Cheap enough to run on a timer: one
+    /// readdir plus a stat per file, over a directory of small text entries.
+    pub fn sweep(&self) {
+        let Some(dir) = self.dir.as_ref() else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let now = unix_now();
+        let mut live: Vec<(u64, u64, PathBuf)> = Vec::new(); // (mtime, size, path)
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            // Read only the header line: the value can be megabytes and is not needed to judge it.
+            let expired = match std::fs::read_to_string(&path) {
+                Ok(raw) => Self::parse_entry(&raw).is_none(),
+                Err(_) => true,
+            };
+            if expired {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(now, |d| d.as_secs());
+            live.push((mtime, meta.len(), path));
+        }
+        let mut total: u64 = live.iter().map(|(_, size, _)| size).sum();
+        let budget = self.max_bytes as u64;
+        if total <= budget {
+            return;
+        }
+        live.sort_by_key(|(mtime, _, _)| *mtime);
+        for (_, size, path) in live {
+            if total <= budget {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= size;
+            }
         }
     }
 
@@ -244,6 +296,41 @@ mod tests {
             assert_eq!(Cache::new(1 << 20, Some(dir.clone())).get("k"), None, "served {raw:?}");
             assert!(!path.exists(), "left an unreadable entry on disk: {raw:?}");
         }
+    }
+
+    /// The disk tier has to be bounded too. Memory's cap never touched it, and lazy expiry needs
+    /// someone to re-request the exact key — which search entries, keyed by a per-file hash, never
+    /// get. Expired entries go first; if that isn't enough, the oldest do.
+    #[test]
+    fn the_sweep_bounds_the_disk_tier() {
+        let dir = tmpdir("sweep");
+        // Budget fits roughly two entries, so a third must push the oldest out.
+        let c = Cache::new(120, Some(dir.clone()));
+        c.put("expired".into(), "x".repeat(40), Duration::from_secs(0));
+        c.put("old".into(), "x".repeat(40), HOUR);
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime has 1s resolution
+        c.put("new".into(), "x".repeat(40), HOUR);
+
+        c.sweep();
+        let fresh = Cache::new(120, Some(dir.clone()));
+        assert_eq!(fresh.get("expired"), None, "an expired entry must not survive a sweep");
+        assert_eq!(fresh.get("new"), Some("x".repeat(40)), "the newest entry must survive");
+        let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
+        assert!(bytes <= 120, "the sweep left {bytes} bytes on disk, over the 120 budget");
+    }
+
+    /// A sweep must never remove a live entry while it is still under budget — evicting eagerly
+    /// would re-download subtitles the cache exists to keep.
+    #[test]
+    fn the_sweep_keeps_everything_that_fits() {
+        let dir = tmpdir("sweep-fits");
+        let c = Cache::new(1 << 20, Some(dir.clone()));
+        c.put("a".into(), "aaa".into(), HOUR);
+        c.put("b".into(), "bbb".into(), HOUR);
+        c.sweep();
+        let fresh = Cache::new(1 << 20, Some(dir));
+        assert_eq!(fresh.get("a"), Some("aaa".into()));
+        assert_eq!(fresh.get("b"), Some("bbb".into()));
     }
 
     #[test]
