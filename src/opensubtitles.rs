@@ -115,7 +115,9 @@ impl<'a> Client<'a> {
             .get(link)
             .send()
             .await
-            .map_err(|e| format!("fetch link failed: {e}"))?;
+            // `without_url`: reqwest's Display prints the URL it failed on, and this one is the
+            // one-shot download link — a bearer capability that would land in the container log.
+            .map_err(|e| format!("fetch link failed: {}", e.without_url()))?;
         // The API call above is status-checked and this one was not, so a CDN 403/404/429 (an
         // expired or rate-limited link) returned its HTML error page AS the subtitle — cached under
         // the file id for 60 days and served `immutable`. One transient blip, one track that

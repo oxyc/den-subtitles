@@ -75,17 +75,26 @@ async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Res
         if context.len() > CONTEXT_WINDOW {
             context.drain(..context.len() - CONTEXT_WINDOW);
         }
-        // Checked per batch, not once at the end: a wrong-length model costs 2n-1 calls per batch
-        // (79 for a 40-cue batch), so waiting for the whole film means ~3000 paid calls to learn
-        // what the first batch already showed.
+        // Bail early on a film that is clearly not being translated: a wrong-length model costs
+        // 2n-1 calls a batch, so running to the end means thousands of paid calls to learn what the
+        // opening showed. Only after a real sample, though — the first batch is title cards and
+        // song lyrics, the harshest forty cues in the film.
         let kept = untranslated.load(Ordering::Relaxed);
-        if unusable(kept, out.len()) {
+        if out.len() >= MIN_GATE_SAMPLE && unusable(kept, out.len()) {
             return Err(format!("model returned unusable output for {kept} of {} cues", out.len()));
         }
+    }
+    // The verdict for the film as a whole, which is also the only gate a short track ever meets.
+    let kept = untranslated.load(Ordering::Relaxed);
+    if unusable(kept, cues.len()) {
+        return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
     }
     debug_assert_eq!(out.len(), cues.len());
     Ok(out)
 }
+
+/// Cues that must be seen before the ratio is allowed to abort a run mid-film.
+const MIN_GATE_SAMPLE: usize = 120;
 
 /// Has too much come back unusable to call this a translation? A single stray cue never trips it —
 /// that one is what the keep-the-source fallback is for — but a model wrong more than a quarter of
@@ -143,8 +152,22 @@ async fn translate_batch(
     let result = upstream.call(sources, context).await;
 
     match result {
-        Ok(v) if v.len() == sources.len() => Ok(v),
-        Ok(_) | Err(_) if sources.len() > 1 => {
+        Ok(v) if v.len() == sources.len() => {
+            // The right length is not the same as a translation. An echo of the source, or blanks,
+            // satisfies the count — and a cheap model does exactly that when the target language is
+            // a typo. Counted rather than rejected: a batch that legitimately matches (names,
+            // numbers, "OK") costs nothing, while a film-wide echo trips the gate.
+            let dead = v
+                .iter()
+                .zip(sources.iter())
+                .filter(|(t, s)| !s.trim().is_empty() && (t.trim().is_empty() || t == s))
+                .count();
+            untranslated.fetch_add(dead, Ordering::Relaxed);
+            Ok(v)
+        }
+        // Only a CONTRACT violation splits. An upstream error is not one — splitting on it spent six
+        // more calls against a provider that had just said no, with no backoff, before failing anyway.
+        Ok(_) if sources.len() > 1 => {
             // Split and retry each half. Context is best-effort continuity, not correctness, so we
             // don't thread the first half's output into the second here — keeps the split simple.
             let mid = sources.len() / 2;
@@ -265,11 +288,13 @@ async fn call_chat(
         Auth::GoogleKey => req.header("x-goog-api-key", &llm.api_key),
     };
 
-    let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+    let resp = req.send().await.map_err(|e| format!("request failed: {}", e.without_url()))?;
     if !resp.status().is_success() {
         let code = resp.status();
-        let body = crate::fetch::capped_text(resp, 64 * 1024).await.unwrap_or_default();
-        return Err(format!("provider {code}: {}", truncate(&body, 200)));
+        // The status only. This string is logged, and the body is the PROVIDER's text about a
+        // request that carried the user's key — OpenAI's 401 quotes a masked form of it back, and a
+        // self-hosted gateway is under no obligation to mask anything.
+        return Err(format!("provider {code}"));
     }
     let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
     extract_text(llm.provider, &v).ok_or_else(|| "no text in provider response".to_string())
@@ -346,9 +371,6 @@ fn parse_json_array(text: &str) -> Option<Vec<String>> {
     arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect()
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -490,6 +512,60 @@ mod contract_tests {
         assert_eq!(out[0].text, "T:line 0");
         // Timing and index are never handed to the model, so they must survive untouched.
         assert_eq!((out[5].index, out[5].start, out[5].end), (6, 5000, 5900));
+    }
+
+    /// A reply of the right length that translated nothing. Both shapes satisfy the count and both
+    /// produce a track that loads, is selectable, and shows nothing useful — the echo shows the
+    /// original language, the blanks show nothing at all.
+    #[tokio::test]
+    async fn a_right_length_reply_that_translated_nothing_is_refused() {
+        let echo = fake(|s: &[String]| Ok(s.to_vec()));
+        let err = run_translation(&echo, &cues(200)).await.unwrap_err();
+        assert!(err.contains("unusable"), "an echo of the source was accepted: {err}");
+
+        let blanks = fake(|s: &[String]| Ok(vec![String::new(); s.len()]));
+        let err = run_translation(&blanks, &cues(200)).await.unwrap_err();
+        assert!(err.contains("unusable"), "a reply of empty strings was accepted: {err}");
+    }
+
+    /// A handful of cues that legitimately come back unchanged — names, numbers, "OK" — must not
+    /// fail a film, and they cluster in the opening titles where the early gate samples.
+    #[tokio::test]
+    async fn cues_that_legitimately_match_do_not_fail_a_film() {
+        let up = fake(|s: &[String]| {
+            Ok(s.iter()
+                .map(|t| if t.ends_with('3') || t.ends_with('7') { t.clone() } else { format!("T:{t}") })
+                .collect())
+        });
+        let out = run_translation(&up, &cues(600)).await.expect("a fifth of cues matching is normal");
+        assert_eq!(out.len(), 600);
+    }
+
+    /// The opening forty cues are the harshest sample a film ever offers — title cards, a song
+    /// lyric, a run of names — so judging the whole film on them rejects good translations. Eleven
+    /// odd cues in the first batch of a 600-cue film is normal; aborting there is not.
+    #[tokio::test]
+    async fn a_rough_opening_does_not_abort_a_good_film() {
+        let up = fake(|s: &[String]| {
+            Ok(s.iter()
+                .map(|t| {
+                    let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
+                    if n < 11 { t.clone() } else { format!("T:{t}") }
+                })
+                .collect())
+        });
+        let out = run_translation(&up, &cues(600)).await.expect("a rough opening must not abort the film");
+        assert_eq!(out.len(), 600);
+        assert_eq!(out[300].text, "T:line 300");
+    }
+
+    /// An upstream error must not be split-retried — that spent six more calls against a provider
+    /// that had just said no, with no backoff, and failed anyway.
+    #[tokio::test]
+    async fn an_upstream_error_is_not_split_retried() {
+        let up = fake(|_: &[String]| Err("provider 429: rate limited".to_string()));
+        assert!(run_translation(&up, &cues(40)).await.is_err());
+        assert_eq!(*up.calls.lock().unwrap(), 1, "a 429 was split-retried instead of surfacing");
     }
 
     /// A transport/auth error is not a contract violation: it must surface, not degrade to the source.
