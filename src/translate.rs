@@ -96,7 +96,10 @@ async fn run_translation(
         // opening showed. Only after a real sample, though — the first batch is title cards and
         // song lyrics, the harshest forty cues in the film.
         let kept = budget.untranslated.load(Ordering::Relaxed);
-        if out.len() >= MIN_GATE_SAMPLE && hopeless(kept, out.len()) {
+        // The same verdict, applied early. It used to need a HIGHER ratio than the final gate,
+        // which meant a run in the band between the two — already certain to be thrown away — never
+        // bailed and spent its entire call budget first, on the viewer's own key.
+        if out.len() >= MIN_GATE_SAMPLE && unusable(kept, out.len()) {
             return Err(format!("model returned unusable output for {kept} of {} cues", out.len()));
         }
     }
@@ -129,14 +132,14 @@ const MIN_GATE_SAMPLE: usize = 120;
 ///
 /// "Nothing translated at all" needs no clause of its own either: 3n > 2n holds for every n > 0.
 fn unusable(kept: usize, seen: usize) -> bool {
-    kept * 3 > seen * 2
+    // A one-cue track is 0% or 100% dead by construction, so the ratio can only ever refuse it —
+    // and if that cue is a sign reading MOSCOW, coming back unchanged is the correct translation.
+    // Refusing costs the viewer the track entirely and repeats on every retry; accepting costs one
+    // line that may already be right.
+    seen > 1 && kept * 3 > seen * 2
 }
 
-/// The mid-run bail is harsher than the verdict: it exists only to stop paying for a run that is
-/// already lost, and a film is judged in full at the end.
-fn hopeless(kept: usize, seen: usize) -> bool {
-    kept * 4 > seen * 3
-}
+
 
 /// Upstream calls a run may make. The happy path is one per batch; a wrong-length reply splits into
 /// 2n-1, and the ratio gate only catches that when the fallbacks are frequent enough — at exactly a
@@ -522,10 +525,17 @@ fn parse_json_array(text: &str) -> Option<Vec<String>> {
     top_level_array(text).or_else(|| innermost_array(text)).flatten()
 }
 
+/// How many candidate spans either pass will try to decode. A real reply has one; prose with
+/// brackets in it has a handful. Deeply nested junk has thousands, and each costs a parse down to
+/// serde's recursion limit — ~3s for 800 KB, tens of seconds at the 12 MiB body cap, on the single
+/// thread that serves every request.
+const MAX_CANDIDATES: usize = 64;
+
 /// Spans that open at depth 0 and close back to it, tried left to right.
 fn top_level_array(text: &str) -> Option<Option<Vec<String>>> {
     let mut scan = Scan::new();
     let mut start = None;
+    let mut tried = 0usize;
     for (i, &b) in text.as_bytes().iter().enumerate() {
         match (scan.step(b), start) {
             (Step::Open(1), _) => start = Some(i),
@@ -533,6 +543,10 @@ fn top_level_array(text: &str) -> Option<Option<Vec<String>>> {
                 start = None;
                 if let Some(reply) = reply_at(&text[s..=i]) {
                     return Some(reply);
+                }
+                tried += 1;
+                if tried >= MAX_CANDIDATES {
+                    return None;
                 }
             }
             _ => {}
@@ -546,6 +560,7 @@ fn top_level_array(text: &str) -> Option<Option<Vec<String>>> {
 fn innermost_array(text: &str) -> Option<Option<Vec<String>>> {
     let mut scan = Scan::new();
     let mut opens: Vec<usize> = Vec::new();
+    let mut tried = 0usize;
     for (i, &b) in text.as_bytes().iter().enumerate() {
         match scan.step(b) {
             Step::Open(_) => opens.push(i),
@@ -553,6 +568,10 @@ fn innermost_array(text: &str) -> Option<Option<Vec<String>>> {
                 if let Some(s) = opens.pop() {
                     if let Some(reply) = reply_at(&text[s..=i]) {
                         return Some(reply);
+                    }
+                    tried += 1;
+                    if tried >= MAX_CANDIDATES {
+                        return None;
                     }
                 }
             }
@@ -737,6 +756,20 @@ mod contract_tests {
         }
     }
 
+    /// Linear is not the same as cheap. A deeply nested reply is one span per level, and each costs
+    /// a parse down to serde's recursion limit — measured at ~3s for 800 KB, tens of seconds at the
+    /// 12 MiB body cap, on the single thread that serves every request. Only so many candidates are
+    /// worth trying: a real reply has one, prose with brackets has a handful.
+    #[test]
+    fn a_deeply_nested_reply_does_not_stall_the_thread() {
+        let depth = 400_000;
+        let input = format!("{}x{}", "[".repeat(depth), "]".repeat(depth));
+        let started = std::time::Instant::now();
+        assert!(parse_json_array(&input).is_none());
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "nested scan took {took:?}");
+    }
+
     /// A candidate that closes but is not an array must be stepped over, not re-entered — and the
     /// real array after it still found. This is the case that keeps the skip honest: stepping one
     /// byte instead would also find it, just quadratically.
@@ -900,6 +933,25 @@ mod contract_tests {
         );
     }
 
+    /// A run already certain to fail must stop paying for itself. The mid-run bail used to need a
+    /// HIGHER ratio than the final verdict, so a run in the band between the two ran every batch and
+    /// spent its whole call budget before being thrown away anyway.
+    #[tokio::test]
+    async fn a_doomed_run_bails_before_spending_its_budget() {
+        // ~70% dead: over the 2/3 verdict, and inside the band the old mid-run bar missed.
+        let up = fake(|s: &[String]| {
+            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n % 10 < 7)) {
+                Ok(vec!["junk".to_string(); s.len() + 1])
+            } else {
+                Ok(s.iter().map(|t| format!("T:{t}")).collect())
+            }
+        });
+        let budget = call_budget(2000);
+        assert!(run_translation_t(&up, &cues(2000)).await.is_err(), "a 70%-dead run must be refused");
+        let spent = *up.calls.lock().unwrap();
+        assert!(spent < budget / 2, "spent {spent} of {budget} before giving up");
+    }
+
     /// The budget is the guard for the case the ratio cannot see: a model wrong on exactly a
     /// quarter of cues never trips `unusable` (`kept * 4 > seen` is false at exactly a quarter) and
     /// used to run to the end at ~60 calls a batch — 8,850 on one request the viewer is waiting on.
@@ -1008,33 +1060,36 @@ mod contract_tests {
         assert!(out.iter().all(|c| !c.text.trim().is_empty()), "a cue would render as nothing");
     }
 
-    /// The gate is a ratio at every size. An absolute floor exempted short tracks from it entirely:
-    /// with a floor of eight, seven dead cues out of eight — 87% of the track still in the source
-    /// language — passed, and cached for sixty days as a successful translation.
+    /// The gate is a ratio at every size above one. An absolute floor exempted short tracks from it
+    /// entirely: with a floor of eight, seven dead cues out of eight — 87% of the track still in the
+    /// source language — passed and cached for sixty days as a successful translation.
     ///
-    /// Swept across the sizes where a floor could hide, asserting both directions at each: a
-    /// majority-dead track is refused, a names-heavy one is not.
+    /// Asserted as behaviour rather than by re-deriving the formula, which would pass for any
+    /// threshold as long as the copy stayed in sync with the code.
     #[test]
     fn no_size_is_exempt_from_the_ratio() {
-        for seen in 1..=40usize {
-            for kept in 0..=seen {
-                let refused = unusable(kept, seen);
-                if kept * 3 > seen * 2 {
-                    assert!(refused, "{kept} of {seen} dead was accepted");
-                } else {
-                    assert!(!refused, "{kept} of {seen} dead was refused");
-                }
+        for seen in 2..=40usize {
+            // Nothing translated, and one lone survivor, are both non-translations at every size.
+            assert!(unusable(seen, seen), "a wholly untranslated {seen}-cue track was accepted");
+            if seen >= 4 {
+                assert!(unusable(seen - 1, seen), "{} of {seen} dead was accepted", seen - 1);
             }
+            // A third unchanged is a normal signs track and must survive at every size.
+            assert!(!unusable(seen / 3, seen), "{} names in {seen} cues was refused", seen / 3);
         }
-        // The cases the floor used to let through, named explicitly. 7-of-11 is 63%, under the
-        // two-thirds bar, so it stays accepted — that is the threshold doing its job, not the hole.
+        // The exact shapes the floor used to hide.
         for (kept, seen) in [(7usize, 8usize), (7, 9), (7, 10)] {
             assert!(unusable(kept, seen), "{kept} of {seen} dead must not be a translation");
         }
-        // And the ones it exists to protect, at the same sizes.
-        for (kept, seen) in [(3usize, 8usize), (4, 12), (6, 20), (1, 3)] {
-            assert!(!unusable(kept, seen), "{kept} names in {seen} cues is a normal signs track");
-        }
+    }
+
+    /// A one-cue track is 0% or 100% dead by construction, so a ratio can only ever refuse it — and
+    /// a sign reading MOSCOW coming back unchanged IS the translation. Refusing costs the viewer the
+    /// track entirely, permanently: the model is deterministic, so every retry reproduces it.
+    #[test]
+    fn a_single_cue_track_is_never_refused() {
+        assert!(!unusable(1, 1));
+        assert!(!unusable(0, 1));
     }
 
     /// A signs-only or forced-narrative track is mostly proper nouns and place names, which

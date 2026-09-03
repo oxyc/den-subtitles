@@ -83,14 +83,27 @@ impl Cache {
             // before renaming it into place, so unlinking one on sight can delete an in-flight
             // write and make a healthy disk report itself degraded.
             if path.extension().is_some_and(|e| e.to_string_lossy().starts_with('t')) {
-                // An unknown age means don't touch it. `elapsed()` errors whenever the mtime reads
-                // as being in the future — a backward clock step, or a filesystem that doesn't
-                // report mtime at all — and treating that as "old enough" deleted in-flight writes
-                // on sight, which is the whole thing the grace period exists to stop.
-                if age(&meta).is_some_and(|age| age > TEMP_GRACE) {
-                    let _ = std::fs::remove_file(&path);
+                match age(&meta) {
+                    // Abandoned by a kill between write and rename.
+                    Some(age) if age > TEMP_GRACE => {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    // Young enough to still be in flight. Leave it, and don't budget it either —
+                    // it is about to become a real entry or be cleaned up by its own writer.
+                    Some(_) => continue,
+                    // Undatable: `elapsed()` errors when the mtime reads as being in the future —
+                    // a backward clock step, or a filesystem that doesn't report mtime. Deleting on
+                    // that signal would kill in-flight writes on sight, which is what the grace
+                    // period exists to stop; keeping it forever is a leak nothing else reclaims.
+                    // So it is budgeted instead: evicted only under pressure, and last, because an
+                    // undatable mtime sorts as "now". It skips the expiry check below, which would
+                    // read a half-written file as garbage and delete it.
+                    None => {
+                        live.push((now, meta.len(), path));
+                        continue;
+                    }
                 }
-                continue;
             }
             match Self::read_expiry(&path) {
                 // Unreadable is not expired. Treating it as such deleted the whole store the first
@@ -444,6 +457,21 @@ mod tests {
         std::fs::write(&in_flight, "half-written").unwrap();
         c.sweep();
         assert!(in_flight.exists(), "the sweep deleted a temp that was still being written");
+    }
+
+    /// An undatable temp must not pile up forever either: nothing else reclaims a `.tN` file, so it
+    /// is counted toward the budget and evicted under pressure like anything else.
+    #[test]
+    fn an_undatable_temp_is_still_bounded_by_the_budget() {
+        let dir = tmpdir("sweep-undatable-budget");
+        let c = Cache::new(60, Some(dir.clone()));
+        c.put("k".into(), "x".repeat(40), HOUR);
+        let stray = c.disk_path("k").unwrap().with_extension("t3");
+        std::fs::write(&stray, "x".repeat(80)).unwrap();
+        shift_mtime(&stray, std::time::SystemTime::now() + Duration::from_secs(5));
+        c.sweep();
+        let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
+        assert!(bytes <= 60, "an undatable temp escaped the budget: {bytes} bytes left");
     }
 
     /// A temp whose mtime reads as being in the FUTURE — an NTP step backwards, or a filesystem
