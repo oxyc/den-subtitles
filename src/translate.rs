@@ -14,6 +14,9 @@
 //! ~30-60s background job for a full film is well within the click-and-wait UX. Cheap models
 //! (gpt-4o-mini / gemini-flash / haiku) clear the "good enough to follow the movie" bar here.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -47,13 +50,24 @@ pub async fn translate(
     if cues.len() > MAX_CUES {
         return Err(format!("subtitle too large: {} cues (max {MAX_CUES})", cues.len()));
     }
+    run_translation(&Upstream { client, llm, target_lang }, cues).await
+}
+
+/// The harness proper, over any upstream. Split from `translate` so the same-length contract and the
+/// unusable-output gate are testable without a provider.
+async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, String> {
     let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Rolling context: the tail of already-translated pairs, refreshed as we go.
     let mut context: Vec<(String, String)> = Vec::new();
 
+    // A wrong-length reply degrades to keeping the source text, which is right for one stray cue and
+    // wrong for a film: a consistently misbehaving model hits that leaf for every cue and returns the
+    // untranslated original, which then caches for 60 days as a successful translation.
+    let untranslated = AtomicUsize::new(0);
+
     for batch in cues.chunks(BATCH) {
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let translated = translate_batch(client, llm, &sources, target_lang, &context).await?;
+        let translated = translate_batch(upstream, &sources, &context, &untranslated).await?;
         for (cue, text) in batch.iter().zip(translated) {
             context.push((cue.text.clone(), text.clone()));
             out.push(Cue { text, ..cue.clone() });
@@ -62,26 +76,61 @@ pub async fn translate(
             context.drain(..context.len() - CONTEXT_WINDOW);
         }
     }
+    let kept = untranslated.load(Ordering::Relaxed);
+    if kept * 4 > cues.len() {
+        return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
+    }
+    debug_assert_eq!(out.len(), cues.len());
     Ok(out)
+}
+
+/// One upstream call: a batch of source lines in, the same number of translated lines out (or an
+/// error). Taken as a parameter so the contract logic below is testable without a provider.
+trait BatchCall: Sync {
+    fn call(
+        &self,
+        sources: &[String],
+        context: &[(String, String)],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>>;
+}
+
+/// The live call, dispatched by provider.
+struct Upstream<'a> {
+    client: &'a reqwest::Client,
+    llm: &'a LlmConfig,
+    target_lang: &'a str,
+}
+
+impl BatchCall for Upstream<'_> {
+    fn call(
+        &self,
+        sources: &[String],
+        context: &[(String, String)],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+        let sources = sources.to_vec();
+        let context = context.to_vec();
+        Box::pin(async move {
+            match self.llm.provider {
+                // DeepL is a 1:1 text-array MT endpoint, not a chat model — no prompt, no JSON contract.
+                Provider::DeepL => deepl_translate(self.client, self.llm, &sources, self.target_lang).await,
+                _ => llm_translate(self.client, self.llm, &sources, self.target_lang, &context).await,
+            }
+        })
+    }
 }
 
 /// Translate one batch under the same-length contract. On a length mismatch, split and retry so a
 /// single misbehaving batch degrades to smaller batches instead of corrupting the whole film.
 async fn translate_batch(
-    client: &reqwest::Client,
-    llm: &LlmConfig,
+    upstream: &(dyn BatchCall + Sync),
     sources: &[String],
-    target_lang: &str,
     context: &[(String, String)],
+    untranslated: &AtomicUsize,
 ) -> Result<Vec<String>, String> {
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    let result = match llm.provider {
-        // DeepL is a 1:1 text-array MT endpoint, not a chat model — no prompt, no JSON contract.
-        Provider::DeepL => deepl_translate(client, llm, sources, target_lang).await,
-        _ => llm_translate(client, llm, sources, target_lang, context).await,
-    };
+    let result = upstream.call(sources, context).await;
 
     match result {
         Ok(v) if v.len() == sources.len() => Ok(v),
@@ -90,14 +139,18 @@ async fn translate_batch(
             // don't thread the first half's output into the second here — keeps the split simple.
             let mid = sources.len() / 2;
             // Box the recursive futures — an async fn can't hold an unboxed future of itself.
-            let mut left = Box::pin(translate_batch(client, llm, &sources[..mid], target_lang, context)).await?;
-            let right = Box::pin(translate_batch(client, llm, &sources[mid..], target_lang, context)).await?;
+            let mut left = Box::pin(translate_batch(upstream, &sources[..mid], context, untranslated)).await?;
+            let right = Box::pin(translate_batch(upstream, &sources[mid..], context, untranslated)).await?;
             left.extend(right);
             Ok(left)
         }
         // A single cue that still won't come back cleanly: keep the source text rather than fail the
-        // whole film (one untranslated line beats no subtitles).
-        Ok(_) => Ok(sources.to_vec()),
+        // whole film (one untranslated line beats no subtitles). Counted, because a model that is
+        // consistently wrong drives EVERY cue to this leaf and returns the source film verbatim.
+        Ok(_) => {
+            untranslated.fetch_add(sources.len(), Ordering::Relaxed);
+            Ok(sources.to_vec())
+        }
         Err(e) => Err(e),
     }
 }
@@ -277,7 +330,10 @@ fn parse_json_array(text: &str) -> Option<Vec<String>> {
         return None;
     }
     let arr: Vec<Value> = serde_json::from_str(&text[start..=end]).ok()?;
-    Some(arr.into_iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect())
+    // Every element must be a string. `as_str().unwrap_or_default()` blanked non-strings while keeping
+    // the count, so `[{"text":"Hej"},…]` — a plausible reply shape — passed the length check and cached
+    // a full track of empty dialogue.
+    arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect()
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -299,5 +355,118 @@ mod tests {
         assert_eq!(deepl_code("English"), "EN-US");
         assert_eq!(deepl_code("sv"), "SV");
         assert_eq!(deepl_code("pt"), "PT");
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn cues(n: usize) -> Vec<Cue> {
+        (0..n)
+            .map(|i| Cue { index: i as u32 + 1, start: i as u64 * 1000, end: i as u64 * 1000 + 900, text: format!("line {i}") })
+            .collect()
+    }
+
+    /// A canned upstream. `reply` builds a response from the batch it was given, so a fake can be
+    /// wrong in exactly the way a real model is wrong.
+    struct Fake<F: Fn(&[String]) -> Result<Vec<String>, String> + Send + Sync> {
+        reply: F,
+        calls: Mutex<usize>,
+    }
+
+    impl<F: Fn(&[String]) -> Result<Vec<String>, String> + Send + Sync> BatchCall for Fake<F> {
+        fn call(
+            &self,
+            sources: &[String],
+            _context: &[(String, String)],
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+            *self.calls.lock().unwrap() += 1;
+            let r = (self.reply)(sources);
+            Box::pin(async move { r })
+        }
+    }
+
+    fn fake<F: Fn(&[String]) -> Result<Vec<String>, String> + Send + Sync>(reply: F) -> Fake<F> {
+        Fake { reply, calls: Mutex::new(0) }
+    }
+
+    async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, String> {
+        let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
+        let untranslated = AtomicUsize::new(0);
+        translate_batch(upstream, &src, &[], &untranslated).await
+    }
+
+    /// A reply of the right LENGTH but the wrong SHAPE must not be accepted. `as_str()` on a non-string
+    /// yielded "" while keeping the count, so this passed the length check and produced a subtitle
+    /// track that loads, is selectable, and shows nothing.
+    #[test]
+    fn non_string_elements_are_not_a_valid_reply() {
+        for body in [
+            r#"[{"text":"a"},{"text":"b"}]"#,
+            r#"["a", null]"#,
+            r#"[["a"],["b"]]"#,
+            r#"[1, 2]"#,
+        ] {
+            assert!(parse_json_array(body).is_none(), "accepted a non-string array: {body}");
+        }
+        // The valid shape still parses, fences and prose included.
+        assert_eq!(parse_json_array("```json\n[\"a\",\"b\"]\n```").unwrap(), vec!["a", "b"]);
+    }
+
+    /// One stray cue keeps its source text rather than failing the film — the documented policy.
+    #[tokio::test]
+    async fn a_single_bad_cue_keeps_its_source_text() {
+        // Any batch holding the bad cue comes back the wrong length, so the split walks down to that
+        // cue alone; every batch without it answers correctly.
+        let up = fake(|s: &[String]| {
+            if s.iter().any(|t| t == "line 3") {
+                Ok(vec!["junk".to_string(); s.len() + 1])
+            } else {
+                Ok(s.iter().map(|t| format!("T:{t}")).collect())
+            }
+        });
+        let out = run(&up, 8).await.unwrap();
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[3], "line 3", "the unusable cue should fall back to its source");
+        assert_eq!(out[0], "T:line 0", "its neighbours must still be translated");
+    }
+
+    /// A model that is consistently wrong-length drives EVERY cue to that same leaf, and the result is
+    /// the untranslated film returned as a success. `translate` must refuse it rather than cache it.
+    #[tokio::test]
+    async fn a_wholly_unusable_model_is_an_error_not_an_untranslated_film() {
+        // Wrong length at every size, so the split bottoms out on every cue and each keeps its source.
+        let up = fake(|s: &[String]| Ok(vec!["junk".to_string(); s.len() + 1]));
+        let err = run_translation(&up, &cues(60)).await.unwrap_err();
+        assert!(err.contains("unusable"), "unexpected error: {err}");
+    }
+
+    /// The gate must not fire on a film that mostly translated — a handful of odd lines is the case
+    /// the source-text fallback exists for.
+    #[tokio::test]
+    async fn a_few_bad_cues_do_not_fail_the_film() {
+        let up = fake(|s: &[String]| {
+            if s.len() == 1 && s[0].ends_with('7') {
+                Ok(vec!["junk".into(), "junk".into()])
+            } else if s.iter().any(|t| t.ends_with('7')) {
+                Ok(vec!["junk".to_string(); s.len() + 1])
+            } else {
+                Ok(s.iter().map(|t| format!("T:{t}")).collect())
+            }
+        });
+        let out = run_translation(&up, &cues(60)).await.expect("a mostly-translated film must succeed");
+        assert_eq!(out.len(), 60);
+        assert_eq!(out[0].text, "T:line 0");
+        // Timing and index are never handed to the model, so they must survive untouched.
+        assert_eq!((out[5].index, out[5].start, out[5].end), (6, 5000, 5900));
+    }
+
+    /// A transport/auth error is not a contract violation: it must surface, not degrade to the source.
+    #[tokio::test]
+    async fn an_upstream_error_still_fails() {
+        let up = fake(|_: &[String]| Err("provider 401: bad key".to_string()));
+        assert!(run(&up, 4).await.is_err(), "an upstream failure must not become an untranslated film");
     }
 }
