@@ -32,6 +32,8 @@ const SYNC_RETRY_TTL: Duration = Duration::from_secs(600);
 /// Namespace for the "this sync just failed" marker. Kept off every prefix a BODY is stored under
 /// (`BODY_PREFIXES`) so a marker can never be read back and served as a subtitle.
 const SYNCFAIL: &str = "syncfail:";
+/// Digits in an IMDb id. Real ones run to seven or eight; ten leaves room and still bounds the key.
+const MAX_IMDB_DIGITS: usize = 10;
 /// Longest a target-language name may be. The longest real one is a couple of dozen characters.
 const MAX_LANG: usize = 64;
 #[cfg(test)]
@@ -97,7 +99,12 @@ fn is_sane_host(h: &str) -> bool {
 fn parse_id(id: &str) -> Option<(String, Option<i64>, Option<i64>)> {
     let mut parts = id.split(':');
     let imdb = parts.next()?;
-    if !imdb.starts_with("tt") || imdb.len() < 3 {
+    // `tt` and digits, and not many of them. It goes into a cache key that becomes a filename —
+    // the same hazard `search_hash` bounds `videoHash` against and `MAX_LANG` bounds `lang`
+    // against. An id long enough to overflow NAME_MAX fails the disk write and burns the process's
+    // one-shot "persistence degraded" warning on a request that was never a real title.
+    let digits = imdb.strip_prefix("tt")?;
+    if digits.is_empty() || digits.len() > MAX_IMDB_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let season = parts.next().and_then(|s| s.parse().ok());
@@ -676,6 +683,36 @@ mod tests {
         assert!(!is_safe_resync_url("file:///etc/passwd").await);
         assert!(!is_safe_resync_url("ftp://host/a.mkv").await);
         assert!(!is_safe_resync_url("").await);
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    /// The id is `tt` and digits, and it lands in a cache key that becomes a filename. Left
+    /// unbounded it overflowed NAME_MAX, so the entry never persisted AND the process's one-shot
+    /// "persistence degraded" warning was spent on it — the next real disk problem then said
+    /// nothing. Two siblings of this value were already bounded for exactly that reason; this one
+    /// was not, which is the shape of gap a per-field fix leaves behind.
+    #[test]
+    fn an_id_is_tt_and_a_sane_number_of_digits() {
+        assert_eq!(parse_id("tt0111161").unwrap().0, "tt0111161");
+        assert_eq!(parse_id("tt0111161:2:5").unwrap(), ("tt0111161".into(), Some(2), Some(5)));
+
+        for bad in [
+            "tt",                                  // no digits
+            "tt12a4",                              // not digits
+            "nope0111161",                         // no prefix
+            "",
+        ] {
+            assert!(parse_id(bad).is_none(), "accepted {bad:?}");
+        }
+        // Long enough to overflow a filename once base64'd into a cache key.
+        let huge = format!("tt{}", "1".repeat(2000));
+        assert!(parse_id(&huge).is_none(), "accepted a 2000-digit id");
+        assert!(parse_id(&format!("tt{}", "1".repeat(MAX_IMDB_DIGITS + 1))).is_none());
+        assert!(parse_id(&format!("tt{}", "1".repeat(MAX_IMDB_DIGITS))).is_some());
     }
 }
 
