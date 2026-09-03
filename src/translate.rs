@@ -447,15 +447,25 @@ fn deepl_code(lang: &str) -> String {
 /// Extract a JSON string array from model output, tolerating markdown code fences and leading prose
 /// by scanning for the first `[` … matching `]`.
 fn parse_json_array(text: &str) -> Option<Vec<String>> {
-    // Every `[` is tried as a start, and each is closed at its own matching `]`. Taking the first
-    // `[` to the LAST `]` broke on any bracket in the surrounding prose — "[sic]" in a trailing
-    // note, or "I [will] translate:" ahead of the array — which then failed the whole film.
+    // Each `[` is closed at its OWN matching `]`, and a candidate that turns out not to be an array
+    // is skipped whole rather than re-entered one byte along. Retrying from every `[` re-scanned the
+    // same interior over and over — 64k open brackets took 1.7s and the reply body is capped at
+    // 12 MiB, so a provider answering with junk could hold the one runtime thread indefinitely.
+    //
+    // Taking the first `[` to the LAST `]` was the earlier bug: a bracket in the surrounding prose
+    // ("[sic]", "I [will] translate:") produced no array at all, which then failed a whole film.
     let bytes = text.as_bytes();
-    for (start, _) in text.char_indices().filter(|&(_, c)| c == '[') {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
         let mut depth = 0usize;
         let mut in_string = false;
         let mut escaped = false;
-        for (offset, &b) in bytes[start..].iter().enumerate() {
+        let mut end = None;
+        for (offset, &b) in bytes[i..].iter().enumerate() {
             if in_string {
                 match b {
                     _ if escaped => escaped = false,
@@ -471,18 +481,21 @@ fn parse_json_array(text: &str) -> Option<Vec<String>> {
                 b']' => {
                     depth -= 1;
                     if depth == 0 {
-                        // A well-formed array here IS the reply, and whether every element is a
-                        // string decides whether it is valid. Falling through to the next `[` would
-                        // descend into a nested one and answer with a fragment of the reply.
-                        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text[start..=start + offset]) {
-                            return arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect();
-                        }
+                        end = Some(i + offset);
                         break;
                     }
                 }
                 _ => {}
             }
         }
+        // Nothing closes this one, so nothing later closes either.
+        let e = end?;
+        // A well-formed array here IS the reply, and whether every element is a string decides
+        // whether it is valid — descending into a nested one would answer with a fragment of it.
+        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text[i..=e]) {
+            return arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect();
+        }
+        i = e + 1;
     }
     None
 }
@@ -584,6 +597,42 @@ mod contract_tests {
             assert_eq!(parse_json_array(chatty).as_deref(), Some(&["a".to_string(), "b".to_string()][..]),
                 "chatty reply not recovered: {chatty:?}");
         }
+    }
+
+    /// The scanner runs over a reply body capped at 12 MiB, on the one runtime thread. Retrying
+    /// from every `[` re-scanned the same interior for each one: 64k open brackets took 1.7s, and a
+    /// megabyte of them would have held the whole service. A candidate that is not an array is
+    /// skipped whole, so each byte is examined once.
+    ///
+    /// The bound is loose on purpose — it catches a return to quadratic, not milliseconds. Linear
+    /// does a million brackets in about a millisecond.
+    #[test]
+    fn the_array_scan_stays_linear() {
+        for input in ["[".repeat(400_000), "[x]".repeat(200_000)] {
+            let started = std::time::Instant::now();
+            assert!(parse_json_array(&input).is_none());
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(10), "scan took {took:?} — quadratic again?");
+        }
+    }
+
+    /// A candidate that closes but is not an array must be stepped over, not re-entered — and the
+    /// real array after it still found. This is the case that keeps the skip honest: stepping one
+    /// byte instead would also find it, just quadratically.
+    #[test]
+    fn a_non_array_candidate_is_skipped_and_the_real_one_found() {
+        assert_eq!(parse_json_array(r#"[not json] then ["y"]"#).unwrap(), vec!["y"]);
+        // But a WELL-FORMED array is the reply, whatever follows it — so a numeric one is an
+        // invalid reply rather than a reason to keep looking. That is what stops a nested
+        // array being answered with a fragment of itself.
+        assert!(parse_json_array(r#"[1,2] then ["y"]"#).is_none());
+        // Brackets inside strings are not structure.
+        assert_eq!(parse_json_array(r#"["a[b","c]d"]"#).unwrap(), vec!["a[b", "c]d"]);
+        // A `]` inside a string, reached through an escaped quote: still not structure.
+        let escaped = "[\"a\\\"]b\"]";
+        assert_eq!(parse_json_array(escaped).unwrap(), vec!["a\"]b"]);
+        // Unbalanced: nothing to find, and it must say so rather than scan forever.
+        assert!(parse_json_array("[[[[[[").is_none());
     }
 
     /// A model that answers with prose instead of an array is breaking the SAME contract as one
