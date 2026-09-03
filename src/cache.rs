@@ -63,6 +63,9 @@ impl Cache {
     ///
     /// Expired first, then oldest-written until under budget.
     pub fn sweep(&self) {
+        /// Longer than any write takes, far shorter than the hourly sweep interval.
+        const TEMP_GRACE: Duration = Duration::from_secs(60);
+
         let Some(dir) = self.dir.as_ref() else { return };
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let now = unix_now();
@@ -75,8 +78,14 @@ impl Cache {
             }
             // A leftover temp from a kill between write and rename. Nothing addresses it, and
             // counting it as live lets it push a real entry out during eviction.
+            //
+            // Only once it is old enough to be abandoned: `disk_put` writes to exactly this name
+            // before renaming it into place, so unlinking one on sight can delete an in-flight
+            // write and make a healthy disk report itself degraded.
             if path.extension().is_some_and(|e| e.to_string_lossy().starts_with('t')) {
-                let _ = std::fs::remove_file(&path);
+                if age(&meta).is_none_or(|age| age > TEMP_GRACE) {
+                    let _ = std::fs::remove_file(&path);
+                }
                 continue;
             }
             match Self::read_expiry(&path) {
@@ -94,11 +103,7 @@ impl Cache {
                 }
                 Ok(Some(_)) => {}
             }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(now, |d| d.as_secs());
+            let mtime = modified_secs(&meta).unwrap_or(now);
             live.push((mtime, meta.len(), path));
         }
         let mut total: u64 = live.iter().map(|(_, size, _)| size).sum();
@@ -255,6 +260,15 @@ fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+fn modified_secs(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+/// How long ago this file was written, or `None` if the filesystem won't say.
+fn age(meta: &std::fs::Metadata) -> Option<Duration> {
+    meta.modified().ok()?.elapsed().ok()
+}
+
 fn next_temp_id() -> u64 {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
@@ -405,9 +419,31 @@ mod tests {
         c.put("k".into(), "v".into(), HOUR);
         let stray = c.disk_path("k").unwrap().with_extension("t99");
         std::fs::write(&stray, format!("{} 1\nv", unix_now() + 3600)).unwrap();
+        backdate(&stray, Duration::from_secs(3600));
         c.sweep();
         assert!(!stray.exists(), "a leftover temp survived the sweep");
         assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v".into()), "the real entry stayed");
+    }
+
+    /// `disk_put` writes to a `.tN` name and then renames it into place. A sweep that unlinks those
+    /// on sight can delete an in-flight write, which fails the rename and makes a healthy disk
+    /// report itself degraded — so a temp too young to be abandoned is left alone.
+    #[test]
+    fn the_sweep_leaves_an_in_flight_temp_alone() {
+        let dir = tmpdir("sweep-inflight");
+        let c = Cache::new(1 << 20, Some(dir.clone()));
+        c.put("k".into(), "v".into(), HOUR);
+        let in_flight = c.disk_path("k").unwrap().with_extension("t42");
+        std::fs::write(&in_flight, "half-written").unwrap();
+        c.sweep();
+        assert!(in_flight.exists(), "the sweep deleted a temp that was still being written");
+    }
+
+    /// Push a file's modification time into the past.
+    fn backdate(path: &std::path::Path, by: Duration) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::now() - by;
+        f.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
     }
 
     #[test]
