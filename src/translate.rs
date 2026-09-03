@@ -69,8 +69,6 @@ async fn run_translation(
     // untranslated original, which then caches for 60 days as a successful translation.
     let budget = Budget {
         untranslated: AtomicUsize::new(0),
-        calls: AtomicUsize::new(0),
-        max_calls: call_budget(cues.len()),
         started: std::time::Instant::now(),
         deadline,
     };
@@ -138,25 +136,16 @@ fn unusable(kept: usize, seen: usize) -> bool {
 
 
 
-/// Upstream calls a run may make.
-///
-/// Sized so it can never be the thing that refuses an acceptable film: a batch splits into at most
-/// 2n-1 calls, so 2*BATCH per batch is above anything the splitting can legitimately cost. Sized
-/// below that it became the stricter of the two gates — the budget was chosen when the quality bar
-/// was a quarter of cues dead, the bar later moved to two thirds, and a film with scattered
-/// wrong-length replies then hit the ceiling at under a tenth dead and was refused.
-///
-/// What actually bounds a run in practice is `RUN_DEADLINE`; this is the backstop for a provider
-/// fast enough to burn calls without burning the clock.
-fn call_budget(cues: usize) -> usize {
-    2 * BATCH * cues.div_ceil(BATCH) + 40
-}
 
-/// What a run is allowed to spend, and what it has spent.
+/// What a run has produced, and how long it has had.
+///
+/// There is no call counter. The split is a binary tree with one leaf per cue, so a batch of n
+/// costs at most 2n-1 calls and a run at most 2*cues - batches — a cap the recursion enforces by
+/// its own shape. A counter on top of that could only ever fire below the structural maximum, and
+/// sized below it, it becomes a stricter quality gate than the quality gate. Time is the bound that
+/// is actually reachable, so time is the bound that is kept.
 struct Budget {
     untranslated: AtomicUsize,
-    calls: AtomicUsize,
-    max_calls: usize,
     started: std::time::Instant,
     deadline: Duration,
 }
@@ -255,9 +244,6 @@ async fn translate_batch(
     // to 2n-1 calls without the outer loop regaining control.
     if budget.spent() {
         return Err("translation ran out of time".to_string());
-    }
-    if budget.calls.fetch_add(1, Ordering::Relaxed) >= budget.max_calls {
-        return Err("translation exceeded its upstream call budget".to_string());
     }
     let result = upstream.call(sources, context).await;
 
@@ -784,8 +770,6 @@ mod contract_tests {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
         let budget = Budget {
             untranslated: AtomicUsize::new(0),
-            calls: AtomicUsize::new(0),
-            max_calls: call_budget(n),
             started: std::time::Instant::now(),
             deadline: Duration::from_secs(600),
         };
@@ -1008,10 +992,9 @@ mod contract_tests {
         let up = fake(|s: &[String]| Ok(vec!["junk".to_string(); s.len() + 1]));
         assert!(run_translation_t(&up, &cues(60)).await.is_err(), "an untranslated film was returned");
         assert!(
-            *up.calls.lock().unwrap() <= call_budget(60),
-            "spent {} calls against a budget of {}",
-            up.calls.lock().unwrap(),
-            call_budget(60)
+            *up.calls.lock().unwrap() <= 2 * 60,
+            "spent {} calls for 60 cues, above 2n",
+            up.calls.lock().unwrap()
         );
     }
 
@@ -1097,30 +1080,20 @@ mod contract_tests {
         let out = run_translation_t(&up, &cues(2000)).await;
         assert!(out.is_ok(), "the cost ceiling refused a film the ratio accepts: {out:?}");
         assert_eq!(out.unwrap().len(), 2000);
-        // And it did stop paying.
-        assert!(*up.calls.lock().unwrap() <= call_budget(2000));
     }
 
-    /// The budget is the guard for the case the ratio cannot see: a model wrong on exactly a
-    /// quarter of cues never trips `unusable` (`kept * 4 > seen` is false at exactly a quarter) and
-    /// used to run to the end at ~60 calls a batch — 8,850 on one request the viewer is waiting on.
+    /// Cost is bounded by the shape of the recursion, not by a counter. The split is a binary tree
+    /// with one leaf per cue, so a batch of n costs at most 2n-1 calls however badly the model
+    /// behaves. Pinned here because a counter above that bound is dead code and a counter below it
+    /// refuses films the ratio is meant to accept — both of which have shipped.
     #[tokio::test]
-    async fn a_run_cannot_outspend_its_call_budget() {
-        let up = fake(|s: &[String]| {
-            // Wrong-length whenever the batch holds a cue whose number is divisible by 4.
-            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n.is_multiple_of(4))) {
-                Ok(vec!["junk".to_string(); s.len() + 1])
-            } else {
-                Ok(s.iter().map(|t| format!("T:{t}")).collect())
-            }
-        });
-        let budget = call_budget(2000);
-        let _ = run_translation_t(&up, &cues(2000)).await;
-        assert!(
-            *up.calls.lock().unwrap() <= budget,
-            "spent {} calls against a budget of {budget}",
-            up.calls.lock().unwrap()
-        );
+    async fn cost_is_bounded_by_the_split_itself() {
+        // Exactly one batch, wrong-length at every size, so every node of the tree fails and the
+        // ratio bail cannot cut the run short before the worst case is actually reached. Asserted
+        // as equality: a bound the run never approaches would not notice the shape changing.
+        let up = fake(|s: &[String]| Ok(vec!["junk".to_string(); s.len() + 1]));
+        let _ = run_translation_t(&up, &cues(BATCH)).await;
+        assert_eq!(*up.calls.lock().unwrap(), 2 * BATCH - 1, "the split is not a binary tree of cues");
     }
 
     /// A short track must not be failed by one odd line. `kept * 4 > seen` alone fails a 3-cue
