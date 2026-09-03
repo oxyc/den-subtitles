@@ -138,11 +138,18 @@ fn unusable(kept: usize, seen: usize) -> bool {
 
 
 
-/// Upstream calls a run may make: about twenty times the happy path's one-per-batch. Reaching it
-/// does not fail the run — it stops the spending and hands the remaining cues back as source text,
-/// where the ratio decides whether that is still a translation.
+/// Upstream calls a run may make.
+///
+/// Sized so it can never be the thing that refuses an acceptable film: a batch splits into at most
+/// 2n-1 calls, so 2*BATCH per batch is above anything the splitting can legitimately cost. Sized
+/// below that it became the stricter of the two gates — the budget was chosen when the quality bar
+/// was a quarter of cues dead, the bar later moved to two thirds, and a film with scattered
+/// wrong-length replies then hit the ceiling at under a tenth dead and was refused.
+///
+/// What actually bounds a run in practice is `RUN_DEADLINE`; this is the backstop for a provider
+/// fast enough to burn calls without burning the clock.
 fn call_budget(cues: usize) -> usize {
-    20 * cues.div_ceil(BATCH) + 40
+    2 * BATCH * cues.div_ceil(BATCH) + 40
 }
 
 /// What a run is allowed to spend, and what it has spent.
@@ -235,18 +242,22 @@ async fn translate_batch(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    // Out of money or out of time: stop paying, keep the source for what is left, and let the ratio
-    // deliver the verdict. Failing outright here made the cost ceiling a STRICTER quality gate than
-    // the quality gate — the budget was sized against a 25% bar and the bar is now two thirds, so a
-    // film with scattered wrong-length replies (blank cues a model declines to echo back, say) hit
-    // the ceiling around 5-10% dead and was refused, at a ratio the code goes out of its way to
-    // accept. Cost and quality are separate questions and only one of them is the verdict.
+    // Out of money or out of time. The run did not finish, and saying so is the only honest answer:
+    // a cue that was never sent is not evidence about translation quality, it is the absence of
+    // evidence. Counting those as "unchanged" and letting the ratio judge them meant a merely SLOW
+    // provider could translate the first third of a film, have the rest handed back untouched, land
+    // at 66% — just under the bar — and be served and cached for sixty days as a translation.
     //
-    // The deadline is checked HERE rather than only between batches because one wrong-length batch
-    // splits into up to 2n-1 calls without the outer loop regaining control.
-    if budget.calls.fetch_add(1, Ordering::Relaxed) >= budget.max_calls || budget.spent() {
-        budget.untranslated.fetch_add(sources.len(), Ordering::Relaxed);
-        return Ok(sources.to_vec());
+    // The ratio's two-thirds bar is sized for cues the model DID return unchanged: names, signs,
+    // numbers. Skipped cues are a different fact and cannot share that counter.
+    //
+    // Checked here rather than only between batches because one wrong-length batch splits into up
+    // to 2n-1 calls without the outer loop regaining control.
+    if budget.spent() {
+        return Err("translation ran out of time".to_string());
+    }
+    if budget.calls.fetch_add(1, Ordering::Relaxed) >= budget.max_calls {
+        return Err("translation exceeded its upstream call budget".to_string());
     }
     let result = upstream.call(sources, context).await;
 
@@ -1034,6 +1045,39 @@ mod contract_tests {
         let out = run_translation_t(&up, &cues(1200)).await.expect("a rough opening must not abort it");
         assert_eq!(out.len(), 1200);
         assert_eq!(out[1000].text, "T:line 1000");
+    }
+
+    /// A provider that is merely SLOW, and otherwise perfect, must not produce a served film. It
+    /// translates the opening, the clock runs out, and the rest is never sent — folding those
+    /// never-attempted cues into the same counter as legitimate unchanged ones put a 66%
+    /// source-language track just under the bar, served and cached for sixty days.
+    #[tokio::test]
+    async fn a_slow_but_correct_provider_does_not_produce_a_half_translated_film() {
+        struct Slow(Mutex<usize>);
+        impl BatchCall for Slow {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                *self.0.lock().unwrap() += 1;
+                // Always correct — the only problem is that it is slow.
+                let out: Vec<String> = sources.iter().map(|t| format!("T:{t}")).collect();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(out)
+                })
+            }
+        }
+        let up = Slow(Mutex::new(0));
+        // 2000 cues is 50 batches at 20ms. The clock is set to run out well past halfway, so the
+        // skipped share lands UNDER the two-thirds bar — which is the whole point: at 80% skipped
+        // the ratio would refuse it anyway and prove nothing. 13a measured the live case at 66.0%.
+        let out = run_translation(&up, &cues(2000), Duration::from_millis(600)).await;
+        let called = *up.0.lock().unwrap();
+        assert!(called < 50, "it kept calling past the deadline ({called} calls)");
+        assert!(called > 10, "the deadline tripped too early to test the ratio ({called} calls)");
+        assert!(out.is_err(), "a film that was mostly never sent must not be served: {out:?}");
     }
 
     /// The cost ceiling must not become a stricter quality gate than the quality gate. A film with
