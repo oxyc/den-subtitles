@@ -61,8 +61,7 @@ impl Cache {
     /// search keys carry a per-file hash, so once a title is watched its entry is never re-read.
     /// On a persistent volume that grows forever.
     ///
-    /// Expired first, then oldest-written until under budget. Cheap enough to run on a timer: one
-    /// readdir plus a stat per file, over a directory of small text entries.
+    /// Expired first, then oldest-written until under budget.
     pub fn sweep(&self) {
         let Some(dir) = self.dir.as_ref() else { return };
         let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -74,14 +73,26 @@ impl Cache {
             if !meta.is_file() {
                 continue;
             }
-            // Read only the header line: the value can be megabytes and is not needed to judge it.
-            let expired = match std::fs::read_to_string(&path) {
-                Ok(raw) => Self::parse_entry(&raw).is_none(),
-                Err(_) => true,
-            };
-            if expired {
+            // A leftover temp from a kill between write and rename. Nothing addresses it, and
+            // counting it as live lets it push a real entry out during eviction.
+            if path.extension().is_some_and(|e| e.to_string_lossy().starts_with('t')) {
                 let _ = std::fs::remove_file(&path);
                 continue;
+            }
+            match Self::read_expiry(&path) {
+                // Unreadable is not expired. Treating it as such deleted the whole store the first
+                // time a redeploy shifted the volume's uid — `disk_get` treats the same error as a
+                // benign miss and leaves the file be.
+                Err(_) => continue,
+                Ok(None) | Ok(Some(0)) => {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                Ok(Some(expiry)) if expiry <= now => {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                Ok(Some(_)) => {}
             }
             let mtime = meta
                 .modified()
@@ -188,6 +199,22 @@ impl Cache {
         }
     }
 
+    /// Just the expiry, without pulling the value into memory — a sweep over a full store would
+    /// otherwise read every entry whole (up to MAX_BODY each) to ask one question. `Ok(None)` means
+    /// the header is not ours: an older format, or garbage.
+    fn read_expiry(path: &std::path::Path) -> std::io::Result<Option<u64>> {
+        use std::io::Read;
+        let mut head = [0u8; 48];
+        let n = std::fs::File::open(path)?.read(&mut head)?;
+        let text = String::from_utf8_lossy(&head[..n]);
+        let Some((line, _)) = text.split_once('\n') else { return Ok(None) };
+        let Some((expiry, len)) = line.split_once(' ') else { return Ok(None) };
+        if len.parse::<usize>().is_err() {
+            return Ok(None);
+        }
+        Ok(expiry.parse::<u64>().ok())
+    }
+
     /// Format: "<expiry-unix-secs> <value-bytes>\n<value>". The length is what makes a torn file
     /// detectable: without it any prefix carrying a newline parses as a complete entry, so a
     /// half-written file is hoisted into memory and served for the rest of its TTL.
@@ -211,10 +238,16 @@ impl Cache {
         // memory and served for the whole TTL. ENOSPC, a kill mid-write, and two writers on one key
         // all produce that. The temp name is unique so concurrent writers don't share one.
         let tmp = path.with_extension(format!("t{}", next_temp_id()));
-        if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
-            return;
+        let wrote = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path));
+        if let Err(e) = wrote {
+            // Once per process: a full or read-only volume degrades the cache to memory-only, which
+            // survives a restart as a cold cache and used to say nothing at all.
+            static WARNED: AtomicU64 = AtomicU64::new(0);
+            if WARNED.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!("warning: cache store write failed ({e}) — persistence degraded");
+            }
+            let _ = std::fs::remove_file(&tmp);
         }
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -230,6 +263,7 @@ fn next_temp_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("den-subs-cache-{name}-{}", next_temp_id()));
@@ -311,9 +345,12 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime has 1s resolution
         c.put("new".into(), "x".repeat(40), HOUR);
 
+        let expired_path = c.disk_path("expired").unwrap();
         c.sweep();
+        // Assert the FILE is gone, not that `get` misses — `disk_get` expires lazily on read, so a
+        // `get` returning None passes whether or not the sweep did anything at all.
+        assert!(!expired_path.exists(), "the sweep left an expired entry on disk");
         let fresh = Cache::new(120, Some(dir.clone()));
-        assert_eq!(fresh.get("expired"), None, "an expired entry must not survive a sweep");
         assert_eq!(fresh.get("new"), Some("x".repeat(40)), "the newest entry must survive");
         let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
         assert!(bytes <= 120, "the sweep left {bytes} bytes on disk, over the 120 budget");
@@ -331,6 +368,42 @@ mod tests {
         let fresh = Cache::new(1 << 20, Some(dir));
         assert_eq!(fresh.get("a"), Some("aaa".into()));
         assert_eq!(fresh.get("b"), Some("bbb".into()));
+    }
+
+    /// Unreadable is not expired. A redeploy that shifts the volume's uid makes every file
+    /// unreadable at once, and a sweep that reads that as "expired" deletes the entire store —
+    /// where `disk_get` treats the same error as a benign miss and leaves the file alone.
+    #[test]
+    fn the_sweep_keeps_an_entry_it_cannot_read() {
+        let dir = tmpdir("sweep-unreadable");
+        let c = Cache::new(1 << 20, Some(dir.clone()));
+        c.put("k".into(), "v".into(), HOUR);
+        let path = c.disk_path("k").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        c.sweep();
+        assert!(path.exists(), "the sweep deleted an entry it merely could not read");
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v".into()), "and it still reads");
+    }
+
+    /// A temp left by a kill between write and rename is addressed by nothing, but parses fine —
+    /// so a sweep counted it as live and could evict a real entry to make room for it.
+    #[test]
+    fn the_sweep_reclaims_leftover_temps() {
+        let dir = tmpdir("sweep-temp");
+        let c = Cache::new(1 << 20, Some(dir.clone()));
+        c.put("k".into(), "v".into(), HOUR);
+        let stray = c.disk_path("k").unwrap().with_extension("t99");
+        std::fs::write(&stray, format!("{} 1\nv", unix_now() + 3600)).unwrap();
+        c.sweep();
+        assert!(!stray.exists(), "a leftover temp survived the sweep");
+        assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v".into()), "the real entry stayed");
     }
 
     #[test]

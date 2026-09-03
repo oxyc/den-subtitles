@@ -32,29 +32,36 @@ pub fn parse(input: &str) -> Vec<Cue> {
     let mut block: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let line = lines[i];
-        if line.is_empty() || (line.trim().is_empty() && starts_a_cue(&lines[i + 1..])) {
-            push_cue(&mut cues, &block);
-            block.clear();
-            while i < lines.len() && lines[i].trim().is_empty() {
-                i += 1;
-            }
+        if !lines[i].trim().is_empty() {
+            block.push(lines[i]);
+            i += 1;
             continue;
         }
-        block.push(line);
-        i += 1;
+        // Take the whole blank run in one step. Deciding per line meant rescanning the rest of the
+        // run for every line in it — quadratic, and since this parser now gates every downloaded
+        // subtitle, a file of padded lines was minutes to hours of CPU on a runtime that has one
+        // thread for every connection.
+        let end = i + lines[i..].iter().take_while(|l| l.trim().is_empty()).count();
+        // A truly empty line always separates. A run of only whitespace separates when a cue
+        // header follows it; otherwise it is padding inside the dialogue and stays in the text.
+        if lines[i..end].iter().any(|l| l.is_empty()) || starts_a_cue(&lines[end..]) {
+            push_cue(&mut cues, &block);
+            block.clear();
+        } else {
+            block.extend_from_slice(&lines[i..end]);
+        }
+        i = end;
     }
     push_cue(&mut cues, &block);
     cues
 }
 
-/// Does the next non-blank line begin a cue — an index followed by a timing line, or a bare timing
-/// line? Used only to decide whether a whitespace-padded line is a separator or part of the text.
+/// Does a cue begin here — an index followed by a timing line, or a bare timing line? Called with
+/// the run of blank lines already skipped, so it looks at two lines and returns.
 fn starts_a_cue(rest: &[&str]) -> bool {
-    let mut it = rest.iter().skip_while(|l| l.trim().is_empty());
-    let Some(first) = it.next() else { return true }; // trailing padding ends the file
+    let Some(first) = rest.first() else { return true }; // trailing padding ends the file
     parse_timing(first).is_some()
-        || (first.trim().parse::<u32>().is_ok() && it.next().is_some_and(|l| parse_timing(l).is_some()))
+        || (first.trim().parse::<u32>().is_ok() && rest.get(1).is_some_and(|l| parse_timing(l).is_some()))
 }
 
 /// Turn one block's lines into a cue, skipping anything malformed — a single bad cue shouldn't
@@ -85,7 +92,17 @@ pub fn serialize(cues: &[Cue]) -> String {
         out.push_str(" --> ");
         out.push_str(&format_ts(c.end));
         out.push('\n');
-        out.push_str(&c.text);
+        // Blank lines are dropped, not written: one inside a cue's text ENDS that cue for every
+        // reader downstream, silently losing the rest of it. A translation model's output reaches
+        // here verbatim, so this is the only place that can guarantee a parseable document.
+        let mut first = true;
+        for line in c.text.lines().filter(|l| !l.trim().is_empty()) {
+            if !first {
+                out.push('\n');
+            }
+            out.push_str(line);
+            first = false;
+        }
         out.push('\n');
     }
     out
@@ -141,6 +158,21 @@ mod tests {
         assert_eq!(serialize(&cues), src);
     }
 
+    /// A cue whose text carries a blank line — which a translation model can return, since its
+    /// output reaches serialize verbatim — must not end the cue early. It used to: everything after
+    /// the blank line was lost, and the truncated document was cached for 60 days.
+    #[test]
+    fn a_blank_line_inside_a_cue_does_not_truncate_the_document() {
+        let cues = vec![
+            Cue { index: 1, start: 1000, end: 2000, text: "Hej.\n\nHur mår du?".into() },
+            Cue { index: 2, start: 3000, end: 4000, text: "Bra.".into() },
+        ];
+        let round_tripped = parse(&serialize(&cues));
+        assert_eq!(round_tripped.len(), 2, "a cue was lost");
+        assert_eq!(round_tripped[0].text, "Hej.\nHur mår du?", "dialogue after the blank line went missing");
+        assert_eq!(round_tripped[1].text, "Bra.");
+    }
+
     #[test]
     fn does_not_panic_on_multibyte_millisecond_field() {
         // A malformed timecode whose millisecond field carries a multibyte char at byte 3 must not
@@ -162,6 +194,27 @@ mod tests {
 #[cfg(test)]
 mod separator_tests {
     use super::*;
+    /// This parser gates every downloaded subtitle body (up to MAX_BODY = 12 MiB of third-party CDN
+    /// content), it has no await in it, and the runtime has one thread — so its cost is the whole
+    /// server's cost. Deciding the separator question per line rescanned the rest of the blank run
+    /// each time: 40k padded lines took 1.6s, 160k took 27s, and a megabyte never finished.
+    ///
+    /// The bound is loose on purpose — it is here to catch a return to quadratic, not to police
+    /// milliseconds. Linear does this in single-digit ms; quadratic needs minutes.
+    #[test]
+    fn a_long_run_of_padded_lines_stays_linear() {
+        let mut input = String::from("1\n00:00:01,000 --> 00:00:02,000\nhi\n");
+        for _ in 0..200_000 {
+            input.push_str(" \n");
+        }
+        input.push_str("not-a-cue-header\n");
+        let started = std::time::Instant::now();
+        let cues = parse(&input);
+        let took = started.elapsed();
+        assert_eq!(cues.len(), 1);
+        assert!(took < std::time::Duration::from_secs(10), "parse took {took:?} — quadratic again?");
+    }
+
 
     /// A separator line carrying a space or a tab is still a separator. Splitting on the literal
     /// "\n\n" missed those and swallowed the following cue whole — so this asserts the cue count,

@@ -121,7 +121,10 @@ mod tests {
     #[test]
     fn empty_current_disables() {
         assert!(Keyring::from_env("", "").unwrap().is_none());
-        assert!(Keyring::from_env("not-base64-@@@", "").is_err() || Keyring::from_env("AAAA", "").is_err());
+        // Each on its own: a disjunction is satisfied by the first term, so the wrong-LENGTH branch
+        // was never actually asserted. A bad current key is a misconfiguration, not "sealing off".
+        assert!(Keyring::from_env("not-base64-@@@", "").is_err(), "unparseable key must be fatal");
+        assert!(Keyring::from_env("AAAA", "").is_err(), "a key of the wrong length must be fatal");
     }
 
     #[test]

@@ -315,7 +315,12 @@ mod tests {
         let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/configure").body(()).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let page = body_string(resp).await;
+        // `contains("DenSeal")` alone passed on a page cut to 4% of its length — the marker sits in
+        // the first few KB. The page must carry the seal implementation AND the form that uses it.
         assert!(page.contains("DenSeal"), "the /configure page must inline the seal bundle");
+        assert!(page.contains("denSeal"), "the seal implementation itself must be present");
+        assert!(page.contains("</html>"), "the page was truncated before the end");
+        assert!(page.len() > 100_000, "the bundle looks truncated: {} bytes", page.len());
     }
 
     #[tokio::test]

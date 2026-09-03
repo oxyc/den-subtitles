@@ -29,6 +29,11 @@ const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60); // 60 days �
 /// How long a raw sub stands in for an alignment that failed. Long enough that a retrying client
 /// doesn't re-spawn the tier binary per request, short enough that a fixed deploy heals itself.
 const SYNC_RETRY_TTL: Duration = Duration::from_secs(600);
+/// Namespace for the "this sync just failed" marker. Kept off every prefix a BODY is stored under
+/// (`BODY_PREFIXES`) so a marker can never be read back and served as a subtitle.
+const SYNCFAIL: &str = "syncfail:";
+#[cfg(test)]
+const BODY_PREFIXES: [&str; 3] = ["os:", "search:", "translate:"];
 // Search results turn over as new subs are uploaded, so a short TTL — enough to spare repeated
 // round-trips when the app reopens a title, not so long that fresh uploads stay hidden.
 const SEARCH_TTL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
@@ -101,12 +106,16 @@ fn parse_id(id: &str) -> Option<(String, Option<i64>, Option<i64>)> {
 /// Pull a `key=value` field out of the Stremio extra-args blob (already `.json`-stripped). The
 /// client sends `videoHash`, `videoSize`, and `filename` here.
 fn extra_field(extra: &str, key: &str) -> Option<String> {
-    let decoded = percent_decode(extra);
+    // Split first, decode second. Decoding the whole blob turned a %26 inside a value into a real
+    // separator, so "Fast %26 Furious 6.mkv" arrived as the filename "Fast " — and a filename
+    // carrying %26videoHash%3D... replaced the hash the client actually sent, which then went to
+    // OpenSubtitles as the moviehash and silently disabled the whole sync ladder.
     let prefix = format!("{key}=");
-    for pair in decoded.split('&') {
+    for pair in extra.split('&') {
         if let Some(v) = pair.strip_prefix(&prefix) {
+            let v = percent_decode(v);
             if !v.is_empty() {
-                return Some(v.to_string());
+                return Some(v);
             }
         }
     }
@@ -293,7 +302,7 @@ pub async fn handle_subtitle_file(
     // timeout, would be paid again per request. The marker is separate from `cache_key` so that key
     // never holds anything but a settled answer.
     let wanted_sync = resync_url.is_some() || ref_id.is_some();
-    let retry_marker = format!("syncfail:{cache_key}");
+    let retry_marker = format!("{SYNCFAIL}{cache_key}");
     if wanted_sync && state.cache.get(&retry_marker).is_some() {
         return httputil::srt_provisional(target);
     }
@@ -656,18 +665,14 @@ mod sync_fallback_tests {
         assert!(cc(httputil::srt("x".into())).contains("immutable"));
     }
 
-    /// A rejected resync target leaves a request that asked for no sync at all. It must NOT keep
-    /// claiming a resync in the key, and — since the raw sub is then the real answer and nothing
-    /// will ever "heal" — it must not be downgraded to a stand-in either. `os:5` is the same key
-    /// `subtitle_srt` fills, so treating it as a stand-in re-downloads on the next request.
+    /// A rejected resync target leaves a request that asked for no sync at all: the key must not
+    /// keep claiming a resync, and `os:5` — the same key `subtitle_srt` fills — must not be
+    /// downgraded to a stand-in, or the raw sub is re-downloaded on the next request.
     #[test]
     fn a_rejected_resync_target_leaves_a_plain_request() {
         let vetted: Option<String> = None; // what the SSRF guard leaves behind
         assert_eq!(sync_cache_key(5, &vetted, Some(9)), "os:5:ref:9");
         assert_eq!(sync_cache_key(5, &vetted, None), "os:5");
-        // wanted_sync is read off the VETTED url, so a refused target with no ref wants no sync.
-        assert!(!(vetted.is_some() || None::<i64>.is_some()), "a refused target must not want a sync");
-        assert!(vetted.is_some() || Some(9i64).is_some(), "a ref still wants one");
         // Two different targets stay distinct, so one stream's alignment is never served for another.
         assert_ne!(
             sync_cache_key(5, &Some("http://host/a.mkv".into()), None),
@@ -675,15 +680,36 @@ mod sync_fallback_tests {
         );
     }
 
-    /// The invariant the whole fix rests on: the retry marker lives in its own namespace, so
-    /// `cache_key` can only ever hold a settled body and the cache-hit path is right to serve it
-    /// `immutable`. A marker sharing the key would be served AS the subtitle.
+    /// The invariant the whole fix rests on: a retry marker can never be read back as a body. Built
+    /// from the real key builders rather than literals, so a change to any of them is caught here.
     #[test]
-    fn the_retry_marker_never_collides_with_a_body_key() {
-        for key in ["os:5", "os:5:ref:9", "os:5:resync:1234"] {
-            let marker = format!("syncfail:{key}");
-            assert_ne!(marker, key);
-            assert!(!marker.starts_with("os:"), "a marker must not look like a body key: {marker}");
+    fn a_retry_marker_can_never_be_read_as_a_body() {
+        // Every body key in the service starts with one of these; the marker starts with none.
+        for prefix in BODY_PREFIXES {
+            assert!(!prefix.starts_with(SYNCFAIL), "{SYNCFAIL} shadows the body prefix {prefix}");
+            assert!(!SYNCFAIL.starts_with(prefix), "a {prefix} read would match {SYNCFAIL}");
         }
+        // And the key builder really does produce keys inside that namespace, for every tier.
+        for key in [
+            sync_cache_key(5, &None, None),
+            sync_cache_key(5, &None, Some(9)),
+            sync_cache_key(5, &Some("http://host/a.mkv".into()), None),
+        ] {
+            assert!(BODY_PREFIXES.iter().any(|p| key.starts_with(p)), "unnamespaced body key: {key}");
+            assert!(!key.starts_with(SYNCFAIL));
+        }
+    }
+
+    /// The extras blob is `key=value` pairs joined by `&`, each value percent-encoded. Decoding the
+    /// blob before splitting let a value's own `%26` become a separator.
+    #[test]
+    fn an_encoded_ampersand_stays_inside_its_value() {
+        let extra = "videoHash=8e24&videoSize=734003200&filename=Fast%20%26%20Furious%206%20(2013).mkv";
+        assert_eq!(extra_field(extra, "filename").as_deref(), Some("Fast & Furious 6 (2013).mkv"));
+        assert_eq!(extra_field(extra, "videoHash").as_deref(), Some("8e24"));
+
+        // And a value cannot forge a field the client never sent.
+        let forged = "filename=movie%26videoHash%3Dcafebabecafebabe.mkv";
+        assert_eq!(extra_field(forged, "videoHash"), None, "a filename forged a videoHash");
     }
 }
