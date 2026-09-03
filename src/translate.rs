@@ -192,7 +192,14 @@ async fn translate_batch(
                 .filter(|(t, s)| !s.trim().is_empty() && (t.trim().is_empty() || t.trim() == s.trim()))
                 .count();
             budget.untranslated.fetch_add(dead, Ordering::Relaxed);
-            Ok(v)
+            // A blanked line is shipped as its source, the same choice the wrong-length leaf makes:
+            // an untranslated line still shows the original language, a blank one shows nothing.
+            // Counting it above and then serving the blank anyway was the gap — below the ratio,
+            // those cues rendered empty in an otherwise successful film.
+            Ok(v.into_iter()
+                .zip(sources.iter())
+                .map(|(t, s)| if t.trim().is_empty() && !s.trim().is_empty() { s.clone() } else { t })
+                .collect())
         }
         // Only a CONTRACT violation splits. An upstream error is not one — splitting on it spent six
         // more calls against a provider that had just said no, with no backoff, before failing anyway.
@@ -523,7 +530,7 @@ mod contract_tests {
     async fn a_run_cannot_outspend_its_call_budget() {
         let up = fake(|s: &[String]| {
             // Wrong-length whenever the batch holds a cue whose number is divisible by 4.
-            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n % 4 == 0)) {
+            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n.is_multiple_of(4))) {
                 Ok(vec!["junk".to_string(); s.len() + 1])
             } else {
                 Ok(s.iter().map(|t| format!("T:{t}")).collect())
@@ -602,6 +609,26 @@ mod contract_tests {
         let blanks = fake(|s: &[String]| Ok(vec![String::new(); s.len()]));
         let err = run_translation(&blanks, &cues(200)).await.unwrap_err();
         assert!(err.contains("unusable"), "a reply of empty strings was accepted: {err}");
+    }
+
+    /// Blanks below the ratio pass the gate, and those cues used to be SHIPPED blank — rendering as
+    /// nothing in a film that otherwise succeeded and caching that way for 60 days. A blanked line
+    /// falls back to its source, the same choice the wrong-length leaf makes.
+    #[tokio::test]
+    async fn a_blanked_cue_falls_back_to_its_source() {
+        // One in ten blank: under the 25% gate, so the run succeeds and the cues are served.
+        let up = fake(|s: &[String]| {
+            Ok(s.iter()
+                .map(|t| {
+                    let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
+                    if n.is_multiple_of(10) { String::new() } else { format!("T:{t}") }
+                })
+                .collect())
+        });
+        let out = run_translation(&up, &cues(200)).await.expect("a tenth blank is under the gate");
+        assert_eq!(out[10].text, "line 10", "a blanked cue was shipped empty");
+        assert_eq!(out[11].text, "T:line 11");
+        assert!(out.iter().all(|c| !c.text.trim().is_empty()), "a cue would render as nothing");
     }
 
     /// A signs-only or forced-narrative track is mostly proper nouns and place names, which

@@ -20,6 +20,9 @@ pub fn has_a_cue(input: &str) -> bool {
     // by one — but streams, stops at the first hit, and allocates nothing. It is deliberately the
     // more eager of the two about block boundaries: this only ever answers "is this a subtitle at
     // all, or an error page", so never rejecting a real one is what matters.
+    // Same BOM strip as `parse`: U+FEFF is not whitespace, so without this a BOM'd index line fails
+    // to parse as a number and the timing line after it is never even tested.
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut at_block_start = true;
     let mut after_index = false;
     for line in input.split(['\n', '\r']) {
@@ -191,6 +194,12 @@ mod tests {
     fn has_a_cue_agrees_with_the_parser() {
         let cases = [
             "1\n00:00:01,000 --> 00:00:02,000\nhi\n",
+            // A BOM'd, LF-only, single-cue file: `parse` strips the BOM and the cheap gate did not,
+            // so it rejected a real subtitle outright. Every literal here was hand-picked, which is
+            // exactly why the BOM — the one case `parse` special-cases — was the one that got out.
+            "\u{feff}1\n00:00:01,000 --> 00:00:02,000\nhi\n",
+            "\u{feff}00:00:01,000 --> 00:00:02,000\nno index\n",
+            "\u{feff}1\r\n00:00:01,000 --> 00:00:02,000\r\nhi\r\n",
             "00:00:01,000 --> 00:00:02,000\nno index\n",
             "\n\n1\n00:00:01,000 --> 00:00:02,000\nleading blanks\n",
             "1\r\n00:00:01,000 --> 00:00:02,000\r\ncrlf\r\n",
