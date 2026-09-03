@@ -25,7 +25,7 @@ pub fn has_a_cue(input: &str) -> bool {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut at_block_start = true;
     let mut after_index = false;
-    for line in input.split(['\n', '\r']) {
+    for line in lines_like_parse(input) {
         if line.trim().is_empty() {
             at_block_start = true;
             after_index = false;
@@ -38,6 +38,15 @@ pub fn has_a_cue(input: &str) -> bool {
         at_block_start = false;
     }
     false
+}
+
+/// Lines as `parse` sees them after normalisation: "\r\n", "\n" and a bare "\r" are each ONE
+/// break. Splitting on the two characters independently yields a phantom empty string inside every
+/// "\r\n", which reads as a blank line — and a blank line means "a cue may start here", so almost
+/// every line of a CRLF document looked like a block start and `has_a_cue` accepted bodies that
+/// `parse` finds no cues in at all.
+fn lines_like_parse(input: &str) -> impl Iterator<Item = &str> {
+    input.split('\n').flat_map(|seg| seg.strip_suffix('\r').unwrap_or(seg).split('\r'))
 }
 
 /// Parse an SRT document. Tolerant of CRLF, a UTF-8 BOM, and blank runs; a malformed block is
@@ -216,6 +225,43 @@ mod tests {
                 "the cheap gate and the parser disagree on {input:?}"
             );
         }
+    }
+
+    /// The cheap gate stands in for the parser on every downloaded body, so it must agree with it
+    /// in BOTH directions: never rejecting a real subtitle, and never passing something the parser
+    /// finds no cues in — that body would be cached for sixty days and render as nothing.
+    ///
+    /// A deterministic differential over the shapes that actually differ: separators, a BOM, stray
+    /// prose, and timing-shaped fragments. Splitting on the two line characters independently put a
+    /// phantom empty line inside every CRLF, which read as "a cue may start here".
+    #[test]
+    fn has_a_cue_agrees_with_the_parser_across_separators() {
+        let pieces = ["1", "00:00:01,000 --> 00:00:02,000", "hi", "x", "", "\u{feff}1", "2.", "00:00:0"];
+        let seps = ["\n", "\r\n", "\r", "\n\n", "\r\n\r\n", " \n"];
+        // A small xorshift keeps this deterministic and dependency-free.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let mut doc = String::new();
+            for _ in 0..rand(8) + 1 {
+                doc.push_str(pieces[rand(pieces.len())]);
+                doc.push_str(seps[rand(seps.len())]);
+            }
+            assert_eq!(has_a_cue(&doc), !parse(&doc).is_empty(), "gate and parser disagree on {doc:?}");
+        }
+    }
+
+    /// The exact minimal case the disagreement reduced to.
+    #[test]
+    fn a_crlf_after_prose_does_not_invent_a_cue() {
+        let doc = "x\r\n00:00:01,000 --> 00:00:02,000";
+        assert!(parse(doc).is_empty(), "the parser finds no cue here");
+        assert!(!has_a_cue(doc), "the gate accepted a body with no cues in it");
     }
 
     /// A cue whose text carries a blank line — which a translation model can return, since its

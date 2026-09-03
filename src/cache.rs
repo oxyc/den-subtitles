@@ -83,7 +83,11 @@ impl Cache {
             // before renaming it into place, so unlinking one on sight can delete an in-flight
             // write and make a healthy disk report itself degraded.
             if path.extension().is_some_and(|e| e.to_string_lossy().starts_with('t')) {
-                if age(&meta).is_none_or(|age| age > TEMP_GRACE) {
+                // An unknown age means don't touch it. `elapsed()` errors whenever the mtime reads
+                // as being in the future — a backward clock step, or a filesystem that doesn't
+                // report mtime at all — and treating that as "old enough" deleted in-flight writes
+                // on sight, which is the whole thing the grace period exists to stop.
+                if age(&meta).is_some_and(|age| age > TEMP_GRACE) {
                     let _ = std::fs::remove_file(&path);
                 }
                 continue;
@@ -280,7 +284,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("den-subs-cache-{name}-{}", next_temp_id()));
+        // The counter restarts per process, so include the pid: two concurrent `cargo test` runs
+        // otherwise pick the same directory and delete each other's files.
+        let d = std::env::temp_dir()
+            .join(format!("den-subs-cache-{name}-{}-{}", std::process::id(), next_temp_id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -439,10 +446,29 @@ mod tests {
         assert!(in_flight.exists(), "the sweep deleted a temp that was still being written");
     }
 
+    /// A temp whose mtime reads as being in the FUTURE — an NTP step backwards, or a filesystem
+    /// that does not report mtime — makes `elapsed()` fail. Treating an unknown age as "old enough"
+    /// deletes the in-flight write the grace period exists to protect, and on a filesystem without
+    /// mtime it disables the grace period permanently.
+    #[test]
+    fn the_sweep_leaves_a_temp_it_cannot_date() {
+        let dir = tmpdir("sweep-undatable");
+        let c = Cache::new(1 << 20, Some(dir.clone()));
+        c.put("k".into(), "v".into(), HOUR);
+        let in_flight = c.disk_path("k").unwrap().with_extension("t7");
+        std::fs::write(&in_flight, "half-written").unwrap();
+        shift_mtime(&in_flight, std::time::SystemTime::now() + Duration::from_secs(5));
+        c.sweep();
+        assert!(in_flight.exists(), "the sweep deleted a temp whose age it could not determine");
+    }
+
     /// Push a file's modification time into the past.
     fn backdate(path: &std::path::Path, by: Duration) {
+        shift_mtime(path, std::time::SystemTime::now() - by);
+    }
+
+    fn shift_mtime(path: &std::path::Path, when: std::time::SystemTime) {
         let f = std::fs::File::options().write(true).open(path).unwrap();
-        let when = std::time::SystemTime::now() - by;
         f.set_times(std::fs::FileTimes::new().set_modified(when)).unwrap();
     }
 
