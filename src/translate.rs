@@ -108,11 +108,8 @@ async fn run_translation(
             return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
         }
     }
-    // The verdict for the film as a whole, which is also the only gate a short track ever meets.
-    let kept = budget.untranslated.load(Ordering::Relaxed);
-    if unusable(kept, cues.len()) {
-        return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
-    }
+    // No verdict after the loop: the check above runs after the last batch too, against the same
+    // count and the same denominator, so a second one could never reach a different answer.
     debug_assert_eq!(out.len(), cues.len());
     Ok(out)
 }
@@ -420,6 +417,23 @@ enum Auth {
 /// OpenAI-compatible chat root. A function rather than a literal so a test can drive the real
 /// request/response path — the classification of an empty reply lives at that call site, and
 /// mis-classifying it there is what killed whole films twice.
+/// DeepL's root, a function for the same reason `chat_base` is: the reply handling below had no
+/// test at all, and that is where these bugs live.
+#[cfg(not(test))]
+fn deepl_base() -> String {
+    "https://api-free.deepl.com".to_string()
+}
+
+#[cfg(test)]
+fn deepl_base() -> String {
+    DEEPL_BASE.with(|b| b.borrow().clone()).unwrap_or_else(|| "http://127.0.0.1:1".to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    static DEEPL_BASE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(not(test))]
 fn chat_base(provider: Provider) -> String {
     match provider {
@@ -483,7 +497,7 @@ async fn deepl_translate(
     };
     let body = json!({ "text": sources, "target_lang": code });
     let resp = client
-        .post("https://api-free.deepl.com/v2/translate")
+        .post(format!("{}/v2/translate", deepl_base()))
         .timeout(LLM_TIMEOUT)
         .header("Authorization", format!("DeepL-Auth-Key {}", llm.api_key))
         .json(&body)
@@ -497,7 +511,14 @@ async fn deepl_translate(
     let arr = v["translations"]
         .as_array()
         .ok_or_else(|| CallError::Contract("deepl returned no translations".to_string()))?;
-    Ok(arr.iter().filter_map(|t| t["text"].as_str().map(str::to_string)).collect())
+    // Invalidate, don't drop. `filter_map` silently shrank the reply, which the same-length check
+    // upstream happens to catch — but only by coincidence: drops offset by spurious extra entries
+    // would misalign every cue at the right length and pass. The chat path already collects into
+    // an Option for exactly this reason.
+    arr.iter()
+        .map(|t| t["text"].as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| CallError::Contract("deepl returned a non-string translation".to_string()))
 }
 
 /// DeepL wants an upper-case language code. Map the display names Den sends; fall back to the first
@@ -1362,5 +1383,67 @@ mod provider_reply_tests {
     async fn a_well_formed_reply_parses() {
         let body = r#"{"choices":[{"message":{"content":"[\"Hej\"]"}}]}"#;
         assert_eq!(call(body, "200 OK").await.unwrap(), vec!["Hej"]);
+    }
+}
+
+#[cfg(test)]
+mod deepl_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn deepl(body: &'static str) -> Result<Vec<String>, CallError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        DEEPL_BASE.with(|b| *b.borrow_mut() = Some(format!("http://{addr}")));
+        let http = reqwest::Client::new();
+        let llm = LlmConfig { provider: Provider::DeepL, api_key: "k".into(), model: String::new() };
+        deepl_translate(&http, &llm, &["a".to_string(), "b".to_string()], "Swedish").await
+    }
+
+    /// A malformed entry must invalidate the reply, not vanish from it. Dropping it shrank the
+    /// array, which the same-length check upstream catches only by coincidence — a drop offset by
+    /// a spurious extra entry would misalign every cue at exactly the right length.
+    #[tokio::test]
+    async fn a_non_string_translation_invalidates_the_reply() {
+        let err = deepl(r#"{"translations":[{"text":"Hej"},{"text":null}]}"#)
+            .await
+            .expect_err("a null translation was accepted");
+        assert!(matches!(err, CallError::Contract(_)), "{err:?}");
+
+        // And the shape that would otherwise slip through: one dropped, one added, length intact.
+        let err = deepl(r#"{"translations":[{"text":"Hej"},{"nope":"x"},{"text":"Da"}]}"#)
+            .await
+            .expect_err("a misaligned reply of the right length was accepted");
+        assert!(matches!(err, CallError::Contract(_)), "{err:?}");
+    }
+
+    /// An unknown language never reaches the network: splitting cannot make DeepL learn it, so it
+    /// fails hard rather than degrading to source text.
+    #[tokio::test]
+    async fn an_unknown_language_is_refused_before_calling() {
+        let http = reqwest::Client::new();
+        let llm = LlmConfig { provider: Provider::DeepL, api_key: "k".into(), model: String::new() };
+        let err = deepl_translate(&http, &llm, &["a".to_string()], "Klingon")
+            .await
+            .expect_err("an unknown language was sent to DeepL");
+        assert!(matches!(err, CallError::Upstream(_)), "must not split-retry: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_reply_parses() {
+        let out = deepl(r#"{"translations":[{"text":"Hej"},{"text":"Da"}]}"#).await.unwrap();
+        assert_eq!(out, vec!["Hej", "Da"]);
     }
 }
