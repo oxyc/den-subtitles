@@ -32,6 +32,8 @@ const SYNC_RETRY_TTL: Duration = Duration::from_secs(600);
 /// Namespace for the "this sync just failed" marker. Kept off every prefix a BODY is stored under
 /// (`BODY_PREFIXES`) so a marker can never be read back and served as a subtitle.
 const SYNCFAIL: &str = "syncfail:";
+/// Longest a target-language name may be. The longest real one is a couple of dozen characters.
+const MAX_LANG: usize = 64;
 #[cfg(test)]
 const BODY_PREFIXES: [&str; 3] = ["os:", "search:", "translate:"];
 // Search results turn over as new subs are uploaded, so a short TTL — enough to spare repeated
@@ -483,6 +485,12 @@ pub async fn handle_translate(
     let Some((imdb, season, episode)) = parse_id(id) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_id");
     };
+    // A language name, not an essay. This lands in a cache key that becomes a filename — the same
+    // hazard `search_hash` already bounds `videoHash` against — and it is interpolated into the
+    // prompt of every batch, so its length multiplies the bill against the viewer's own key.
+    if lang.is_empty() || lang.len() > MAX_LANG {
+        return httputil::text(StatusCode::BAD_REQUEST, "bad_lang");
+    }
     let cache_key = format!(
         "translate:{imdb}:{}:{}:{lang}:{}:{}",
         season.unwrap_or(0),
@@ -817,6 +825,27 @@ mod translate_retry_tests {
         // "recently" is what says the marker short-circuited rather than a fresh attempt failing:
         // with no HTTP client both paths end in a 502, so the status alone proves nothing.
         assert!(body.contains("recently"), "the marker did not short-circuit; body: {body}");
+    }
+
+    /// An over-long language name is refused before it can become a filename or a prompt. The same
+    /// file already bounds `videoHash` for the first reason; the second is that `lang` goes into
+    /// every batch's prompt, so its length multiplies the bill against the viewer's own key.
+    #[tokio::test]
+    async fn an_over_long_language_is_refused() {
+        let state = state("long-lang");
+        let config = config_segment();
+        let long = "x".repeat(MAX_LANG + 1);
+        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", &long, false).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an over-long language was accepted");
+
+        // Nothing was written for it — not the body key, and not the failure marker either.
+        let store = state.cfg.cache_dir.join("store");
+        let files = std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(files, 0, "an invalid request left {files} cache files behind");
+
+        // A real language still works its way through to the upstream check.
+        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "Swedish", false).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "a valid language must not be refused");
     }
 
     /// And the marker is scoped to the translation it belongs to: another language is a different
