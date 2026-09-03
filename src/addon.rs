@@ -103,6 +103,13 @@ fn parse_id(id: &str) -> Option<(String, Option<i64>, Option<i64>)> {
     Some((imdb.to_string(), season, episode))
 }
 
+/// The client's OSHash, if it really is one: 16 hex digits. Anything else is not a hash, and this
+/// value goes into a cache key that becomes a filename — an over-long one fails the disk write and
+/// burns the process's one-shot "persistence degraded" warning on a request that was never valid.
+fn search_hash(extra: &str) -> Option<String> {
+    extra_field(extra, "videoHash").filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Pull a `key=value` field out of the Stremio extra-args blob (already `.json`-stripped). The
 /// client sends `videoHash`, `videoSize`, and `filename` here.
 fn extra_field(extra: &str, key: &str) -> Option<String> {
@@ -147,7 +154,10 @@ pub async fn handle_subtitles(
     // keyed by the query params incl. the file hash. Short TTL — new subs get uploaded — but enough
     // to spare a live round-trip every time the app reopens a title. Ranking is filename-specific, so
     // it is NOT baked into the cached list — we rank per request below.
-    let hash = extra_field(extra, "videoHash");
+    // An OSHash is 16 hex digits. Anything else is not one, and this value goes into a cache key
+    // that becomes a filename — an over-long one fails the disk write and burns the process's
+    // one-shot "persistence degraded" warning on a request that was never valid.
+    let hash = search_hash(extra);
     let filename = extra_field(extra, "filename");
     let search_key = format!(
         "search:{imdb}:{}:{}:{}",
@@ -482,11 +492,20 @@ pub async fn handle_translate(
     );
 
     // Warm the cache if needed (both the .json and .srt forms share it).
+    let failed_recently = format!("{SYNCFAIL}{cache_key}");
     if state.cache.get(&cache_key).is_none() {
+        // A whole film's LLM bill is not something to re-pay on every tap. The `.json` and `.srt`
+        // forms are two requests, so the app's own flow retries once by design — and nothing was
+        // remembered about the failure, so each attempt paid in full again, with no backoff. Same
+        // marker the sync path uses, in the same namespace.
+        if state.cache.get(&failed_recently).is_some() {
+            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+        }
         if let Err(e) = produce_translation(state, &cfg, llm, &imdb, season, episode, lang, &cache_key).await {
             // Log the detail (no key in these strings); hand the client a generic message rather than
             // echoing a raw upstream error body.
             eprintln!("translate: {imdb} → {lang} failed: {e}");
+            state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
             return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
         }
     }
@@ -711,6 +730,14 @@ mod sync_fallback_tests {
         // And a value cannot forge a field the client never sent.
         let forged = "filename=movie%26videoHash%3Dcafebabecafebabe.mkv";
         assert_eq!(extra_field(forged, "videoHash"), None, "a filename forged a videoHash");
+
+        // A videoHash is 16 hex digits. Anything else is not one — and it lands in a cache key
+        // that becomes a filename, where an over-long value fails the write and consumes the
+        // process's only "persistence degraded" warning on a request that was never valid.
+        assert_eq!(extra_field("videoHash=8e245d9679d31e12", "videoHash").as_deref(), Some("8e245d9679d31e12"));
+        for bad in ["videoHash=8e24", "videoHash=zzzzzzzzzzzzzzzz", &format!("videoHash={}", "a".repeat(300))] {
+            assert_eq!(search_hash(bad), None, "accepted a non-hash: {bad}");
+        }
 
         // The extras arrive as a PATH segment, where `+` is a literal plus. Form-decoding it turned
         // every HDR10+ / DTS-HD 7.1+ release name into one the ranker scores differently.

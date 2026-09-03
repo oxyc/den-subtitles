@@ -50,12 +50,16 @@ pub async fn translate(
     if cues.len() > MAX_CUES {
         return Err(format!("subtitle too large: {} cues (max {MAX_CUES})", cues.len()));
     }
-    run_translation(&Upstream { client, llm, target_lang }, cues).await
+    run_translation(&Upstream { client, llm, target_lang }, cues, RUN_DEADLINE).await
 }
 
 /// The harness proper, over any upstream. Split from `translate` so the same-length contract and the
 /// unusable-output gate are testable without a provider.
-async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, String> {
+async fn run_translation(
+    upstream: &(dyn BatchCall + Sync),
+    cues: &[Cue],
+    deadline: Duration,
+) -> Result<Vec<Cue>, String> {
     let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Rolling context: the tail of already-translated pairs, refreshed as we go.
     let mut context: Vec<(String, String)> = Vec::new();
@@ -68,8 +72,15 @@ async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Res
         calls: AtomicUsize::new(0),
         max_calls: call_budget(cues.len()),
     };
+    let started = std::time::Instant::now();
 
     for batch in cues.chunks(BATCH) {
+        // Calls were counted but never timed, and batches run in sequence at up to LLM_TIMEOUT
+        // each — so the permitted ceiling was measured in hours, long after the viewer gave up,
+        // still spending their key.
+        if started.elapsed() > deadline {
+            return Err("translation took too long".to_string());
+        }
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
         let translated = translate_batch(upstream, &sources, &context, &budget).await?;
         for (cue, text) in batch.iter().zip(translated) {
@@ -97,22 +108,31 @@ async fn run_translation(upstream: &(dyn BatchCall + Sync), cues: &[Cue]) -> Res
     Ok(out)
 }
 
+/// Wall-clock ceiling for one film. Well past a healthy run (~30 sequential calls) and well short
+/// of what the call budget alone permits at LLM_TIMEOUT apiece.
+const RUN_DEADLINE: Duration = Duration::from_secs(600);
 /// Cues that must be seen before the ratio is allowed to abort a run mid-film.
 const MIN_GATE_SAMPLE: usize = 120;
 /// Fallbacks below this never condemn a run, however small it is. A signs-only track is mostly
 /// proper nouns and place names, and those legitimately come back unchanged.
 const MIN_UNUSABLE: usize = 8;
 
-/// Has too much come back unusable to call this a translation? A model wrong more than a quarter of
-/// the time is not translating, and its output must not be cached as though it were.
+/// Has too much come back unusable to call this a translation?
+///
+/// Nothing translated at all is the unambiguous case, and it is refused at any size — a seven-cue
+/// track echoed back verbatim is as much a non-translation as a film is. Short of that the bar is
+/// high, because the alternative error is worse: a forced-narrative track is mostly place names and
+/// proper nouns that legitimately come back unchanged, and refusing it costs the full LLM bill,
+/// caches nothing, and makes every retry pay again. A quarter unchanged is a normal signs track; two
+/// thirds is a model that is not translating.
 fn unusable(kept: usize, seen: usize) -> bool {
-    kept >= MIN_UNUSABLE && kept * 4 > seen
+    seen > 0 && (kept == seen || (kept >= MIN_UNUSABLE && kept * 3 > seen * 2))
 }
 
-/// The mid-run bail is deliberately harsher than the verdict: it exists to stop paying for a run
-/// that is clearly lost, and a film is only judged in full at the end.
+/// The mid-run bail is harsher than the verdict: it exists only to stop paying for a run that is
+/// already lost, and a film is judged in full at the end.
 fn hopeless(kept: usize, seen: usize) -> bool {
-    kept >= MIN_UNUSABLE && kept * 2 > seen
+    kept >= MIN_UNUSABLE && kept * 4 > seen * 3
 }
 
 /// Upstream calls a run may make. The happy path is one per batch; a wrong-length reply splits into
@@ -129,6 +149,35 @@ struct Budget {
     max_calls: usize,
 }
 
+/// Why a call did not produce a usable batch.
+///
+/// The distinction decides everything below it: a CONTRACT failure is the model misbehaving, and
+/// degrades — split the batch, and at one cue keep the source. An UPSTREAM failure is the provider
+/// refusing, and splitting on that just spends more calls at a service that has already said no.
+/// Wrong shape and wrong length are both the model misbehaving; treating only the length that way
+/// made one chatty reply fatal to a whole film.
+#[derive(Debug)]
+enum CallError {
+    Contract(String),
+    Upstream(String),
+}
+
+/// Everything that reaches here as a bare string came from the transport or a provider status —
+/// the model's own misbehaviour is constructed explicitly as `Contract`.
+impl From<String> for CallError {
+    fn from(m: String) -> Self {
+        CallError::Upstream(m)
+    }
+}
+
+impl CallError {
+    fn into_message(self) -> String {
+        match self {
+            CallError::Contract(m) | CallError::Upstream(m) => m,
+        }
+    }
+}
+
 /// One upstream call: a batch of source lines in, the same number of translated lines out (or an
 /// error). Taken as a parameter so the contract logic below is testable without a provider.
 trait BatchCall: Sync {
@@ -136,7 +185,7 @@ trait BatchCall: Sync {
         &self,
         sources: &[String],
         context: &[(String, String)],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>>;
 }
 
 /// The live call, dispatched by provider.
@@ -151,7 +200,7 @@ impl BatchCall for Upstream<'_> {
         &self,
         sources: &[String],
         context: &[(String, String)],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
         let sources = sources.to_vec();
         let context = context.to_vec();
         Box::pin(async move {
@@ -201,9 +250,9 @@ async fn translate_batch(
                 .map(|(t, s)| if t.trim().is_empty() && !s.trim().is_empty() { s.clone() } else { t })
                 .collect())
         }
-        // Only a CONTRACT violation splits. An upstream error is not one — splitting on it spent six
+        // A contract violation splits; an upstream refusal does not — splitting on that spent six
         // more calls against a provider that had just said no, with no backoff, before failing anyway.
-        Ok(_) if sources.len() > 1 => {
+        Ok(_) | Err(CallError::Contract(_)) if sources.len() > 1 => {
             // Split and retry each half. Context is best-effort continuity, not correctness, so we
             // don't thread the first half's output into the second here — keeps the split simple.
             let mid = sources.len() / 2;
@@ -216,11 +265,11 @@ async fn translate_batch(
         // A single cue that still won't come back cleanly: keep the source text rather than fail the
         // whole film (one untranslated line beats no subtitles). Counted, because a model that is
         // consistently wrong drives EVERY cue to this leaf and returns the source film verbatim.
-        Ok(_) => {
+        Ok(_) | Err(CallError::Contract(_)) => {
             budget.untranslated.fetch_add(sources.len(), Ordering::Relaxed);
             Ok(sources.to_vec())
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.into_message()),
     }
 }
 
@@ -232,7 +281,7 @@ async fn llm_translate(
     sources: &[String],
     target_lang: &str,
     context: &[(String, String)],
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, CallError> {
     let system = format!(
         "You are a professional subtitle translator. Translate each string in the user's JSON array \
          into {target_lang}. Return ONLY a JSON array of strings, the SAME length and order as the \
@@ -252,10 +301,11 @@ async fn llm_translate(
         user.push('\n');
     }
     user.push_str("Translate this JSON array:\n");
-    user.push_str(&serde_json::to_string(sources).map_err(|e| e.to_string())?);
+    user.push_str(&serde_json::to_string(sources).map_err(|e| CallError::Upstream(e.to_string()))?);
 
     let text = call_chat(client, llm, &system, &user).await?;
-    parse_json_array(&text).ok_or_else(|| "model did not return a JSON array".to_string())
+    parse_json_array(&text)
+        .ok_or_else(|| CallError::Contract("model did not return a JSON array".to_string()))
 }
 
 /// Dispatch a single (system, user) chat turn to the configured provider and return the assistant
@@ -360,7 +410,7 @@ async fn deepl_translate(
     llm: &LlmConfig,
     sources: &[String],
     target_lang: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, CallError> {
     let body = json!({ "text": sources, "target_lang": deepl_code(target_lang) });
     let resp = client
         .post("https://api-free.deepl.com/v2/translate")
@@ -371,10 +421,12 @@ async fn deepl_translate(
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("deepl {}", resp.status()));
+        return Err(CallError::Upstream(format!("deepl {}", resp.status())));
     }
     let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
-    let arr = v["translations"].as_array().ok_or("no translations")?;
+    let arr = v["translations"]
+        .as_array()
+        .ok_or_else(|| CallError::Contract("deepl returned no translations".to_string()))?;
     Ok(arr.iter().filter_map(|t| t["text"].as_str().map(str::to_string)).collect())
 }
 
@@ -395,17 +447,47 @@ fn deepl_code(lang: &str) -> String {
 /// Extract a JSON string array from model output, tolerating markdown code fences and leading prose
 /// by scanning for the first `[` … matching `]`.
 fn parse_json_array(text: &str) -> Option<Vec<String>> {
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    if end <= start {
-        return None;
+    // Every `[` is tried as a start, and each is closed at its own matching `]`. Taking the first
+    // `[` to the LAST `]` broke on any bracket in the surrounding prose — "[sic]" in a trailing
+    // note, or "I [will] translate:" ahead of the array — which then failed the whole film.
+    let bytes = text.as_bytes();
+    for (start, _) in text.char_indices().filter(|&(_, c)| c == '[') {
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, &b) in bytes[start..].iter().enumerate() {
+            if in_string {
+                match b {
+                    _ if escaped => escaped = false,
+                    b'\\' => escaped = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // A well-formed array here IS the reply, and whether every element is a
+                        // string decides whether it is valid. Falling through to the next `[` would
+                        // descend into a nested one and answer with a fragment of the reply.
+                        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&text[start..=start + offset]) {
+                            return arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect();
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    let arr: Vec<Value> = serde_json::from_str(&text[start..=end]).ok()?;
-    // Every element must be a string. `as_str().unwrap_or_default()` blanked non-strings while keeping
-    // the count, so `[{"text":"Hej"},…]` — a plausible reply shape — passed the length check and cached
-    // a full track of empty dialogue.
-    arr.into_iter().map(|v| v.as_str().map(str::to_string)).collect()
+    None
 }
+
+
 
 
 #[cfg(test)]
@@ -439,25 +521,30 @@ mod contract_tests {
 
     /// A canned upstream. `reply` builds a response from the batch it was given, so a fake can be
     /// wrong in exactly the way a real model is wrong.
-    struct Fake<F: Fn(&[String]) -> Result<Vec<String>, String> + Send + Sync> {
+    struct Fake<F: Fn(&[String]) -> Result<Vec<String>, CallError> + Send + Sync> {
         reply: F,
         calls: Mutex<usize>,
     }
 
-    impl<F: Fn(&[String]) -> Result<Vec<String>, String> + Send + Sync> BatchCall for Fake<F> {
+    impl<F: Fn(&[String]) -> Result<Vec<String>, CallError> + Send + Sync> BatchCall for Fake<F> {
         fn call(
             &self,
             sources: &[String],
             _context: &[(String, String)],
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
             *self.calls.lock().unwrap() += 1;
             let r = (self.reply)(sources);
             Box::pin(async move { r })
         }
     }
 
-    fn fake<F: Fn(&[String]) -> Result<Vec<String>, String> + Send + Sync>(reply: F) -> Fake<F> {
+    fn fake<F: Fn(&[String]) -> Result<Vec<String>, CallError> + Send + Sync>(reply: F) -> Fake<F> {
         Fake { reply, calls: Mutex::new(0) }
+    }
+
+    /// The harness with a deadline long enough never to be the thing under test.
+    async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, String> {
+        run_translation(up, cues, Duration::from_secs(600)).await
     }
 
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, String> {
@@ -485,6 +572,97 @@ mod contract_tests {
         }
         // The valid shape still parses, fences and prose included.
         assert_eq!(parse_json_array("```json\n[\"a\",\"b\"]\n```").unwrap(), vec!["a", "b"]);
+
+        // A bracket in the surrounding prose used to break the whole film: the scan ran from the
+        // first `[` to the LAST `]`, so a trailing "[sic]" or a leading "I [will] translate:"
+        // produced no array at all, which was then fatal rather than degrading.
+        for chatty in [
+            "[\"a\",\"b\"]\n\nNote: I preserved [sic] the tone.",
+            "I [will] translate:\n[\"a\",\"b\"]",
+            "Sure! Here is [the] result: [\"a\",\"b\"]",
+        ] {
+            assert_eq!(parse_json_array(chatty).as_deref(), Some(&["a".to_string(), "b".to_string()][..]),
+                "chatty reply not recovered: {chatty:?}");
+        }
+    }
+
+    /// A model that answers with prose instead of an array is breaking the SAME contract as one
+    /// that answers with the wrong number of lines — so it must degrade the same way. Treating it
+    /// as an upstream refusal made one chatty reply on batch six kill a whole film.
+    #[tokio::test]
+    async fn a_reply_that_is_not_an_array_degrades_instead_of_killing_the_film() {
+        let up = fake(|s: &[String]| {
+            if s.iter().any(|t| t == "line 3") {
+                Err(CallError::Contract("model did not return a JSON array".into()))
+            } else {
+                Ok(s.iter().map(|t| format!("T:{t}")).collect())
+            }
+        });
+        let out = run_translation_t(&up, &cues(8)).await.expect("one chatty reply must not kill the film");
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[3].text, "line 3", "the unparseable cue should keep its source");
+        assert_eq!(out[0].text, "T:line 0", "its neighbours must still be translated");
+    }
+
+    /// Calls were counted but never timed, and batches run in sequence at up to LLM_TIMEOUT each,
+    /// so the permitted ceiling ran to hours — long after the viewer gave up, still spending their
+    /// key. A run stops when its wall clock does, whatever the call count says.
+    #[tokio::test]
+    async fn a_run_stops_when_its_deadline_passes() {
+        // A call that takes real time, the way a provider does.
+        struct Slow(Mutex<usize>);
+        impl BatchCall for Slow {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                *self.0.lock().unwrap() += 1;
+                let out: Vec<String> = sources.iter().map(|t| format!("T:{t}")).collect();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(out)
+                })
+            }
+        }
+        // 400 cues is 10 batches at 20ms each; the deadline expires partway, far under the budget.
+        let up = Slow(Mutex::new(0));
+        let err = run_translation(&up, &cues(400), Duration::from_millis(50))
+            .await
+            .expect_err("a run past its deadline must stop");
+        assert!(err.contains("too long"), "unexpected error: {err}");
+        assert!(*up.0.lock().unwrap() < 10, "it kept calling past the deadline");
+    }
+
+    /// A forced-narrative track is mostly place names and proper nouns that legitimately come back
+    /// unchanged. Refusing it costs the full LLM bill, caches nothing, and makes every retry pay
+    /// again — so the bar for "not a translation" has to sit well above a normal signs track.
+    #[tokio::test]
+    async fn a_forced_narrative_track_is_not_refused() {
+        for total in [30usize, 40, 60, 100, 150] {
+            let up = fake(move |s: &[String]| {
+                Ok(s.iter()
+                    .map(|t| {
+                        let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
+                        // Three in ten unchanged, spread through the track.
+                        if n % 10 < 3 { t.clone() } else { format!("T:{t}") }
+                    })
+                    .collect())
+            });
+            let out = run_translation_t(&up, &cues(total)).await;
+            assert!(out.is_ok(), "a {total}-cue forced track at 30% names was refused: {out:?}");
+        }
+    }
+
+    /// Nothing translated at all is refused at any size — the floor protects tracks that are partly
+    /// unchanged, not ones that came back verbatim.
+    #[tokio::test]
+    async fn a_tiny_track_echoed_verbatim_is_still_refused() {
+        for total in [3usize, 7, 8] {
+            let echo = fake(|s: &[String]| Ok(s.to_vec()));
+            let out = run_translation_t(&echo, &cues(total)).await;
+            assert!(out.is_err(), "a {total}-cue track echoed verbatim was accepted");
+        }
     }
 
     /// One stray cue keeps its source text rather than failing the film — the documented policy.
@@ -514,7 +692,7 @@ mod contract_tests {
     #[tokio::test]
     async fn a_wholly_unusable_model_is_an_error_not_an_untranslated_film() {
         let up = fake(|s: &[String]| Ok(vec!["junk".to_string(); s.len() + 1]));
-        assert!(run_translation(&up, &cues(60)).await.is_err(), "an untranslated film was returned");
+        assert!(run_translation_t(&up, &cues(60)).await.is_err(), "an untranslated film was returned");
         assert!(
             *up.calls.lock().unwrap() <= call_budget(60),
             "spent {} calls against a budget of {}",
@@ -537,7 +715,7 @@ mod contract_tests {
             }
         });
         let budget = call_budget(2000);
-        let _ = run_translation(&up, &cues(2000)).await;
+        let _ = run_translation_t(&up, &cues(2000)).await;
         assert!(
             *up.calls.lock().unwrap() <= budget,
             "spent {} calls against a budget of {budget}",
@@ -559,7 +737,7 @@ mod contract_tests {
                 Ok(s.iter().map(|t| format!("T:{t}")).collect())
             }
         });
-        let out = run_translation(&up, &cues(3)).await.expect("one odd line must not fail a 3-cue track");
+        let out = run_translation_t(&up, &cues(3)).await.expect("one odd line must not fail a 3-cue track");
         assert_eq!(out[1].text, "line 1", "the odd cue keeps its source");
         assert_eq!(out[0].text, "T:line 0");
     }
@@ -577,7 +755,7 @@ mod contract_tests {
                 Ok(s.iter().map(|t| format!("T:{t}")).collect())
             }
         });
-        let out = run_translation(&up, &cues(60)).await.expect("a mostly-translated film must succeed");
+        let out = run_translation_t(&up, &cues(60)).await.expect("a mostly-translated film must succeed");
         assert_eq!(out.len(), 60);
         assert_eq!(out[0].text, "T:line 0");
         // Timing and index are never handed to the model, so they must survive untouched.
@@ -599,15 +777,15 @@ mod contract_tests {
             ("trailing tab", "\t"),
         ] {
             let echo = fake(move |s: &[String]| Ok(s.iter().map(|t| format!("{t}{decorate}")).collect()));
-            let err = run_translation(&echo, &cues(200)).await.unwrap_err();
+            let err = run_translation_t(&echo, &cues(200)).await.unwrap_err();
             assert!(err.contains("unusable"), "an echo ({name}) was accepted: {err}");
         }
         // A leading space is the same trick from the other end.
         let echo = fake(|s: &[String]| Ok(s.iter().map(|t| format!(" {t}")).collect()));
-        assert!(run_translation(&echo, &cues(200)).await.is_err(), "a leading-space echo was accepted");
+        assert!(run_translation_t(&echo, &cues(200)).await.is_err(), "a leading-space echo was accepted");
 
         let blanks = fake(|s: &[String]| Ok(vec![String::new(); s.len()]));
-        let err = run_translation(&blanks, &cues(200)).await.unwrap_err();
+        let err = run_translation_t(&blanks, &cues(200)).await.unwrap_err();
         assert!(err.contains("unusable"), "a reply of empty strings was accepted: {err}");
     }
 
@@ -625,7 +803,7 @@ mod contract_tests {
                 })
                 .collect())
         });
-        let out = run_translation(&up, &cues(200)).await.expect("a tenth blank is under the gate");
+        let out = run_translation_t(&up, &cues(200)).await.expect("a tenth blank is under the gate");
         assert_eq!(out[10].text, "line 10", "a blanked cue was shipped empty");
         assert_eq!(out[11].text, "T:line 11");
         assert!(out.iter().all(|c| !c.text.trim().is_empty()), "a cue would render as nothing");
@@ -645,7 +823,7 @@ mod contract_tests {
                     })
                     .collect())
             });
-            let out = run_translation(&up, &cues(total)).await;
+            let out = run_translation_t(&up, &cues(total)).await;
             assert!(out.is_ok(), "{matching} names in a {total}-cue track was rejected: {out:?}");
         }
     }
@@ -659,7 +837,7 @@ mod contract_tests {
                 .map(|t| if t.ends_with('3') || t.ends_with('7') { t.clone() } else { format!("T:{t}") })
                 .collect())
         });
-        let out = run_translation(&up, &cues(600)).await.expect("a fifth of cues matching is normal");
+        let out = run_translation_t(&up, &cues(600)).await.expect("a fifth of cues matching is normal");
         assert_eq!(out.len(), 600);
     }
 
@@ -676,7 +854,7 @@ mod contract_tests {
                 })
                 .collect())
         });
-        let out = run_translation(&up, &cues(600)).await.expect("a rough opening must not abort the film");
+        let out = run_translation_t(&up, &cues(600)).await.expect("a rough opening must not abort the film");
         assert_eq!(out.len(), 600);
         assert_eq!(out[300].text, "T:line 300");
     }
@@ -685,15 +863,15 @@ mod contract_tests {
     /// that had just said no, with no backoff, and failed anyway.
     #[tokio::test]
     async fn an_upstream_error_is_not_split_retried() {
-        let up = fake(|_: &[String]| Err("provider 429: rate limited".to_string()));
-        assert!(run_translation(&up, &cues(40)).await.is_err());
+        let up = fake(|_: &[String]| Err(CallError::Upstream("provider 429: rate limited".into())));
+        assert!(run_translation_t(&up, &cues(40)).await.is_err());
         assert_eq!(*up.calls.lock().unwrap(), 1, "a 429 was split-retried instead of surfacing");
     }
 
     /// A transport/auth error is not a contract violation: it must surface, not degrade to the source.
     #[tokio::test]
     async fn an_upstream_error_still_fails() {
-        let up = fake(|_: &[String]| Err("provider 401: bad key".to_string()));
+        let up = fake(|_: &[String]| Err(CallError::Upstream("provider 401: bad key".into())));
         assert!(run(&up, 4).await.is_err(), "an upstream failure must not become an untranslated film");
     }
 }
