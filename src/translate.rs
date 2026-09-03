@@ -114,26 +114,28 @@ async fn run_translation(
 const RUN_DEADLINE: Duration = Duration::from_secs(600);
 /// Cues that must be seen before the ratio is allowed to abort a run mid-film.
 const MIN_GATE_SAMPLE: usize = 120;
-/// Fallbacks below this never condemn a run, however small it is. A signs-only track is mostly
-/// proper nouns and place names, and those legitimately come back unchanged.
-const MIN_UNUSABLE: usize = 8;
 
 /// Has too much come back unusable to call this a translation?
 ///
-/// Nothing translated at all is the unambiguous case, and it is refused at any size — a seven-cue
-/// track echoed back verbatim is as much a non-translation as a film is. Short of that the bar is
-/// high, because the alternative error is worse: a forced-narrative track is mostly place names and
-/// proper nouns that legitimately come back unchanged, and refusing it costs the full LLM bill,
-/// caches nothing, and makes every retry pay again. A quarter unchanged is a normal signs track; two
-/// thirds is a model that is not translating.
+/// Purely a ratio, plus "nothing translated at all" as the unambiguous case at any size. The bar is
+/// high — two thirds — because the opposite error is worse: a forced-narrative track is mostly place
+/// names and proper nouns that legitimately come back unchanged, and refusing one costs the full LLM
+/// bill, caches nothing, and makes every retry pay again. A third unchanged is a normal signs track.
+///
+/// It carried an absolute floor for a while, to stop the ratio failing short tracks back when the
+/// bar was a quarter. Once the bar moved to two thirds the floor was doing nothing useful and quite
+/// a lot of harm: a floor of eight let seven dead cues out of eight through — 87% untranslated,
+/// served and cached for sixty days. Ratios do not need a size exemption; the old threshold did.
+///
+/// "Nothing translated at all" needs no clause of its own either: 3n > 2n holds for every n > 0.
 fn unusable(kept: usize, seen: usize) -> bool {
-    seen > 0 && (kept == seen || (kept >= MIN_UNUSABLE && kept * 3 > seen * 2))
+    kept * 3 > seen * 2
 }
 
 /// The mid-run bail is harsher than the verdict: it exists only to stop paying for a run that is
 /// already lost, and a film is judged in full at the end.
 fn hopeless(kept: usize, seen: usize) -> bool {
-    kept >= MIN_UNUSABLE && kept * 4 > seen * 3
+    kept * 4 > seen * 3
 }
 
 /// Upstream calls a run may make. The happy path is one per batch; a wrong-length reply splits into
@@ -1004,6 +1006,35 @@ mod contract_tests {
         assert_eq!(out[10].text, "line 10", "a blanked cue was shipped empty");
         assert_eq!(out[11].text, "T:line 11");
         assert!(out.iter().all(|c| !c.text.trim().is_empty()), "a cue would render as nothing");
+    }
+
+    /// The gate is a ratio at every size. An absolute floor exempted short tracks from it entirely:
+    /// with a floor of eight, seven dead cues out of eight — 87% of the track still in the source
+    /// language — passed, and cached for sixty days as a successful translation.
+    ///
+    /// Swept across the sizes where a floor could hide, asserting both directions at each: a
+    /// majority-dead track is refused, a names-heavy one is not.
+    #[test]
+    fn no_size_is_exempt_from_the_ratio() {
+        for seen in 1..=40usize {
+            for kept in 0..=seen {
+                let refused = unusable(kept, seen);
+                if kept * 3 > seen * 2 {
+                    assert!(refused, "{kept} of {seen} dead was accepted");
+                } else {
+                    assert!(!refused, "{kept} of {seen} dead was refused");
+                }
+            }
+        }
+        // The cases the floor used to let through, named explicitly. 7-of-11 is 63%, under the
+        // two-thirds bar, so it stays accepted — that is the threshold doing its job, not the hole.
+        for (kept, seen) in [(7usize, 8usize), (7, 9), (7, 10)] {
+            assert!(unusable(kept, seen), "{kept} of {seen} dead must not be a translation");
+        }
+        // And the ones it exists to protect, at the same sizes.
+        for (kept, seen) in [(3usize, 8usize), (4, 12), (6, 20), (1, 3)] {
+            assert!(!unusable(kept, seen), "{kept} names in {seen} cues is a normal signs track");
+        }
     }
 
     /// A signs-only or forced-narrative track is mostly proper nouns and place names, which
