@@ -393,7 +393,7 @@ async fn call_chat_typed(
         // self-hosted gateway is under no obligation to mask anything.
         return Err(CallError::Upstream(format!("provider {code}")));
     }
-    let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
+    let v = provider_json(resp).await?;
     // Contract, not Upstream: a 200 with no usable text is a safety filter or an empty candidate
     // list, and both are about THIS batch's dialogue — film dialogue trips content filters routinely.
     // As an Upstream it propagated, so one filtered batch killed the whole film instead of falling
@@ -431,6 +431,26 @@ fn chat_base(_provider: Provider) -> String {
     CHAT_BASE.with(|b| b.borrow().clone()).unwrap_or_else(|| "http://127.0.0.1:1".to_string())
 }
 
+/// A 200's body, decoded — with the failure split the way the caller needs it.
+///
+/// The body arriving intact and being unusable is the same kind of event as a reply with no text in
+/// it: the provider answered, about THIS batch, and answered badly. So an unparseable body and one
+/// that runs past the size cap are Contract — splitting asks for less at a time, which is the one
+/// thing that can help. Only the stream itself failing is Upstream.
+///
+/// This was the whole of the previous fix's gap: the classification was applied one statement too
+/// late, and `?` on the decode above it still resolved to Upstream through `From<String>`.
+async fn provider_json(resp: reqwest::Response) -> Result<Value, CallError> {
+    let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_BODY)
+        .await
+        .map_err(|e| match e.starts_with("read body:") {
+            true => CallError::Upstream(e),
+            false => CallError::Contract(e),
+        })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| CallError::Contract(format!("provider returned unparseable JSON: {e}")))
+}
+
 fn extract_text(provider: Provider, v: &Value) -> Option<String> {
     match provider {
         Provider::OpenAI | Provider::Xai | Provider::OpenRouter => {
@@ -461,7 +481,7 @@ async fn deepl_translate(
     if !resp.status().is_success() {
         return Err(CallError::Upstream(format!("deepl {}", resp.status())));
     }
-    let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
+    let v = provider_json(resp).await?;
     let arr = v["translations"]
         .as_array()
         .ok_or_else(|| CallError::Contract("deepl returned no translations".to_string()))?;
@@ -1059,7 +1079,7 @@ mod provider_reply_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A one-shot chat endpoint answering with a canned body.
-    async fn provider(status: &'static str, body: &'static str) -> String {
+    async fn provider_owned(status: &'static str, body: String) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1078,7 +1098,11 @@ mod provider_reply_tests {
     }
 
     async fn call(body: &'static str, status: &'static str) -> Result<Vec<String>, CallError> {
-        let base = provider(status, body).await;
+        call_owned(body.to_string(), status).await
+    }
+
+    async fn call_owned(body: String, status: &'static str) -> Result<Vec<String>, CallError> {
+        let base = provider_owned(status, body).await;
         CHAT_BASE.with(|b| *b.borrow_mut() = Some(base));
         let http = reqwest::Client::new();
         let llm = LlmConfig {
@@ -1102,11 +1126,80 @@ mod provider_reply_tests {
         );
     }
 
+    /// A 200 carrying a body that will not decode is the provider answering badly about THIS
+    /// batch, not refusing to serve — an HTML error page from a gateway, or a stream a proxy cut
+    /// short. The previous fix classified the reply-with-no-text case and left the decode one
+    /// statement above it on the Upstream path, so this still killed whole films.
+    #[tokio::test]
+    async fn an_unparseable_body_is_a_contract_violation_not_a_refusal() {
+        for body in ["<html><body>Bad Gateway</body></html>", "", "{\"choices\": [truncated"] {
+            let err = call_owned(body.to_string(), "200 OK").await.unwrap_err();
+            assert!(
+                matches!(err, CallError::Contract(_)),
+                "a 200 with body {body:?} must degrade, not propagate: {err:?}"
+            );
+        }
+    }
+
     /// A reply that is text but not an array is the model misbehaving too.
     #[tokio::test]
     async fn prose_instead_of_an_array_is_a_contract_violation() {
         let body = r#"{"choices":[{"message":{"content":"I cannot help with that."}}]}"#;
         assert!(matches!(call(body, "200 OK").await.unwrap_err(), CallError::Contract(_)));
+    }
+
+    /// A body that runs past the cap is the model free-running on this batch's dialogue — asking
+    /// for less at a time is exactly what can help, so it degrades rather than propagating.
+    #[tokio::test]
+    async fn an_oversized_body_is_a_contract_violation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                // Declared over the cap: rejected before a byte of it is transferred.
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+                    crate::fetch::MAX_BODY + 1
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        CHAT_BASE.with(|b| *b.borrow_mut() = Some(format!("http://{addr}")));
+        let http = reqwest::Client::new();
+        let llm = LlmConfig { provider: Provider::OpenAI, api_key: "k".into(), model: "m".into() };
+        let err = llm_translate(&http, &llm, &["a".to_string()], "Swedish", &[])
+            .await
+            .expect_err("an oversized body must fail");
+        assert!(matches!(err, CallError::Contract(_)), "an oversized body must degrade: {err:?}");
+    }
+
+    /// A stream that dies mid-body IS upstream — the provider stopped talking, and asking for less
+    /// at a time cannot help. This is the one half of a failed read that must not degrade.
+    #[tokio::test]
+    async fn a_dead_stream_is_an_upstream_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                // Promise 500 bytes, send 10, hang up.
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 500\r\n\r\n0123456789")
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        CHAT_BASE.with(|b| *b.borrow_mut() = Some(format!("http://{addr}")));
+        let http = reqwest::Client::new();
+        let llm = LlmConfig { provider: Provider::OpenAI, api_key: "k".into(), model: "m".into() };
+        let err = llm_translate(&http, &llm, &["a".to_string()], "Swedish", &[])
+            .await
+            .expect_err("a truncated stream must fail");
+        assert!(matches!(err, CallError::Upstream(_)), "a dead stream must propagate: {err:?}");
     }
 
     /// But a provider REFUSING is upstream, and must not be split-retried.
