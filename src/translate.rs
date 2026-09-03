@@ -80,7 +80,15 @@ async fn run_translation(
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
         let translated = translate_batch(upstream, &sources, &context, &budget).await?;
         for (cue, text) in batch.iter().zip(translated) {
-            context.push((cue.text.clone(), text.clone()));
+            // Only a pair that actually CHANGED goes into the context. An unchanged one is either a
+            // name that legitimately stays put or a cue the model failed on and we fell back to
+            // source — and from here those are indistinguishable. The context is rendered into the
+            // next prompt as "already translated, do not re-translate", so handing it a failure
+            // presents that failure as precedent and invites the model to repeat it on the same
+            // word later in the film. An identity pair teaches it almost nothing anyway.
+            if text.trim() != cue.text.trim() {
+                context.push((cue.text.clone(), text.clone()));
+            }
             out.push(Cue { text, ..cue.clone() });
         }
         if context.len() > CONTEXT_WINDOW {
@@ -265,7 +273,10 @@ async fn translate_batch(
             // those cues rendered empty in an otherwise successful film.
             Ok(v.into_iter()
                 .zip(sources.iter())
-                .map(|(t, s)| if t.trim().is_empty() && !s.trim().is_empty() { s.clone() } else { t })
+                // A blank source has nothing to translate, so anything the model invented for it is
+                // not a translation — it is a line the film does not contain. Both directions of
+                // blankness resolve to the source.
+                .map(|(t, s)| if t.trim().is_empty() || s.trim().is_empty() { s.clone() } else { t })
                 .collect())
         }
         // A contract violation splits; an upstream refusal does not — splitting on that spent six
@@ -1160,6 +1171,67 @@ mod contract_tests {
         let blanks = fake(|s: &[String]| Ok(vec![String::new(); s.len()]));
         let err = run_translation_t(&blanks, &cues(200)).await.unwrap_err();
         assert!(err.contains("unusable"), "a reply of empty strings was accepted: {err}");
+    }
+
+    /// A blank source cue has nothing to translate, so whatever the model returns for it is a line
+    /// the film does not contain. The dead-count and the fallback both skipped blank sources — they
+    /// were written for the mirror case — so an invented line shipped verbatim and cached.
+    #[tokio::test]
+    async fn an_invented_line_for_a_blank_cue_is_dropped() {
+        let mut film = cues(6);
+        film[2].text = String::new();
+        film[4].text = "   ".into();
+        let up = fake(|s: &[String]| {
+            Ok(s.iter()
+                .map(|t| if t.trim().is_empty() { "INVENTED".to_string() } else { format!("T:{t}") })
+                .collect())
+        });
+        let out = run_translation_t(&up, &film).await.expect("five good cues is not an unusable film");
+        assert_eq!(out[2].text, "", "a line was invented for an empty cue");
+        assert_eq!(out[4].text, "   ", "a line was invented for a whitespace-only cue");
+        assert_eq!(out[3].text, "T:line 3", "its neighbours still translate");
+    }
+
+    /// The rolling context is rendered into the next batch's prompt as "already translated, do not
+    /// re-translate". A cue that fell back to its source is a FAILURE, and putting it there offers
+    /// that failure to the model as precedent — inviting it to leave the same word alone next time.
+    /// Nothing here distinguishes a fallback from a name that legitimately stays put, so neither
+    /// goes in; an identity pair teaches the model almost nothing either way.
+    #[tokio::test]
+    async fn a_failed_cue_is_not_offered_as_precedent() {
+        use std::sync::Mutex as StdMutex;
+        struct Recorder(StdMutex<Vec<Vec<(String, String)>>>);
+        impl BatchCall for Recorder {
+            fn call(
+                &self,
+                sources: &[String],
+                context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                self.0.lock().unwrap().push(context.to_vec());
+                // "line 79" is the last cue of batch two, so its failure would otherwise still be
+                // in the window when batch three is sent.
+                let bad = sources.iter().any(|t| t == "line 79");
+                let out: Vec<String> = if bad {
+                    vec!["junk".to_string(); sources.len() + 1]
+                } else {
+                    sources.iter().map(|t| format!("T:{t}")).collect()
+                };
+                Box::pin(async move { Ok(out) })
+            }
+        }
+        let up = Recorder(StdMutex::new(Vec::new()));
+        let out = run_translation_t(&up, &cues(120)).await.expect("one bad cue must not fail the film");
+        assert_eq!(out[79].text, "line 79", "the bad cue should have kept its source");
+
+        let seen = up.0.lock().unwrap();
+        let offered: Vec<(String, String)> = seen.iter().flatten().cloned().collect();
+        let echoes: Vec<&(String, String)> = offered.iter().filter(|(s, d)| s == d).collect();
+        assert!(echoes.is_empty(), "an unchanged pair was offered as an established translation: {echoes:?}");
+        // And the context is still doing its job for cues that really were translated.
+        assert!(
+            offered.iter().any(|(s, d)| d == &format!("T:{s}")),
+            "no real pairs reached the context at all"
+        );
     }
 
     /// Blanks below the ratio pass the gate, and those cues used to be SHIPPED blank — rendering as

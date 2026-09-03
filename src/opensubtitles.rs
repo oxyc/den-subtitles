@@ -140,8 +140,12 @@ fn parse_search(v: &Value) -> Vec<Subtitle> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let attrs = &item["attributes"];
-        // Each subtitle "entry" carries one or more files; we take the first (the SRT).
-        let file = &attrs["files"][0];
+        // A multi-file entry is a multi-CD release, and only one part of it can be served. Taking
+        // the first looked fine everywhere it shows — full release string, hash match, quality
+        // flags — and then stopped partway through the film, which is the failure that never
+        // reports itself. Skip it and let a complete subtitle win instead.
+        let files = attrs["files"].as_array().map(Vec::as_slice).unwrap_or_default();
+        let [file] = files else { continue };
         let Some(file_id) = file["file_id"].as_i64() else { continue };
         out.push(Subtitle {
             file_id,
@@ -263,6 +267,27 @@ fn release_group(s: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A multi-file entry is a multi-CD release. Only one part can ever be served, and serving it
+    /// looks completely normal in the picker — full release string, quality flags, hash match —
+    /// then stops partway through the film. A complete subtitle is a better answer than a fragment
+    /// that never says it is one.
+    #[test]
+    fn a_multi_cd_entry_is_not_offered_as_a_whole_subtitle() {
+        let v = json!({"data": [
+            {"attributes": {"language": "en", "download_count": 9999, "release": "Old.DVDRip.CD1-CD2",
+                "files": [{"file_id": 10}, {"file_id": 11}]}},
+            {"attributes": {"language": "en", "download_count": 5, "release": "Complete.1080p",
+                "files": [{"file_id": 12}]}},
+        ]});
+        let subs = parse_search(&v);
+        assert_eq!(subs.len(), 1, "a two-CD entry was offered as a subtitle");
+        assert_eq!(subs[0].file_id, 12, "the complete subtitle should be the one that survives");
+
+        // And an entry with no files at all is not one either.
+        let empty = json!({"data": [{"attributes": {"language": "en", "files": []}}]});
+        assert!(parse_search(&empty).is_empty());
+    }
 
     #[test]
     fn parses_results() {
