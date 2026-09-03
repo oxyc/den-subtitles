@@ -124,7 +124,7 @@ impl SyncTools {
         inputs: [&PathBuf; N],
     ) -> Result<String, String> {
         let result = match run_result {
-            Ok(status) if status.success() => match tokio::fs::read_to_string(out).await {
+            Ok(status) if status.success() => match read_capped(out).await {
                 // Exit 0 is the binary's opinion, not a result. ffsubsync and alass both exit 0
                 // having written nothing usable when handed a target they can't parse, and that
                 // empty string was cached for 60 days as the finished alignment — worse than the
@@ -245,6 +245,26 @@ mod tests {
     /// The second write failing skips `finish`, the only cleanup — and the sync work dir has no
     /// sweep, so the first file stays forever. Disk pressure is exactly when a second write fails,
     /// so the leak feeds the condition that caused it.
+    /// The tier binary's output goes straight into the cache, and a runaway alignment has no other
+    /// ceiling on it — every other body this addon ingests is capped at MAX_BODY.
+    #[tokio::test]
+    async fn an_oversized_alignment_is_refused() {
+        let dir = work_dir("t1-huge");
+        // Write one byte past the cap to $5 and exit 0.
+        // A REAL cue first, then filler past the cap — so it clears the "has any cues" gate and the
+        // size cap is the only thing that can refuse it.
+        let script = format!(
+            "printf '1\\n00:00:01,000 --> 00:00:02,000\\nhi\\n' > \"$5\"; head -c {} /dev/zero | tr '\\0' 'a' >> \"$5\"",
+            crate::fetch::MAX_BODY
+        );
+        let bin = fake_bin(&dir, "fake-ffsubsync", &script).await;
+        let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-huge").await;
+        let err = out.expect_err("an oversized alignment was accepted");
+        assert!(err.contains("too large"), "refused for the wrong reason: {err}");
+        assert!(!dir.join("tag-huge-target.srt").exists(), "inputs leaked");
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
     #[tokio::test]
     async fn a_failed_second_write_does_not_leak_the_first() {
         let dir = work_dir("t1-write-fail");
@@ -285,6 +305,22 @@ mod tests {
         assert!(!dir.join("tag-t2-synced.srt").exists());
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
+}
+
+/// Read a tier binary's output, bounded like every other body this addon ingests. It goes straight
+/// into the cache, and a runaway alignment has no other ceiling on it.
+async fn read_capped(path: &PathBuf) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await.map_err(|e| format!("read synced: {e}"))?;
+    let mut buf = Vec::new();
+    file.take(crate::fetch::MAX_BODY as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("read synced: {e}"))?;
+    if buf.len() > crate::fetch::MAX_BODY {
+        return Err("sync output too large".to_string());
+    }
+    String::from_utf8(buf).map_err(|_| "sync output is not utf-8".to_string())
 }
 
 /// tokio's File buffers: `write_all` returns Ok and stashes the real error for the next write or

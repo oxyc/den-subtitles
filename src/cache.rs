@@ -96,11 +96,15 @@ impl Cache {
                     // a backward clock step, or a filesystem that doesn't report mtime. Deleting on
                     // that signal would kill in-flight writes on sight, which is what the grace
                     // period exists to stop; keeping it forever is a leak nothing else reclaims.
-                    // So it is budgeted instead: evicted only under pressure, and last, because an
-                    // undatable mtime sorts as "now". It skips the expiry check below, which would
-                    // read a half-written file as garbage and delete it.
+                    //
+                    // So it goes into the budget as the OLDEST thing there: never deleted on sight,
+                    // but first to go once the store is over budget. Stamping it `now` instead made
+                    // it the last — so a sweep under pressure evicted live, in-TTL subtitles, each
+                    // costing a re-download against the viewer's quota, to keep a scratch file of
+                    // unknown provenance. It skips the expiry check below, which would read a
+                    // half-written file as garbage and delete it outright.
                     None => {
-                        live.push((now, meta.len(), path));
+                        live.push((0, meta.len(), path));
                         continue;
                     }
                 }
@@ -469,9 +473,14 @@ mod tests {
         let stray = c.disk_path("k").unwrap().with_extension("t3");
         std::fs::write(&stray, "x".repeat(80)).unwrap();
         shift_mtime(&stray, std::time::SystemTime::now() + Duration::from_secs(5));
+        let entry = c.disk_path("k").unwrap();
         c.sweep();
         let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
         assert!(bytes <= 60, "an undatable temp escaped the budget: {bytes} bytes left");
+        // And it goes BEFORE live data: evicting a real subtitle to keep a scratch file of unknown
+        // provenance costs a re-download against the viewer's quota.
+        assert!(!stray.exists(), "the temp outlived the entry it displaced");
+        assert!(entry.exists(), "a live entry was evicted to make room for an undatable temp");
     }
 
     /// A temp whose mtime reads as being in the FUTURE — an NTP step backwards, or a filesystem

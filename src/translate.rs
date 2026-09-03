@@ -96,11 +96,16 @@ async fn run_translation(
         // opening showed. Only after a real sample, though — the first batch is title cards and
         // song lyrics, the harshest forty cues in the film.
         let kept = budget.untranslated.load(Ordering::Relaxed);
-        // The same verdict, applied early. It used to need a HIGHER ratio than the final gate,
-        // which meant a run in the band between the two — already certain to be thrown away — never
-        // bailed and spent its entire call budget first, on the viewer's own key.
-        if out.len() >= MIN_GATE_SAMPLE && unusable(kept, out.len()) {
-            return Err(format!("model returned unusable output for {kept} of {} cues", out.len()));
+        // Bail early only when the verdict is already decided — that is, when the dead count alone
+        // exceeds the bar for the WHOLE film, so no amount of perfect translation in the cues still
+        // to come could rescue it. `kept` only grows, so this can never refuse a film the final
+        // verdict would have passed.
+        //
+        // Judging the sample against itself is what cannot be done here: three batches of a
+        // name-dense opening is not evidence about the ninety batches after it, and doing that
+        // refused films whose true ratio was nowhere near the bar.
+        if unusable(kept, cues.len()) {
+            return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
         }
     }
     // The verdict for the film as a whole, which is also the only gate a short track ever meets.
@@ -115,8 +120,6 @@ async fn run_translation(
 /// Wall-clock ceiling for one film. Well past a healthy run (~30 sequential calls) and well short
 /// of what the call budget alone permits at LLM_TIMEOUT apiece.
 const RUN_DEADLINE: Duration = Duration::from_secs(600);
-/// Cues that must be seen before the ratio is allowed to abort a run mid-film.
-const MIN_GATE_SAMPLE: usize = 120;
 
 /// Has too much come back unusable to call this a translation?
 ///
@@ -474,7 +477,11 @@ async fn deepl_translate(
     sources: &[String],
     target_lang: &str,
 ) -> Result<Vec<String>, CallError> {
-    let body = json!({ "text": sources, "target_lang": deepl_code(target_lang) });
+    let Some(code) = deepl_code(target_lang) else {
+        // Upstream, not Contract: splitting the batch cannot make DeepL learn the language.
+        return Err(CallError::Upstream(format!("deepl has no code for {target_lang}")));
+    };
+    let body = json!({ "text": sources, "target_lang": code });
     let resp = client
         .post("https://api-free.deepl.com/v2/translate")
         .timeout(LLM_TIMEOUT)
@@ -495,16 +502,46 @@ async fn deepl_translate(
 
 /// DeepL wants an upper-case language code. Map the display names Den sends; fall back to the first
 /// two letters upper-cased (covers the common `sv`/`no`/`da`/`en` → `SV`/`NB`/`DA`/`EN` cases).
-fn deepl_code(lang: &str) -> String {
-    match lang.to_ascii_lowercase().as_str() {
-        "english" | "en" => "EN-US".to_string(),
-        "swedish" | "sv" => "SV".to_string(),
-        "norwegian" | "no" | "nb" => "NB".to_string(),
-        "danish" | "da" => "DA".to_string(),
-        "finnish" | "fi" => "FI".to_string(),
-        "german" | "de" => "DE".to_string(),
-        other => other.chars().take(2).collect::<String>().to_ascii_uppercase(),
-    }
+fn deepl_code(lang: &str) -> Option<&'static str> {
+    // Named in full, because guessing is worse than refusing here. The old fallback took the first
+    // two letters and uppercased them, which is not a language code — it is a coincidence. Estonian
+    // became ES, which is DeepL's code for SPANISH, so a request for Estonian came back as fluent
+    // Spanish: right shape, right length, not an echo, so nothing downstream could tell. Cached
+    // sixty days and served immutable. Slovak became SL, which is Slovenian. Portuguese and Polish
+    // both became PO, which is nothing at all.
+    Some(match lang.to_ascii_lowercase().as_str() {
+        "english" | "en" => "EN-US",
+        "swedish" | "sv" => "SV",
+        "norwegian" | "no" | "nb" => "NB",
+        "danish" | "da" => "DA",
+        "finnish" | "fi" => "FI",
+        "german" | "de" => "DE",
+        "spanish" | "es" => "ES",
+        "portuguese" | "pt" => "PT-PT",
+        "french" | "fr" => "FR",
+        "italian" | "it" => "IT",
+        "dutch" | "nl" => "NL",
+        "polish" | "pl" => "PL",
+        "russian" | "ru" => "RU",
+        "turkish" | "tr" => "TR",
+        "czech" | "cs" => "CS",
+        "greek" | "el" => "EL",
+        "japanese" | "ja" => "JA",
+        "korean" | "ko" => "KO",
+        "chinese" | "zh" => "ZH",
+        "ukrainian" | "uk" => "UK",
+        "indonesian" | "id" => "ID",
+        "estonian" | "et" => "ET",
+        "slovak" | "sk" => "SK",
+        "slovenian" | "sl" => "SL",
+        "romanian" | "ro" => "RO",
+        "hungarian" | "hu" => "HU",
+        "bulgarian" | "bg" => "BG",
+        "latvian" | "lv" => "LV",
+        "lithuanian" | "lt" => "LT",
+        "arabic" | "ar" => "AR",
+        _ => return None,
+    })
 }
 
 /// Extract a JSON string array from model output, tolerating markdown code fences and leading prose
@@ -653,9 +690,21 @@ mod tests {
 
     #[test]
     fn deepl_code_maps_names_and_falls_back() {
-        assert_eq!(deepl_code("English"), "EN-US");
-        assert_eq!(deepl_code("sv"), "SV");
-        assert_eq!(deepl_code("pt"), "PT");
+        assert_eq!(deepl_code("English"), Some("EN-US"));
+        assert_eq!(deepl_code("sv"), Some("SV"));
+        assert_eq!(deepl_code("pt"), Some("PT-PT"));
+
+        // The old fallback took the first two letters, which produced a DIFFERENT REAL LANGUAGE for
+        // some inputs — fluent, right-length, undetectable downstream, cached for sixty days.
+        assert_eq!(deepl_code("Estonian"), Some("ET"), "Estonian truncated to ES, which is Spanish");
+        assert_eq!(deepl_code("Slovak"), Some("SK"), "Slovak truncated to SL, which is Slovenian");
+        // And these truncated to codes DeepL does not have, so they simply always failed.
+        for lang in ["Spanish", "Portuguese", "Chinese", "Turkish", "Dutch", "Polish", "Indonesian"] {
+            assert!(deepl_code(lang).is_some(), "{lang} has no DeepL code");
+        }
+        // An unknown language is refused rather than guessed at.
+        assert_eq!(deepl_code("Klingon"), None);
+        assert_eq!(deepl_code("xx"), None);
     }
 }
 
@@ -933,23 +982,36 @@ mod contract_tests {
         );
     }
 
-    /// A run already certain to fail must stop paying for itself. The mid-run bail used to need a
-    /// HIGHER ratio than the final verdict, so a run in the band between the two ran every batch and
-    /// spent its whole call budget before being thrown away anyway.
+    /// A run already certain to fail stops early — but only once it is CERTAIN, meaning the dead
+    /// count alone already exceeds the bar for the whole film. An echoing model reaches that two
+    /// thirds of the way through, and the remaining batches are never paid for.
     #[tokio::test]
-    async fn a_doomed_run_bails_before_spending_its_budget() {
-        // ~70% dead: over the 2/3 verdict, and inside the band the old mid-run bar missed.
-        let up = fake(|s: &[String]| {
-            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n % 10 < 7)) {
-                Ok(vec!["junk".to_string(); s.len() + 1])
-            } else {
-                Ok(s.iter().map(|t| format!("T:{t}")).collect())
-            }
-        });
-        let budget = call_budget(2000);
-        assert!(run_translation_t(&up, &cues(2000)).await.is_err(), "a 70%-dead run must be refused");
+    async fn a_doomed_run_stops_before_the_end() {
+        let up = fake(|s: &[String]| Ok(s.to_vec()));
+        assert!(run_translation_t(&up, &cues(2000)).await.is_err(), "an echoing film must be refused");
         let spent = *up.calls.lock().unwrap();
-        assert!(spent < budget / 2, "spent {spent} of {budget} before giving up");
+        let all_batches = 2000_usize.div_ceil(BATCH);
+        assert!(spent < all_batches, "spent {spent} calls of {all_batches} batches — it ran to the end");
+    }
+
+    /// And it must never stop early on a film that would have passed. A cold open of title cards,
+    /// song lyrics and place names can run for several batches; judging those against themselves
+    /// refused films whose true ratio was nowhere near the bar.
+    #[tokio::test]
+    async fn a_long_rough_opening_does_not_abort_a_good_film() {
+        // The first 120 cues — three whole batches — come back unchanged; the remaining 1080 are
+        // translated cleanly. 90 dead in 1200 is 7.5%, nowhere near two thirds.
+        let up = fake(|s: &[String]| {
+            Ok(s.iter()
+                .map(|t| {
+                    let n: usize = t.trim_start_matches("line ").parse().unwrap_or(9999);
+                    if n < 90 { t.clone() } else { format!("T:{t}") }
+                })
+                .collect())
+        });
+        let out = run_translation_t(&up, &cues(1200)).await.expect("a rough opening must not abort it");
+        assert_eq!(out.len(), 1200);
+        assert_eq!(out[1000].text, "T:line 1000");
     }
 
     /// The budget is the guard for the case the ratio cannot see: a model wrong on exactly a
