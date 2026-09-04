@@ -297,6 +297,8 @@ mod tests {
             alass: "alass".to_string(),
             config_key: config_key.to_string(),
             config_keys_prev: String::new(),
+            // Never the live API from a test: port 1 refuses instantly.
+            os_api_base: "http://127.0.0.1:1".to_string(),
         };
         AppState::new(cfg)
     }

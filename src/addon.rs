@@ -167,7 +167,7 @@ pub async fn handle_subtitles(
     // one-shot "persistence degraded" warning on a request that was never valid.
     let hash = search_hash(extra);
     let filename = extra_field(extra, "filename");
-    let client = os_client(http, &cfg);
+    let client = os_client(state, http, &cfg);
     let mut subs = match cached_search(state, &client, &imdb, season, episode, hash.as_deref()).await {
         Ok(s) => s,
         // Empty-200 is the correct Stremio shape for "nothing"; `cached_search` has already logged
@@ -217,12 +217,12 @@ pub async fn handle_subtitles(
 }
 
 /// The OpenSubtitles client for one request, from that install's BYOK credentials.
-fn os_client<'a>(http: &'a reqwest::Client, cfg: &'a UserConfig) -> opensubtitles::Client<'a> {
+fn os_client<'a>(state: &'a AppState, http: &'a reqwest::Client, cfg: &'a UserConfig) -> opensubtitles::Client<'a> {
     opensubtitles::Client {
         http,
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
-        api_base: opensubtitles::API,
+        api_base: &state.cfg.os_api_base,
     }
 }
 
@@ -343,7 +343,7 @@ pub async fn handle_subtitle_file(
     let Some(http) = state.http.as_ref() else {
         return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "subtitle service unavailable");
     };
-    let client = os_client(http, &cfg);
+    let client = os_client(state, http, &cfg);
 
     let target = match subtitle_srt(state, &client, file_id).await {
         Ok(body) => body,
@@ -743,7 +743,7 @@ pub async fn handle_translate(
     let Some(http) = state.http.as_ref() else {
         return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "translation service unavailable");
     };
-    let client = os_client(http, &cfg);
+    let client = os_client(state, http, &cfg);
 
     // TWO searches, and the difference between them is the whole cost model of this endpoint.
     //
@@ -1288,6 +1288,12 @@ mod translate_retry_tests {
             alass: "alass".into(),
             config_key: String::new(),
             config_keys_prev: String::new(),
+            // Port 1 refuses instantly. These cases are about the handler's own guards — the marker,
+            // the language bound, the allowance — and every one of them has to get past a search
+            // first. Pointed at the real API root they made a live request to api.opensubtitles.com
+            // on every `cargo test`, which passed whether it 401'd or the network was down, so the
+            // dependency was invisible.
+            os_api_base: "http://127.0.0.1:1".into(),
         })
     }
 
