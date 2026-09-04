@@ -169,14 +169,26 @@ fn parse_search(v: &Value) -> Vec<Subtitle> {
 /// Machine/AI-translated subs are pushed below everything.
 pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
     const HASH: i64 = 1_000_000;
-    const JUNK: i64 = 2_000_000; // demote machine/AI below even a no-info sub
-    let mut score = 0i64;
+    let mut score = text_score(s);
     if s.hash_match {
         score += HASH;
     }
     if let Some(f) = filename {
         score += release_fit(f, &s.release);
     }
+    score
+}
+
+/// How good this subtitle is as TEXT — everything in `fit_score` except the two terms that are
+/// about which encode is playing (the hash match and the release-name overlap).
+///
+/// This is what you want when choosing something to TRANSLATE. The translated text is the same text
+/// whatever the encode, and the timing is corrected afterwards by the sync ladder, so letting the
+/// hash steer the pick would mint a separate full-price translation for every encode of the same
+/// film — the one cost here that is charged to the viewer's own provider account.
+pub fn text_score(s: &Subtitle) -> i64 {
+    const JUNK: i64 = 2_000_000; // demote machine/AI below even a no-info sub
+    let mut score = 0i64;
     if s.from_trusted {
         score += 400;
     }
@@ -196,14 +208,6 @@ pub fn rank(subs: &mut [Subtitle], filename: Option<&str>) {
             .cmp(&b.lang)
             .then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
     });
-}
-
-/// Best subtitle for a wanted language by fit score (hash match, then quality) — independent of any
-/// prior ordering.
-pub fn best_for<'s>(subs: &'s [Subtitle], lang: &str) -> Option<&'s Subtitle> {
-    subs.iter()
-        .filter(|s| s.lang.eq_ignore_ascii_case(lang))
-        .max_by_key(|s| fit_score(s, None))
 }
 
 /// Significant release tokens shared between the file name and a sub's release string imply the same

@@ -5,11 +5,13 @@
 //!   GET /<config>/manifest.json                         configured manifest
 //!   GET /<config>/subtitles/<type>/<id>/<extra>.json    native subs (OpenSubtitles, hash-matched)
 //!   GET /<config>/subtitle/<file_id>.srt                proxy+cache one OpenSubtitles file
-//!   GET /<config>/translate/<type>/<id>/<lang>.json     app-driven: kick off/await a translation → { url }
-//!   GET /<config>/translate/<type>/<id>/<lang>.srt      the translated SRT (cache hit after the .json warmed it)
+//!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.json  app-driven: kick off/await a translation → { url }
+//!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.srt   the translated SRT (cache hit after the .json warmed it)
 //!
 //! `<id>` is `tt<digits>` or `tt<digits>:<season>:<episode>`. `<extra>` is the Stremio query blob
-//! carrying `videoHash`/`videoSize` (the OSHash the app computed).
+//! carrying `videoHash`/`videoSize` (the OSHash the app computed). On the translate routes it is
+//! optional — the older five-segment form still resolves — but without it a translation can find no
+//! Tier-1 anchor and is served on whatever timing its source happened to have.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -159,51 +161,17 @@ pub async fn handle_subtitles(
         return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
     };
 
-    // Cache the search result itself (config-independent: file_ids/langs are the same for everyone),
-    // keyed by the query params incl. the file hash. Short TTL — new subs get uploaded — but enough
-    // to spare a live round-trip every time the app reopens a title. Ranking is filename-specific, so
-    // it is NOT baked into the cached list — we rank per request below.
     // An OSHash is 16 hex digits. Anything else is not one, and this value goes into a cache key
     // that becomes a filename — an over-long one fails the disk write and burns the process's
     // one-shot "persistence degraded" warning on a request that was never valid.
     let hash = search_hash(extra);
     let filename = extra_field(extra, "filename");
-    let search_key = format!(
-        "search:{imdb}:{}:{}:{}",
-        season.unwrap_or(0),
-        episode.unwrap_or(0),
-        hash.as_deref().unwrap_or("")
-    );
-    let mut subs: Vec<opensubtitles::Subtitle> = if let Some(hit) = state
-        .cache
-        .get(&search_key)
-        .and_then(|h| serde_json::from_str(&h).ok())
-    {
-        hit
-    } else {
-        let client = opensubtitles::Client {
-            http,
-            api_key: &cfg.opensubtitles_key,
-            token: cfg.opensubtitles_token.as_deref(),
-            api_base: opensubtitles::API,
-        };
-        // Ask for everything; the app filters/selects by its own preferred-language rules.
-        match client.search(&imdb, season, episode, "all", hash.as_deref()).await {
-            Ok(s) => {
-                state.os_fails.store(0, std::sync::atomic::Ordering::Relaxed);
-                if let Ok(json) = serde_json::to_string(&s) {
-                    state.cache.put(search_key, json, SEARCH_TTL);
-                }
-                s
-            }
-            // Empty-200 is the correct Stremio shape for "nothing", but log the cause (our error
-            // strings carry no key) and count it so /health can report `degraded` (ADDON-02).
-            Err(e) => {
-                eprintln!("subtitles: opensubtitles search failed for {imdb}: {e}");
-                state.os_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
-            }
-        }
+    let client = os_client(http, &cfg);
+    let mut subs = match cached_search(state, &client, &imdb, season, episode, hash.as_deref()).await {
+        Ok(s) => s,
+        // Empty-200 is the correct Stremio shape for "nothing"; `cached_search` has already logged
+        // the cause and counted it for /health.
+        Err(_) => return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store"),
     };
 
     // Rank for THIS stream: hash-match, then release/filename fit, then quality; grouped by language
@@ -245,6 +213,62 @@ pub async fn handle_subtitles(
     // A strong ETag (hash of this serialized ranked list) is attached by `json()`; add
     // stale-while-revalidate so a client can serve the last list instantly while refreshing.
     httputil::json(StatusCode::OK, &json!({"subtitles": out}), "public, max-age=3600, stale-while-revalidate=3600")
+}
+
+/// The OpenSubtitles client for one request, from that install's BYOK credentials.
+fn os_client<'a>(http: &'a reqwest::Client, cfg: &'a UserConfig) -> opensubtitles::Client<'a> {
+    opensubtitles::Client {
+        http,
+        api_key: &cfg.opensubtitles_key,
+        token: cfg.opensubtitles_token.as_deref(),
+        api_base: opensubtitles::API,
+    }
+}
+
+/// The search for one title, cached. Config-independent (file_ids and languages are the same for
+/// everyone), keyed by the query params including the file hash. Short TTL — new subs get uploaded —
+/// but enough to spare a live round-trip every time the app reopens a title.
+///
+/// Always asks for every language: the app filters by its own preferred-language rules, and the
+/// translate path needs to see every candidate source. That also means the two endpoints share one
+/// cache entry, so tapping "translate" right after browsing the picker costs no API call at all.
+///
+/// Returned UNRANKED, and cached that way: ranking is filename-specific, so each caller ranks the
+/// list for its own request.
+async fn cached_search(
+    state: &Arc<AppState>,
+    client: &opensubtitles::Client<'_>,
+    imdb: &str,
+    season: Option<i64>,
+    episode: Option<i64>,
+    hash: Option<&str>,
+) -> Result<Vec<opensubtitles::Subtitle>, String> {
+    let search_key = format!(
+        "search:{imdb}:{}:{}:{}",
+        season.unwrap_or(0),
+        episode.unwrap_or(0),
+        hash.unwrap_or("")
+    );
+    if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
+        return Ok(hit);
+    }
+    match client.search(imdb, season, episode, "all", hash).await {
+        Ok(s) => {
+            state.os_fails.store(0, Ordering::Relaxed);
+            if let Ok(json) = serde_json::to_string(&s) {
+                state.cache.put(search_key, json, SEARCH_TTL);
+            }
+            Ok(s)
+        }
+        // Log the cause (our error strings carry no key) and count it so /health can report
+        // `degraded` (ADDON-02). Counted HERE rather than at one call site, so a translation that
+        // cannot reach OpenSubtitles is visible on /health too — it was not before.
+        Err(e) => {
+            eprintln!("search: opensubtitles failed for {imdb}: {e}");
+            state.os_fails.fetch_add(1, Ordering::Relaxed);
+            Err(e)
+        }
+    }
 }
 
 /// The `file_id` of a trusted timing reference for Tier-1 reference alignment: the BEST hash-matched
@@ -318,12 +342,7 @@ pub async fn handle_subtitle_file(
     let Some(http) = state.http.as_ref() else {
         return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "subtitle service unavailable");
     };
-    let client = opensubtitles::Client {
-        http,
-        api_key: &cfg.opensubtitles_key,
-        token: cfg.opensubtitles_token.as_deref(),
-        api_base: opensubtitles::API,
-    };
+    let client = os_client(http, &cfg);
 
     let target = match subtitle_srt(state, &client, file_id).await {
         Ok(body) => body,
@@ -513,13 +532,16 @@ fn sync_cache_key(base: &str, resync_url: &Option<String>, ref_id: Option<i64>) 
     }
 }
 
-/// Cache key for one translated title. Built here rather than inline so the handler and the tests
-/// cannot drift apart on it — the same reason `sync_cache_key` exists, and `lang` in particular is
-/// now canonicalized rather than taken verbatim (see `translate::canonical_lang`).
+/// Key of the "this translation failed recently" marker: title-scoped, and answerable before any
+/// network call. That is the whole point of it — a whole film's LLM bill must not be re-paid on the
+/// app's next tap, and the app's own `.json`-then-`.srt` flow retries once by design.
 ///
-/// Keyed by provider+model as well: stepping up to a bigger model to re-translate a title that read
-/// badly is meant to overwrite, and it can only do that if the model is part of the identity.
-fn translate_cache_key(
+/// Deliberately NOT the key the translated body lives under (`translate_body_key`): that one names a
+/// source file, which is only knowable after a search, and a marker that can only be consulted after
+/// a search cannot do this job. Built here rather than inline so the handler and the tests cannot
+/// drift apart on it — the same reason `sync_cache_key` exists, and `lang` in particular is
+/// canonicalized rather than taken verbatim (see `translate::canonical_lang`).
+fn translate_fail_key(
     imdb: &str,
     season: Option<i64>,
     episode: Option<i64>,
@@ -535,6 +557,44 @@ fn translate_cache_key(
     )
 }
 
+/// Cache key for the translated TEXT of one source subtitle.
+///
+/// Keyed by the SOURCE FILE, not by the title. The translated text depends only on what was
+/// translated, so every encode of a film that resolves to the same source shares one translation —
+/// and one LLM bill, the only cost here charged to the viewer's own provider account. The timing
+/// differences between encodes are not this key's business: the aligned variants hang off it through
+/// `sync_cache_key`, exactly as they do off `os:{file_id}`.
+///
+/// Keyed by provider+model too: stepping up to a bigger model to re-translate a title that read badly
+/// is meant to overwrite, and it can only do that if the model is part of the identity.
+fn translate_body_key(source_file_id: i64, lang_key: &str, llm: &LlmConfig) -> String {
+    format!("translate:{source_file_id}:{lang_key}:{}:{}", provider_tag(llm), llm.model)
+}
+
+/// The subtitle to translate FROM: English for preference, best-quality otherwise.
+///
+/// Judged as text, so the pick does not depend on which encode is playing — see
+/// `opensubtitles::text_score` for why that matters to the bill.
+///
+/// The English preference is a bonus rather than a filter-then-fall-back, because "the best English
+/// sub, else anything" picks a machine-translated English one over a good human Spanish one. Nothing
+/// downstream can tell that it is translating a translation, and the errors compound instead of
+/// cancelling.
+fn translation_source(subs: &[opensubtitles::Subtitle]) -> Option<&opensubtitles::Subtitle> {
+    // Enough to prefer any English source over an equally good one in another language, and nowhere
+    // near enough to rescue a machine-translated one: `text_score` sinks those by two million.
+    const ENGLISH: i64 = 10_000;
+    subs.iter().min_by_key(|s| {
+        let mut score = opensubtitles::text_score(s);
+        if s.lang.eq_ignore_ascii_case("en") {
+            score += ENGLISH;
+        }
+        // Reverse for a highest-score-wins pick that takes the FIRST of equal scores: the chosen
+        // source is part of the translation's cache key, so an unstable pick buys the film twice.
+        std::cmp::Reverse(score)
+    })
+}
+
 fn short_hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -542,16 +602,29 @@ fn short_hash(s: &str) -> u64 {
     h.finish()
 }
 
-/// GET /<config>/translate/<type>/<id>/<lang>.(json|srt) — the app-driven translation flow. The app
-/// calls the `.json` form (showing its own "Translating…" wait), which does the work and returns the
-/// `.srt` URL; it then hands that URL to the engine, which fetches the now-cached `.srt` instantly.
+/// GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.(json|srt) — the app-driven translation
+/// flow. The app calls the `.json` form (showing its own "Translating…" wait), which does the work
+/// and returns the `.srt` URL; it then hands that URL to the engine, which fetches the now-cached
+/// `.srt` instantly.
+///
+/// `<extra>` is the same Stremio blob the `subtitles` resource takes, carrying this stream's OSHash.
+/// It is optional — the older five-segment form still resolves — but without it a translation gets
+/// no Tier-1 anchor, which is the state every translation used to be in: the timing came from
+/// whatever source happened to be picked and nothing ever corrected it.
+///
+/// A `?resync=` on the `.srt` form runs Tier 2, mirroring the subtitle proxy. It is not read on the
+/// `.json` form: that one's job is to warm and hand back a URL, and Tier 2 is a user action taken
+/// against the track itself.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_translate(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     config: &str,
     id: &str,
+    extra: &str,
     lang: &str,
     want_json: bool,
+    resync_url: Option<String>,
 ) -> Response<Body> {
     let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
@@ -584,93 +657,136 @@ pub async fn handle_translate(
     if lang_key.is_empty() {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_lang");
     }
-    let cache_key = translate_cache_key(&imdb, season, episode, &lang_key, llm);
+    // Checked before any network call, and scoped to the title rather than to the source file: a
+    // whole film's LLM bill is not something to re-pay on every tap. The `.json` and `.srt` forms are
+    // two requests, so the app's own flow retries once by design — and nothing was remembered about a
+    // failure, so each attempt paid in full again, with no backoff. Same marker the sync path uses,
+    // in the same namespace.
+    //
+    // Said differently from a fresh failure on purpose: from the outside the two are the same 502,
+    // and the difference — "we just tried" versus "we are backing off" — is the first thing you want
+    // to know when a translation stops working.
+    let failed_recently = format!("{SYNCFAIL}{}", translate_fail_key(&imdb, season, episode, &lang_key, llm));
+    if state.cache.get(&failed_recently).is_some() {
+        return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
+    }
 
-    // Warm the cache if needed (both the .json and .srt forms share it).
-    let failed_recently = format!("{SYNCFAIL}{cache_key}");
-    if state.cache.get(&cache_key).is_none() {
-        // A whole film's LLM bill is not something to re-pay on every tap. The `.json` and `.srt`
-        // forms are two requests, so the app's own flow retries once by design — and nothing was
-        // remembered about the failure, so each attempt paid in full again, with no backoff. Same
-        // marker the sync path uses, in the same namespace.
-        // Said differently from a fresh failure on purpose: from the outside the two are the same
-        // 502, and the difference — "we just tried" versus "we are backing off" — is the first
-        // thing you want to know when a translation stops working.
-        if state.cache.get(&failed_recently).is_some() {
-            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
-        }
-        if let Err(e) = produce_translation(state, &cfg, llm, &imdb, season, episode, &lang, &cache_key).await {
-            // Log the detail (no key in these strings); hand the client a generic message rather than
-            // echoing a raw upstream error body.
-            eprintln!("translate: {imdb} → {lang} failed: {e}");
+    let Some(http) = state.http.as_ref() else {
+        return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "translation service unavailable");
+    };
+    let client = os_client(http, &cfg);
+
+    // The extras carry this stream's OSHash. It does NOT choose the source (see
+    // `opensubtitles::text_score`) — what it does is make the search return `moviehash_match` flags,
+    // which is what makes a Tier-1 anchor findable at all. Without it every translation is served on
+    // whatever timing its source happened to have, which is what used to happen to all of them.
+    let hash = search_hash(extra);
+    let subs = match cached_search(state, &client, &imdb, season, episode, hash.as_deref()).await {
+        Ok(s) => s,
+        Err(_) => {
             state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
             return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
         }
+    };
+    let Some(source) = translation_source(&subs) else {
+        return httputil::text(StatusCode::NOT_FOUND, "no source subtitle to translate");
+    };
+    let body_key = translate_body_key(source.file_id, &lang_key, llm);
+
+    // Tier 2 is a user action against the track itself, so it is only read on the `.srt` form — the
+    // `.json` form's job is to warm and hand back a URL. Vetted before it can reach a cache key, for
+    // the reason `handle_subtitle_file` gives.
+    let resync_url = match resync_url.filter(|_| !want_json) {
+        Some(u) if is_safe_resync_url(&u).await => Some(u),
+        // Never the URL itself: a stream target carries the provider's token.
+        Some(_) => {
+            eprintln!("translate: refusing unsafe resync target for {imdb}");
+            None
+        }
+        None => None,
+    };
+    // The translated body inherits its source's timing, so it needs the same Tier-1 correction the
+    // source itself would get from the picker: nothing when the source is already hash-matched to
+    // this encode, and otherwise the anchor.
+    let anchor = if cfg.auto_sync { tier1_reference(&subs) } else { None };
+    let ref_id = tier1_ref_for(source, anchor);
+    let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
+
+    if state.cache.get(&cache_key).is_none() {
+        // The expensive half: the translated text, cached against the source file so every encode of
+        // this film reuses it.
+        let translated = match state.cache.get(&body_key) {
+            Some(body) => body,
+            None => match produce_translation(state, &client, llm, source.file_id, &lang, &body_key).await {
+                Ok(body) => body,
+                Err(e) => {
+                    // Log the detail (no key in these strings); hand the client a generic message
+                    // rather than echoing a raw upstream error body.
+                    eprintln!("translate: {imdb} → {lang} failed: {e}");
+                    state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
+                    return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+                }
+            },
+        };
+        // The cheap half. Run here even for the `.json` form so the engine's follow-up fetch is a
+        // cache hit rather than an ffsubsync spawn with the viewer waiting on it.
+        let resp = sync_and_cache(
+            state,
+            &client,
+            cache_key,
+            translated,
+            ref_id,
+            resync_url,
+            &format!("translation of {imdb} → {lang_key}"),
+        )
+        .await;
+        if !want_json {
+            return resp;
+        }
+    } else if !want_json {
+        // Settled already, in whichever variant this request asked for.
+        return match state.cache.get(&cache_key) {
+            Some(body) => httputil::srt(body),
+            None => httputil::text(StatusCode::NOT_FOUND, "not translated"),
+        };
     }
 
-    if want_json {
-        let base = self_base(state, headers, config);
-        // The segment as it arrived, not the decoded name: this is a URL, and handing back a decoded
-        // "Brazilian Portuguese" would put a raw space in it. The client fetching this lands on the
-        // same cache key it just warmed, whichever spelling it used.
-        let url = format!("{base}/translate/{}/{}/{}.srt", type_of(season), id, lang_seg);
-        return httputil::json(StatusCode::OK, &json!({ "url": url }), "no-store");
-    }
-    match state.cache.get(&cache_key) {
-        Some(body) => httputil::srt(body),
-        None => httputil::text(StatusCode::NOT_FOUND, "not translated"),
-    }
+    let base = self_base(state, headers, config);
+    // The segment as it arrived, not the decoded name: this is a URL, and handing back a decoded
+    // "Brazilian Portuguese" would put a raw space in it. The client fetching this lands on the same
+    // cache key it just warmed, whichever spelling it used — and it must carry the same extras, or
+    // that fetch would resolve a different source and a different anchor.
+    let url = match extra.is_empty() {
+        true => format!("{base}/translate/{}/{}/{}.srt", type_of(season), id, lang_seg),
+        false => format!("{base}/translate/{}/{}/{}/{}.srt", type_of(season), id, extra, lang_seg),
+    };
+    httputil::json(StatusCode::OK, &json!({ "url": url }), "no-store")
 }
 
-/// Fetch a source subtitle (prefer English), translate it, and store the result in the cache.
-#[allow(clippy::too_many_arguments)]
+/// Translate one source subtitle into `lang` and cache the result under `body_key`. Returns the
+/// translated SRT — the caller then runs the sync ladder over it.
 async fn produce_translation(
     state: &Arc<AppState>,
-    cfg: &UserConfig,
+    client: &opensubtitles::Client<'_>,
     llm: &LlmConfig,
-    imdb: &str,
-    season: Option<i64>,
-    episode: Option<i64>,
+    source_file_id: i64,
     lang: &str,
-    cache_key: &str,
-) -> Result<(), String> {
-    let http = state.http.as_ref().ok_or("http client unavailable")?;
-    let client = opensubtitles::Client {
-        http,
-        api_key: &cfg.opensubtitles_key,
-        token: cfg.opensubtitles_token.as_deref(),
-        api_base: opensubtitles::API,
-    };
-    // Prefer an English source (best-resourced), else whatever exists.
-    //
-    // Searching "en" made that "else" unreachable: the list it picks from could only ever hold
-    // English, so `.or_else` was dead code and a film with a perfectly good Spanish or French source
-    // returned "no source subtitle to translate". Asking for every language costs the same one round
-    // trip; the preference is expressed in the pick below, not in the query.
-    let subs = client.search(imdb, season, episode, "all", None).await?;
-    let source = opensubtitles::best_for(&subs, "en")
-        // No English at all. Take the best of what there is, by the same score and the same
-        // first-wins tie-break `tier1_reference` uses — `subs` arrives unranked from the API, so
-        // `.first()` was whichever result OpenSubtitles happened to list first. `fit_score` also
-        // sinks machine/AI-translated subs, which is what keeps us from translating a translation.
-        .or_else(|| {
-            subs.iter()
-                .min_by_key(|s| std::cmp::Reverse(opensubtitles::fit_score(s, None)))
-        })
-        .ok_or("no source subtitle to translate")?;
+    body_key: &str,
+) -> Result<String, String> {
     // Through the cache, not straight at the API. A `/download` call spends one of the viewer's
     // daily OpenSubtitles credits on the CALL, not on the file fetch — and dodging that quota is the
     // reason the proxy-and-cache design exists at all. Going direct re-paid for a file already
     // sitting under `os:{file_id}`: once per retry after the ten-minute backoff, and once more for
     // every additional target language of the same film.
-    let raw = subtitle_srt(state, &client, source.file_id).await?;
+    let raw = subtitle_srt(state, client, source_file_id).await?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
         return Err("source subtitle was empty".into());
     }
-    let translated = translate::translate(http, llm, &cues, lang).await?;
-    state.cache.put(cache_key.to_string(), srt::serialize(&translated), CACHE_TTL);
-    Ok(())
+    let translated = translate::translate(client.http, llm, &cues, lang).await?;
+    let body = srt::serialize(&translated);
+    state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
+    Ok(body)
 }
 
 fn provider_tag(llm: &LlmConfig) -> &'static str {
@@ -757,6 +873,67 @@ mod tests {
         assert_eq!(tier1_ref_for(&sub(2, false), anchor), None);
         // With no anchor, nothing is aligned — the gap case, served as-is.
         assert_eq!(tier1_ref_for(&sub(1, false), None), None);
+    }
+
+    /// The translation source is chosen as TEXT, not as a fit to this encode. If the hash match got
+    /// a vote here, two encodes of one film would resolve to two different sources and each would buy
+    /// a separate full-price translation of the same dialogue — against the viewer's own key.
+    #[test]
+    fn the_translation_source_does_not_depend_on_the_encode() {
+        let good = Subtitle { downloads: 50_000, from_trusted: true, ..sub(1, false) };
+        let poor = Subtitle { downloads: 2, ..sub(2, false) };
+        // One encode hash-matches the poor sub; another hash-matches nothing. Same answer both times.
+        let hashes_the_poor_one = [Subtitle { hash_match: true, ..poor.clone() }, good.clone()];
+        let hashes_nothing = [poor.clone(), good.clone()];
+        assert_eq!(translation_source(&hashes_the_poor_one).unwrap().file_id, 1);
+        assert_eq!(translation_source(&hashes_nothing).unwrap().file_id, 1);
+
+        // With no English at all, the best of what exists — and a machine/AI sub is the last resort,
+        // never the first, so we don't translate a translation.
+        let spanish = Subtitle { lang: "es".into(), downloads: 10, ..sub(3, false) };
+        let ai_english = Subtitle { ai_translated: true, downloads: 999_999, ..sub(4, false) };
+        assert_eq!(translation_source(&[spanish.clone(), ai_english.clone()]).unwrap().file_id, 3);
+        // An English sub still wins when there is one, even a modest one.
+        assert_eq!(translation_source(&[spanish, ai_english, poor]).unwrap().file_id, 2);
+
+        assert!(translation_source(&[]).is_none());
+    }
+
+    /// A translated body carries the same tier namespacing a downloaded one does, hanging off the
+    /// translate key instead of `os:{id}`. The unaligned translation and its aligned variants must
+    /// not collide, and none of them may look like a retry marker.
+    #[test]
+    fn a_translated_body_carries_the_same_tier_namespacing() {
+        let llm = LlmConfig {
+            provider: userconfig::Provider::OpenAI,
+            model: "gpt-4o-mini".into(),
+            api_key: "k".into(),
+        };
+        let base = translate_body_key(42, "SV", &llm);
+        let raw = sync_cache_key(&base, &None, None);
+        let aligned = sync_cache_key(&base, &None, Some(9));
+        let resynced = sync_cache_key(&base, &Some("http://host/s.mkv".into()), None);
+        assert_eq!(raw, base, "the unaligned body is the base key itself");
+        assert_ne!(raw, aligned);
+        assert_ne!(raw, resynced);
+        assert_ne!(aligned, resynced);
+        for key in [&raw, &aligned, &resynced] {
+            assert!(BODY_PREFIXES.iter().any(|p| key.starts_with(p)), "unnamespaced body key: {key}");
+            assert!(!key.starts_with(SYNCFAIL), "a body key must never look like a marker: {key}");
+        }
+
+        // Two encodes of one film: the same translated text, two different anchors. One LLM bill and
+        // two cheap alignments — which is the whole reason the text key names a source file rather
+        // than a title.
+        let encode_a = sync_cache_key(&base, &None, Some(11));
+        let encode_b = sync_cache_key(&base, &None, Some(22));
+        assert_ne!(encode_a, encode_b);
+        assert!(encode_a.starts_with(&base) && encode_b.starts_with(&base));
+
+        // A different source, or a different model, is a different translation.
+        assert_ne!(translate_body_key(43, "SV", &llm), base);
+        let bigger = LlmConfig { model: "gpt-4o".into(), ..llm.clone() };
+        assert_ne!(translate_body_key(42, "SV", &bigger), base);
     }
 
     #[test]
@@ -963,7 +1140,7 @@ mod translate_retry_tests {
         let llm = cfg.llm.as_ref().expect("test config carries an llm");
         // From the real key builder, not a literal: `lang` is canonicalized on the way into the key,
         // so a literal silently stopped addressing the same entry the handler reads.
-        let cache_key = translate_cache_key("tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
+        let cache_key = translate_fail_key("tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
         state.cache.put(format!("{SYNCFAIL}{cache_key}"), "1".into(), SYNC_RETRY_TTL);
 
         let resp = handle_translate(
@@ -971,8 +1148,10 @@ mod translate_retry_tests {
             &HeaderMap::new(),
             &config,
             "tt0111161",
+            "",
             "Swedish",
             false,
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1003,8 +1182,17 @@ mod translate_retry_tests {
         };
         let key = |lang: &str| {
             let decoded = httputil::percent_decode_path(lang);
-            translate_cache_key("tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)
+            translate_fail_key("tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)
         };
+        // The body key is keyed by source file rather than by title, but it carries the same
+        // canonicalized language, so the collapsing has to hold there too — that is the key the
+        // film's text actually lives under.
+        let body_key = |lang: &str| {
+            let decoded = httputil::percent_decode_path(lang);
+            translate_body_key(77, &translate::canonical_lang(&decoded), &llm)
+        };
+        assert_eq!(body_key("sv"), body_key("Swedish"));
+        assert_ne!(body_key("Swedish"), body_key("Finnish"));
 
         let swedish = key("Swedish");
         for same in ["swedish", "SWEDISH", "  Swedish  ", "sv", "SV"] {
@@ -1029,7 +1217,7 @@ mod translate_retry_tests {
         let state = state("long-lang");
         let config = config_segment();
         let long = "x".repeat(MAX_LANG + 1);
-        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", &long, false).await;
+        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", &long, false, None).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an over-long language was accepted");
 
         // Nothing was written for it — not the body key, and not the failure marker either.
@@ -1038,7 +1226,7 @@ mod translate_retry_tests {
         assert_eq!(files, 0, "an invalid request left {files} cache files behind");
 
         // A real language still works its way through to the upstream check.
-        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "Swedish", false).await;
+        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "a valid language must not be refused");
     }
 
@@ -1055,12 +1243,12 @@ mod translate_retry_tests {
         // Through the real builder and the real canonicalizer, so the keys the test addresses are
         // the keys the handler writes.
         let key_for =
-            |lang: &str| translate_cache_key("tt0111161", None, None, &translate::canonical_lang(lang), llm);
+            |lang: &str| translate_fail_key("tt0111161", None, None, &translate::canonical_lang(lang), llm);
         state.cache.put(format!("{SYNCFAIL}{}", key_for("Swedish")), "1".into(), SYNC_RETRY_TTL);
 
         let finnish_marker = format!("{SYNCFAIL}{}", key_for("Finnish"));
         assert!(state.cache.get(&finnish_marker).is_none(), "precondition: Finnish is unmarked");
-        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "Finnish", false).await;
+        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Finnish", false, None).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert!(
             state.cache.get(&finnish_marker).is_some(),

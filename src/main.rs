@@ -131,12 +131,16 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             }
         }
         "translate" => {
-            // /<config>/translate/<type>/<id>/<lang>.(json|srt)
-            if segs.len() != 5 {
-                return httputil::text(StatusCode::NOT_FOUND, "not found");
-            }
-            let id = segs[3];
-            let last = segs[4];
+            // /<config>/translate/<type>/<id>[/<extra>]/<lang>.(json|srt)
+            //
+            // The <extra> segment carries this stream's videoHash, which is what lets a translation
+            // find a Tier-1 anchor. It is optional so installs built against the older five-segment
+            // shape keep resolving — they just get no anchor, which is where every translation was.
+            let (id, extra, last) = match segs.len() {
+                6 => (segs[3], segs[4], segs[5]),
+                5 => (segs[3], "", segs[4]),
+                _ => return httputil::text(StatusCode::NOT_FOUND, "not found"),
+            };
             let (lang, want_json) = if let Some(l) = last.strip_suffix(".json") {
                 (l, true)
             } else if let Some(l) = last.strip_suffix(".srt") {
@@ -144,7 +148,8 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             } else {
                 return httputil::text(StatusCode::NOT_FOUND, "not found");
             };
-            addon::handle_translate(state, &parts.headers, config, id, lang, want_json).await
+            let resync = query_get(parts.uri.query().unwrap_or(""), "resync");
+            addon::handle_translate(state, &parts.headers, config, id, extra, lang, want_json, resync).await
         }
         _ => httputil::text(StatusCode::NOT_FOUND, "not found"),
     }
