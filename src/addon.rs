@@ -231,8 +231,13 @@ fn os_client<'a>(state: &'a AppState, http: &'a reqwest::Client, cfg: &'a UserCo
 /// but enough to spare a live round-trip every time the app reopens a title.
 ///
 /// Always asks for every language: the app filters by its own preferred-language rules, and the
-/// translate path needs to see every candidate source. That also means the two endpoints share one
-/// cache entry, so tapping "translate" right after browsing the picker costs no API call at all.
+/// translate path needs to see every candidate source.
+///
+/// Entries are per hash, so the picker (which sends one) and the translate path's source lookup
+/// (which deliberately does not — see `handle_translate`) do NOT share an entry. A translate on a
+/// cold title therefore pays a second search. Searches spend no download credit, and the alternative
+/// is choosing the source from a list whose contents depend on the encode, which costs a second
+/// full-price translation.
 ///
 /// Returned UNRANKED, and cached that way: ranking is filename-specific, so each caller ranks the
 /// list for its own request.
@@ -335,6 +340,11 @@ pub async fn handle_subtitle_file(
         }
         None => None,
     };
+    // A subtitle is never its own timing reference. `tier1_ref_for` refuses that when it BUILDS a
+    // URL, but this value arrives on the query string and anyone can name it: `?ref=5` on file 5
+    // spawned a tier binary to align a file to itself — a subprocess, on the one runtime thread, for
+    // a guaranteed no-op — and filed the result under `os:5:ref:5`.
+    let ref_id = ref_id.filter(|&r| r != file_id);
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
     let cache_key = sync_cache_key(&os_base_key(file_id), &resync_url, ref_id);
     if let Some(hit) = state.cache.get(&cache_key) {
@@ -405,7 +415,15 @@ async fn sync_and_cache(
 
     // Per-invocation unique temp tag: two concurrent requests for the same file must not share
     // scratch paths (one would read the other's half-written output and cache it for 60 days).
-    let tag = format!("{}-{}", cache_key.replace(':', "-"), SYNC_SEQ.fetch_add(1, Ordering::Relaxed));
+    // Bounded, for the reason `Cache::disk_path` is: this becomes `{tag}-reference.srt` in the work
+    // dir, and a translate cache key already runs to ~255 bytes with a long model name and language.
+    // Past NAME_MAX the temp write fails, so the alignment fails, so the key earns a `syncfail:`
+    // marker — a long model name silently disabling Tier-1 for that install.
+    let tag = format!(
+        "{}-{}",
+        cache_key.replace(':', "-").chars().take(80).collect::<String>(),
+        SYNC_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let synced: Option<String> = if let Some(url) = resync_url {
         // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
         match state.sync.sync_to_audio(&target, &url, &tag).await {
@@ -569,7 +587,14 @@ fn sync_cache_key(base: &str, resync_url: &Option<String>, ref_id: Option<i64>) 
 /// a search cannot do this job. Built here rather than inline so the handler and the tests cannot
 /// drift apart on it — the same reason `sync_cache_key` exists, and `lang` in particular is
 /// canonicalized rather than taken verbatim (see `translate::canonical_lang`).
+///
+/// Scoped to the INSTALL, unlike the body key. A translated body is the same bytes whoever asked for
+/// it and is deliberately shared; a failure is not. One install with a dead provider key would
+/// otherwise hand every other install on the same provider and model a 502 and a `.status` of
+/// `failed` for ten minutes, and show them its progress bar — the cheapest cross-tenant lever in the
+/// service, from something that was only ever meant to protect one viewer's bill.
 fn translate_fail_key(
+    config: &str,
     imdb: &str,
     season: Option<i64>,
     episode: Option<i64>,
@@ -577,7 +602,8 @@ fn translate_fail_key(
     llm: &LlmConfig,
 ) -> String {
     format!(
-        "translate:{imdb}:{}:{}:{lang_key}:{}:{}",
+        "translate:{:016x}:{imdb}:{}:{}:{lang_key}:{}:{}",
+        short_hash(config),
         season.unwrap_or(0),
         episode.unwrap_or(0),
         llm.provider.tag(),
@@ -734,7 +760,7 @@ pub async fn handle_translate(
     // Said differently from a fresh failure on purpose: from the outside the two are the same 502,
     // and the difference — "we just tried" versus "we are backing off" — is the first thing you want
     // to know when a translation stops working.
-    let job_key = translate_fail_key(&imdb, season, episode, &lang_key, llm);
+    let job_key = translate_fail_key(config, &imdb, season, episode, &lang_key, llm);
     let failed_recently = format!("{SYNCFAIL}{job_key}");
     if state.cache.get(&failed_recently).is_some() {
         return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
@@ -754,25 +780,52 @@ pub async fn handle_translate(
     // encodes of one film to two sources, which is two `translate_body_key`s and two full-price
     // translations of the same dialogue — the exact cost keying by source file was meant to avoid.
     //
-    // Both are cached under `search:` and the unhashed one is shared with every other encode of the
-    // title, so the steady-state cost of the pair is one round trip, no download credits.
+    // Both are cached under `search:`, keyed per hash — so they are two different entries and a cold
+    // title pays two searches, not one. Neither spends a download credit, and the alternative is
+    // choosing the source from an encode-dependent list, which spends a whole second translation.
     let hash = search_hash(extra);
+    // A failed search does NOT set the marker. The marker means "a whole film's LLM bill was just
+    // spent and lost, do not spend it again for ten minutes" — a search that failed cost nothing,
+    // spent no tokens, and is usually a blip. Marking it made a moment's upstream trouble outlive
+    // itself by ten minutes across every language the viewer tried, and made `.status` report
+    // `failed` for a run that was never attempted.
     let Ok(candidates) = cached_search(state, &client, &imdb, season, episode, None).await else {
-        state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
         return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
     };
-    let Some(source) = translation_source(&candidates) else {
+    // Which file this title translates FROM is pinned once and reused.
+    //
+    // `translation_source` reads download counts, ratings and the trusted flag, and all three drift —
+    // one new trusted upload is +400 and flips the pick outright. The search behind it is cached for
+    // six hours, so a run the next day re-picks from a refreshed list, lands on a different file, and
+    // that is a different `translate_body_key`: a second full-price translation of dialogue already
+    // bought, with the first left orphaned under a key nothing will ask for again.
+    //
+    // The pin is per title rather than per language, so every language of a film translates from the
+    // same source, and it is honoured only while that file is still among the candidates — if the
+    // upload disappears, the next pick stands in and is pinned in its place.
+    let pin_key = format!("source:{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0));
+    let pinned = state.cache.get(&pin_key).and_then(|v| v.parse::<i64>().ok());
+    let source = pinned
+        .and_then(|id| candidates.iter().find(|s| s.file_id == id))
+        .or_else(|| translation_source(&candidates));
+    let Some(source) = source else {
         return httputil::text(StatusCode::NOT_FOUND, "no source subtitle to translate");
     };
     let source_id = source.file_id;
+    state.cache.put(pin_key, source_id.to_string(), CACHE_TTL);
     let body_key = translate_body_key(source_id, &lang_key, llm);
 
     // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
     // either there is no anchor to find, and the answer would be the list we already have.
     let anchored = match hash.as_deref().filter(|_| cfg.auto_sync) {
-        Some(h) => cached_search(state, &client, &imdb, season, episode, Some(h))
-            .await
-            .unwrap_or_default(),
+        // Propagated, not swallowed. Treating a failed search as "no anchor" makes `ref_id` depend
+        // on whether a round trip happened to succeed — so the `.json` call could align and cache
+        // under `body_key:ref:R` while the `.srt` call that follows computes `None`, keys on
+        // `body_key`, and is served the UNALIGNED body while the aligned one sits unused.
+        Some(h) => match cached_search(state, &client, &imdb, season, episode, Some(h)).await {
+            Ok(s) => s,
+            Err(_) => return httputil::text(StatusCode::BAD_GATEWAY, "translation failed"),
+        },
         None => Vec::new(),
     };
     // Whether the SOURCE is hash-matched to this encode is a fact about the hashed list, and the
@@ -916,7 +969,7 @@ pub async fn handle_translate_status(
     if lang_key.is_empty() {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_lang"}), "no-store");
     }
-    let job_key = translate_fail_key(&imdb, season, episode, &lang_key, llm);
+    let job_key = translate_fail_key(config, &imdb, season, episode, &lang_key, llm);
 
     let body = if let Some((done, total)) = state.progress.get(&job_key) {
         json!({"state": "working", "done": done, "total": total})
@@ -1104,6 +1157,21 @@ mod tests {
         assert_ne!(translate_body_key(43, "SV", &llm), base);
         let bigger = LlmConfig { model: "gpt-4o".into(), ..llm.clone() };
         assert_ne!(translate_body_key(42, "SV", &bigger), base);
+    }
+
+    /// A subtitle is never its own reference. `tier1_ref_for` refuses that when it builds a URL, but
+    /// `ref` arrives on the query string and anyone can name it — and `?ref=5` on file 5 spawned a
+    /// tier binary to align a file to itself: a subprocess on the one runtime thread, for a
+    /// guaranteed no-op, cached afterwards under a key that claims an alignment happened.
+    #[test]
+    fn a_subtitle_is_never_its_own_reference() {
+        // What the handler does with the query value before it reaches a key.
+        let vetted = |file_id: i64, r: Option<i64>| r.filter(|&r| r != file_id);
+        assert_eq!(vetted(5, Some(5)), None, "a file was accepted as its own reference");
+        assert_eq!(vetted(5, Some(9)), Some(9), "a real reference was rejected");
+        assert_eq!(vetted(5, None), None);
+        // And with it refused, the request keys on the plain body rather than claiming an alignment.
+        assert_eq!(sync_cache_key(&os_base_key(5), &None, vetted(5, Some(5))), "os:5");
     }
 
     #[test]
@@ -1316,7 +1384,7 @@ mod translate_retry_tests {
         let llm = cfg.llm.as_ref().expect("test config carries an llm");
         // From the real key builder, not a literal: `lang` is canonicalized on the way into the key,
         // so a literal silently stopped addressing the same entry the handler reads.
-        let cache_key = translate_fail_key("tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
+        let cache_key = translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
         state.cache.put(format!("{SYNCFAIL}{cache_key}"), "1".into(), SYNC_RETRY_TTL);
 
         let resp = handle_translate(
@@ -1356,9 +1424,10 @@ mod translate_retry_tests {
             model: "gpt-4o-mini".into(),
             api_key: "k".into(),
         };
+        let config = config_segment();
         let key = |lang: &str| {
             let decoded = httputil::percent_decode_path(lang);
-            translate_fail_key("tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)
+            translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)
         };
         // The body key is keyed by source file rather than by title, but it carries the same
         // canonicalized language, so the collapsing has to hold there too — that is the key the
@@ -1420,7 +1489,7 @@ mod translate_retry_tests {
         let config = config_segment();
         let cfg = userconfig::decode(state.config_keyring.as_ref(), &config).unwrap();
         let llm = cfg.llm.as_ref().unwrap();
-        let job_key = translate_fail_key("tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
+        let job_key = translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
 
         let read = |resp: Response<Body>| async {
             let bytes = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
@@ -1471,8 +1540,10 @@ mod translate_retry_tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an over-long language was accepted");
 
         // Nothing was written for it — not the body key, and not the failure marker either.
+        // `expect`, not `unwrap_or(0)`: a missing directory would otherwise score zero and pass this
+        // assertion without ever testing anything.
         let store = state.cfg.cache_dir.join("store");
-        let files = std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0);
+        let files = std::fs::read_dir(&store).expect("the store directory is created at boot").count();
         assert_eq!(files, 0, "an invalid request left {files} cache files behind");
 
         // A real language still works its way through to the upstream check.
@@ -1481,9 +1552,12 @@ mod translate_retry_tests {
     }
 
     /// And the marker is scoped to the translation it belongs to: another language is a different
-    /// job and must still be attempted. Proven by the marker the ATTEMPT leaves behind — the test
-    /// config's OpenSubtitles key is a test string, so a Finnish run gets as far as failing on the
-    /// upstream and recording that, which a short-circuit would never do.
+    /// job and must still be attempted.
+    ///
+    /// Proven by the response body, not by a marker the attempt leaves behind — a failed SEARCH no
+    /// longer writes one, deliberately: a search costs nothing, and marking it made a moment's
+    /// upstream trouble outlive itself by ten minutes. The body is what separates the two outcomes
+    /// anyway, since both are a 502.
     #[tokio::test]
     async fn a_remembered_failure_does_not_block_a_different_translation() {
         let state = state("scoping");
@@ -1493,16 +1567,27 @@ mod translate_retry_tests {
         // Through the real builder and the real canonicalizer, so the keys the test addresses are
         // the keys the handler writes.
         let key_for =
-            |lang: &str| translate_fail_key("tt0111161", None, None, &translate::canonical_lang(lang), llm);
+            |lang: &str| translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang(lang), llm);
         state.cache.put(format!("{SYNCFAIL}{}", key_for("Swedish")), "1".into(), SYNC_RETRY_TTL);
 
-        let finnish_marker = format!("{SYNCFAIL}{}", key_for("Finnish"));
-        assert!(state.cache.get(&finnish_marker).is_none(), "precondition: Finnish is unmarked");
+        let body_of = |resp: Response<Body>| async {
+            let bytes = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+
+        // Finnish is a different job: it must get past the marker and fail on its own merits.
         let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Finnish", false, None).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let finnish = body_of(resp).await;
         assert!(
-            state.cache.get(&finnish_marker).is_some(),
-            "Finnish was short-circuited by Swedish's marker instead of being attempted"
+            !finnish.contains("recently"),
+            "Finnish was short-circuited by Swedish's marker instead of being attempted: {finnish}"
         );
+
+        // Swedish, the marked one, is still short-circuited.
+        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let swedish = body_of(resp).await;
+        assert!(swedish.contains("recently"), "the marked language was attempted anyway: {swedish}");
     }
 }

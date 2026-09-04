@@ -31,7 +31,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -70,8 +70,15 @@ const GLOSSARY_SAMPLE_CHARS: usize = 40_000;
 ///
 /// A term longer than 40 characters is not a term. It is a model answering with an explanation, and
 /// the cost of letting one through is paid on every remaining batch.
+/// At 40×40 a worst-case glossary is ~3.5 KB per prompt and ~120 KB across a 35-batch film, against
+/// ~48 KB of actual dialogue. So this is a reduction from "several times the text being translated"
+/// to "a couple of times" — better, not solved. Tighten again if a real glossary ever runs near the
+/// cap; the typical one is far under it.
 const MAX_GLOSSARY: usize = 40;
 const MAX_GLOSSARY_TERM: usize = 40;
+
+/// Spreads retries that would otherwise fire in the same instant. Only ever incremented.
+static RETRY_TICK: AtomicU64 = AtomicU64::new(0);
 
 /// Where a finished batch is remembered between runs, so a film that dies at cue 1100 of 1200 does
 /// not re-buy the 1100 that worked. A trait rather than the cache itself, so the harness tests can
@@ -90,7 +97,9 @@ const BATCH_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 
 impl BatchStore for crate::cache::Cache {
     fn get(&self, key: &str) -> Option<String> {
-        crate::cache::Cache::get(self, key)
+        // Memory only, to match `put` below. `Cache::get` would fall through to a disk probe that
+        // can never hit for a key nothing ever wrote to disk.
+        crate::cache::Cache::get_mem(self, key)
     }
     /// Memory only. A film is ~150 batches, and the write-through `put` is a blocking `fs::write`
     /// plus a rename on the one runtime thread — a hundred and fifty of those, per translation,
@@ -698,9 +707,12 @@ async fn call_with_retries(
         let Err(CallError::Upstream { retry: Some(stated), .. }) = &result else { break };
         // One second, then four, unless the provider named a longer wait of its own — plus a spread
         // of up to a second. Without it the CONCURRENCY batches in flight are rate-limited together,
-        // sleep in lockstep, and retry in the same instant, which is the burst that got them refused.
-        // Derived from the batch rather than a random source: same effect, nothing new to seed.
-        let spread = Duration::from_millis((sources.len() as u64 * 137) % 1000);
+        // sleep in lockstep, and burst again in the same instant, which is what got them refused.
+        //
+        // From a counter, NOT from `sources.len()`. Every batch in the window is BATCH cues long, so
+        // deriving the spread from the length handed all of them the same number and left the
+        // lockstep exactly as it was — a jitter that jittered nothing.
+        let spread = Duration::from_millis((RETRY_TICK.fetch_add(1, Ordering::Relaxed) * 373) % 1000);
         let wait = (*stated).max(Duration::from_secs(1 << (2 * (attempt - 1)))) + spread;
         if wait >= budget.remaining() {
             break;

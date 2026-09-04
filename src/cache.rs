@@ -66,6 +66,27 @@ impl Cache {
         /// Longer than any write takes, far shorter than the hourly sweep interval.
         const TEMP_GRACE: Duration = Duration::from_secs(60);
 
+        // The memory tier first, and unconditionally — it has to be reclaimed even when there is no
+        // disk tier to walk. An expired memory entry is otherwise dropped only when someone reads
+        // that exact key again, or when LRU pressure evicts it. Entries written and never re-read
+        // are the norm now that a film leaves ~150 batch entries behind, and every one of them holds
+        // its bytes against the budget until something else needs the room.
+        {
+            let mut g = self.inner.lock().unwrap();
+            let now = Instant::now();
+            let dead: Vec<String> = g
+                .map
+                .iter()
+                .filter(|(_, e)| e.expires <= now)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in dead {
+                if let Some(e) = g.map.remove(&key) {
+                    g.bytes -= e.size;
+                }
+            }
+        }
+
         let Some(dir) = self.dir.as_ref() else { return };
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         let now = unix_now();
@@ -168,10 +189,23 @@ impl Cache {
     /// per film, which exists only to rescue a retry a few minutes later and is redundant the moment
     /// the finished artifact is cached.
     ///
-    /// The cost is that these do not survive a restart. For the case they exist for — a run that
-    /// failed, retried by the same process while the viewer is still waiting — that is no loss.
+    /// The saving is not really the write itself — it is that ~150 files per film, at up to fifty
+    /// films a day, would leave the hourly `sweep` opening and header-reading thousands of extra
+    /// files on that same thread.
+    ///
+    /// The cost is real and worth naming: a restart mid-run — a deploy, an OOM, a host reboot —
+    /// now re-buys the whole film, where a disk-backed entry would have rescued the batches already
+    /// paid for. That is the trade. A retry by the same process, which is the common case and the
+    /// one the viewer is sitting in front of, is unaffected.
     pub fn put_mem(&self, key: String, value: String, ttl: Duration) {
         self.mem_put(key, value, ttl);
+    }
+
+    /// Read from memory only. The companion to `put_mem`: going through `get` would fall through to
+    /// a disk probe that, for a key only ever written by `put_mem`, cannot hit — a blocking `open`
+    /// per lookup, ~150 of them per resumed film, all of them ENOENT.
+    pub fn get_mem(&self, key: &str) -> Option<String> {
+        self.mem_get(key)
     }
 
     // ---- memory tier -------------------------------------------------------
@@ -242,7 +276,12 @@ impl Cache {
             key.hash(&mut h);
             // On a char boundary — a key is UTF-8 and a byte slice through a multibyte char panics.
             let head: String = key.chars().take(32).collect();
-            format!("{}-{:016x}", encode(head.as_bytes()), h.finish())
+            // `~` separates the two namespaces because it is not in the base64url alphabet, so a
+            // plain name can never equal a hashed one. A `-` would not do: `-` and the hex digits
+            // are all legal base64url output, so some short key could encode to exactly a long key's
+            // hashed name and the two would share a file. Nor a `.`, which `disk_put`'s
+            // `with_extension` would then treat as the extension and overwrite.
+            format!("{}~{:016x}", encode(head.as_bytes()), h.finish())
         };
         Some(dir.join(name))
     }

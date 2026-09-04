@@ -150,11 +150,8 @@ fn serialize_with(cues: &[Cue], ms_sep: char, header: &str) -> String {
             if !first {
                 out.push('\n');
             }
-            // WebVTT reads `&` and `<` as markup in a cue payload, so a line like "5 < 6 & rising" —
-            // perfectly ordinary SRT — is malformed VTT, and a strict parser drops or mangles the
-            // cue. SRT has no such rule and must be written through untouched.
             match ms_sep {
-                '.' => out.push_str(&line.replace('&', "&amp;").replace('<', "&lt;")),
+                '.' => out.push_str(&escape_vtt(line)),
                 _ => out.push_str(line),
             }
             first = false;
@@ -162,6 +159,49 @@ fn serialize_with(cues: &[Cue], ms_sep: char, header: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Escape one cue line for WebVTT: `&` always, `<` only when it is not opening a tag.
+///
+/// WebVTT reads both as markup, so a line like "5 < 6 & rising" — ordinary, valid SRT — is malformed
+/// there and a strict parser mangles the cue. But `<i>`, `<b>`, `<u>` and `<font …>` are the dominant
+/// styling convention in real subtitle files AND are legal WebVTT markup, so escaping every `<`
+/// renders a literal `<i>Whispering</i>` on screen for a large share of tracks. That is a worse bug
+/// than the one being fixed, and it is what a blanket replace produces.
+fn escape_vtt(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    // `&` and `<` are ASCII, so every index here lands on a char boundary.
+    while let Some(i) = rest.find(['&', '<']) {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if let Some(after) = tail.strip_prefix('&') {
+            out.push_str("&amp;");
+            rest = after;
+        } else if let Some(end) = tag_end(tail) {
+            // Tag-shaped and closed: hand it through as the markup it is.
+            out.push_str(&tail[..=end]);
+            rest = &tail[end + 1..];
+        } else {
+            out.push_str("&lt;");
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byte index of the `>` closing a WebVTT tag at the start of `s`, or `None` if this `<` is just a
+/// less-than sign. Covers `<i>`, `</i>`, `<c.loud>`, `<v Fred>`, `<lang en>` and the timestamp form
+/// `<00:00:01.000>` — the common shape being "angle bracket, optional slash, then something
+/// alphanumeric, then a closing bracket on the same line".
+fn tag_end(s: &str) -> Option<usize> {
+    let body = s.strip_prefix('<')?;
+    let body = body.strip_prefix('/').unwrap_or(body);
+    if !body.chars().next()?.is_ascii_alphanumeric() {
+        return None;
+    }
+    s.find('>')
 }
 
 /// `HH:MM:SS,mmm --> HH:MM:SS,mmm` → (start_ms, end_ms). Also accepts a `.` millisecond separator
@@ -229,6 +269,23 @@ mod tests {
         assert!(vtt.contains("5 &lt; 6 &amp; rising"), "a VTT payload was not escaped: {vtt:?}");
         // And SRT has no such rule, so it must be written through untouched.
         assert!(serialize(&awkward).contains("5 < 6 & rising"), "SRT was escaped when it must not be");
+
+        // But `<i>` and friends are LEGAL WebVTT markup and are how most real subtitle files carry
+        // emphasis. Escaping those renders the tag on screen as text — a worse bug, on far more
+        // tracks, than the one the escaping is for.
+        let styled = parse("1\n00:00:01,000 --> 00:00:02,000\n<i>Whispering</i>\n");
+        let vtt = serialize_vtt(&styled);
+        assert!(vtt.contains("<i>Whispering</i>"), "italics were escaped into visible text: {vtt:?}");
+
+        // Both at once, on one line, each treated on its own merits.
+        let mixed = parse("1\n00:00:01,000 --> 00:00:02,000\n<b>Tom & Jerry</b> 5 < 6\n");
+        let vtt = serialize_vtt(&mixed);
+        assert!(vtt.contains("<b>Tom &amp; Jerry</b>"), "a tag or its ampersand was mishandled: {vtt:?}");
+        assert!(vtt.contains("5 &lt; 6"), "a bare less-than was left unescaped: {vtt:?}");
+
+        // A `<` that opens nothing is still escaped, even with a `>` later in the line.
+        let tricky = parse("1\n00:00:01,000 --> 00:00:02,000\na < b > c\n");
+        assert!(serialize_vtt(&tricky).contains("a &lt; b > c"), "a bare less-than was read as a tag");
     }
 
     #[test]
