@@ -142,6 +142,11 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                 5 => (segs[3], "", segs[4]),
                 _ => return httputil::text(StatusCode::NOT_FOUND, "not found"),
             };
+            // `.status` is answered from the request alone, so it is dispatched before anything that
+            // could make a poll expensive.
+            if let Some(lang) = last.strip_suffix(".status") {
+                return addon::handle_translate_status(state, config, id, lang).await;
+            }
             let (lang, want_json) = if let Some(l) = last.strip_suffix(".json") {
                 (l, true)
             } else if let Some(l) = last.strip_suffix(".srt") {

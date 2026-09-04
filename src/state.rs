@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::cache::Cache;
 use crate::config::Config;
-use crate::inflight::InFlight;
+use crate::inflight::{InFlight, Progress};
 use crate::seal::Keyring;
 use crate::sync::SyncTools;
 
@@ -23,6 +23,8 @@ pub struct AppState {
     /// One worker per cache key for the two expensive jobs (an LLM translation, a sync subprocess).
     /// The cache only collapses work that has already finished; this collapses work in progress.
     pub inflight: InFlight,
+    /// How far a running translation has got, for the `.status` endpoint.
+    pub progress: Progress,
     pub sync: SyncTools,
     /// Consecutive OpenSubtitles search failures — surfaced as `degraded` on /health (ADDON-02).
     pub os_fails: AtomicU32,
@@ -66,6 +68,7 @@ impl AppState {
             http,
             cache,
             inflight: InFlight::default(),
+            progress: Progress::default(),
             sync,
             os_fails: AtomicU32::new(0),
         })

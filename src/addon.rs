@@ -7,6 +7,7 @@
 //!   GET /<config>/subtitle/<file_id>.srt                proxy+cache one OpenSubtitles file
 //!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.json  app-driven: kick off/await a translation → { url }
 //!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.srt   the translated SRT (cache hit after the .json warmed it)
+//!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.status how far a running translation has got
 //!
 //! `<id>` is `tt<digits>` or `tt<digits>:<season>:<episode>`. `<extra>` is the Stremio query blob
 //! carrying `videoHash`/`videoSize` (the OSHash the app computed). On the translate routes it is
@@ -685,7 +686,8 @@ pub async fn handle_translate(
     // Said differently from a fresh failure on purpose: from the outside the two are the same 502,
     // and the difference — "we just tried" versus "we are backing off" — is the first thing you want
     // to know when a translation stops working.
-    let failed_recently = format!("{SYNCFAIL}{}", translate_fail_key(&imdb, season, episode, &lang_key, llm));
+    let job_key = translate_fail_key(&imdb, season, episode, &lang_key, llm);
+    let failed_recently = format!("{SYNCFAIL}{job_key}");
     if state.cache.get(&failed_recently).is_some() {
         return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
     }
@@ -744,7 +746,7 @@ pub async fn handle_translate(
                 match state.cache.get(&body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
                     Some(body) => body,
-                    None => match produce_translation(state, &client, llm, source.file_id, &lang, &body_key).await {
+                    None => match produce_translation(state, &client, llm, source.file_id, &lang, &body_key, &job_key).await {
                         Ok(body) => body,
                         Err(e) => {
                             // Log the detail (no key in these strings); hand the client a generic
@@ -792,8 +794,56 @@ pub async fn handle_translate(
     httputil::json(StatusCode::OK, &json!({ "url": url }), "no-store")
 }
 
+/// GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.status — how far a running translation has
+/// got, so the app can draw a bar instead of a spinner while the `.json` call it made on another
+/// connection is still working.
+///
+/// Answered from the request alone: no search, no upstream call, no cache write. A poll arrives every
+/// second or so while the expensive thing runs, and it must not itself become expensive — which is
+/// why progress is filed under the title-scoped job key rather than the key the translation lands on.
+///
+/// `working` means a run is in progress in THIS process. Anything else is `idle`, `done` or `failed`,
+/// and a client that gets `idle` should simply keep waiting on its `.json`: a run that has not
+/// reached its first completed batch, or one being carried out by another instance, looks the same
+/// from here and is not worth inventing a state for.
+pub async fn handle_translate_status(
+    state: &Arc<AppState>,
+    config: &str,
+    id: &str,
+    lang: &str,
+) -> Response<Body> {
+    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
+        return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_config"}), "no-store");
+    };
+    let Some(llm) = &cfg.llm else {
+        return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "no_llm"}), "no-store");
+    };
+    let Some((imdb, season, episode)) = parse_id(id) else {
+        return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_id"}), "no-store");
+    };
+    let lang = httputil::percent_decode_path(lang);
+    if lang.is_empty() || lang.len() > MAX_LANG {
+        return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_lang"}), "no-store");
+    }
+    let lang_key = translate::canonical_lang(&lang);
+    if lang_key.is_empty() {
+        return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_lang"}), "no-store");
+    }
+    let job_key = translate_fail_key(&imdb, season, episode, &lang_key, llm);
+
+    let body = if let Some((done, total)) = state.progress.get(&job_key) {
+        json!({"state": "working", "done": done, "total": total})
+    } else if state.cache.get(&format!("{SYNCFAIL}{job_key}")).is_some() {
+        json!({"state": "failed"})
+    } else {
+        json!({"state": "idle"})
+    };
+    httputil::json(StatusCode::OK, &body, "no-store")
+}
+
 /// Translate one source subtitle into `lang` and cache the result under `body_key`. Returns the
 /// translated SRT — the caller then runs the sync ladder over it.
+#[allow(clippy::too_many_arguments)]
 async fn produce_translation(
     state: &Arc<AppState>,
     client: &opensubtitles::Client<'_>,
@@ -801,6 +851,7 @@ async fn produce_translation(
     source_file_id: i64,
     lang: &str,
     body_key: &str,
+    job_key: &str,
 ) -> Result<String, String> {
     // Through the cache, not straight at the API. A `/download` call spends one of the viewer's
     // daily OpenSubtitles credits on the CALL, not on the file fetch — and dodging that quota is the
@@ -814,8 +865,20 @@ async fn produce_translation(
     }
     // The cache doubles as the batch store: a run that dies at cue 1100 of 1200 leaves the 1100
     // behind, so the retry the viewer is about to make re-buys only what actually failed.
-    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache).await?;
-    let body = srt::serialize(&translated);
+    //
+    // Progress is published under the JOB key rather than the body key, so `.status` can answer a
+    // poll from the request alone — deriving the body key needs a search, and a poll happens every
+    // second while the expensive thing runs.
+    state.progress.set(job_key, 0, cues.len());
+    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache, &|done, total| {
+        state.progress.set(job_key, done, total);
+    })
+    .await;
+    // Cleared on both paths: a failed run that left its last count behind would report a translation
+    // frozen partway for as long as the process lived.
+    state.progress.clear(job_key);
+
+    let body = srt::serialize(&translated?);
     state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
     Ok(body)
 }
@@ -1226,6 +1289,51 @@ mod translate_retry_tests {
         // some neighbour — the whole reason `canonical_lang` refuses to guess a code.
         assert_ne!(key("Hebrew"), key("Thai"));
         assert_ne!(key("Brazilian Portuguese"), key("Portuguese"));
+    }
+
+    /// `.status` answers from the request alone — no search, no upstream call — because it is polled
+    /// every second or so while the expensive thing runs. It reports what the run is doing, and it
+    /// reports a remembered failure rather than leaving a client polling a job that will not start.
+    #[tokio::test]
+    async fn status_reports_the_run_without_touching_the_upstream() {
+        let state = state("status");
+        let config = config_segment();
+        let cfg = userconfig::decode(state.config_keyring.as_ref(), &config).unwrap();
+        let llm = cfg.llm.as_ref().unwrap();
+        let job_key = translate_fail_key("tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
+
+        let read = |resp: Response<Body>| async {
+            let bytes = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+            serde_json::from_slice::<Value>(&bytes).expect("status is json")
+        };
+
+        // Nothing running, nothing remembered.
+        let resp = handle_translate_status(&state, &config, "tt0111161", "Swedish").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(read(resp).await["state"], "idle");
+
+        // A run in progress reports how far it has got.
+        state.progress.set(&job_key, 340, 1200);
+        let body = read(handle_translate_status(&state, &config, "tt0111161", "Swedish").await).await;
+        assert_eq!(body["state"], "working");
+        assert_eq!(body["done"], 340);
+        assert_eq!(body["total"], 1200);
+
+        // Another language is a different job and must not read this one's progress.
+        let other = read(handle_translate_status(&state, &config, "tt0111161", "Finnish").await).await;
+        assert_eq!(other["state"], "idle", "a different language saw Swedish's progress");
+
+        // Once it finishes, the entry is gone; a remembered failure is reported as one so a client
+        // stops waiting for a run that is being backed off.
+        state.progress.clear(&job_key);
+        state.cache.put(format!("{SYNCFAIL}{job_key}"), "1".into(), SYNC_RETRY_TTL);
+        let body = read(handle_translate_status(&state, &config, "tt0111161", "Swedish").await).await;
+        assert_eq!(body["state"], "failed");
+
+        // Spellings of one language are one job here too, or a poll would never find its own run.
+        state.progress.set(&job_key, 1, 2);
+        let by_code = read(handle_translate_status(&state, &config, "tt0111161", "sv").await).await;
+        assert_eq!(by_code["state"], "working", "a code and a name polled different jobs");
     }
 
     /// An over-long language name is refused before it can become a filename or a prompt. The same

@@ -66,6 +66,33 @@ impl Drop for Guard<'_> {
     }
 }
 
+/// How far a long job has got, so a client can show a bar rather than a spinner.
+///
+/// Keyed by the job, not by the artifact: the key has to be computable from the request alone, or a
+/// poll would cost a search of its own — and a poll happens every second while the expensive thing
+/// is running.
+///
+/// Entries are live only while a job is; a missing one means "not running here", which is also the
+/// honest answer after a restart or from a second instance.
+#[derive(Default)]
+pub struct Progress {
+    jobs: Mutex<HashMap<String, (usize, usize)>>,
+}
+
+impl Progress {
+    pub fn set(&self, key: &str, done: usize, total: usize) {
+        self.jobs.lock().unwrap().insert(key.to_string(), (done, total));
+    }
+
+    pub fn get(&self, key: &str) -> Option<(usize, usize)> {
+        self.jobs.lock().unwrap().get(key).copied()
+    }
+
+    pub fn clear(&self, key: &str) {
+        self.jobs.lock().unwrap().remove(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

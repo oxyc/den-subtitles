@@ -133,6 +133,7 @@ pub async fn translate(
     cues: &[Cue],
     target_lang: &str,
     store: &dyn BatchStore,
+    progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<Cue>, String> {
     if cues.is_empty() {
         return Ok(Vec::new());
@@ -144,7 +145,7 @@ pub async fn translate(
         store,
         prefix: format!("{}:{}:{}", llm.provider.tag(), llm.model, canonical_lang(target_lang)),
     };
-    run_translation(&Upstream { client, llm, target_lang }, cues, RUN_DEADLINE, Some(&resume)).await
+    run_translation(&Upstream { client, llm, target_lang }, cues, RUN_DEADLINE, Some(&resume), progress).await
 }
 
 /// The harness proper, over any upstream. Split from `translate` so the same-length contract and the
@@ -154,6 +155,7 @@ async fn run_translation(
     cues: &[Cue],
     deadline: Duration,
     resume: Option<&Resume<'_>>,
+    progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<Cue>, String> {
     let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Rolling context: the tail of already-translated pairs, refreshed as batches land. Shared
@@ -217,6 +219,10 @@ async fn run_translation(
         for (cue, text) in batch.iter().zip(translated) {
             out.push(Cue { text, ..cue.clone() });
         }
+        // Cues settled, out of cues total. Reported per completed batch rather than per cue: the
+        // client polling this is drawing a bar, and a batch is the granularity at which anything
+        // actually changes.
+        progress(out.len(), cues.len());
         // Bail on a film that is clearly not being translated: a wrong-length model costs 2n-1 calls
         // a batch, so running to the end means thousands of paid calls to learn what the opening
         // showed.
@@ -1167,6 +1173,10 @@ mod contract_tests {
         Fake { reply, calls: Mutex::new(0) }
     }
 
+    /// Progress reporting is not what these cases are about; the `.status` endpoint's own behaviour
+    /// is covered where it lives.
+    fn no_progress(_done: usize, _total: usize) {}
+
     /// A batch store in memory, so the resume path is testable without a disk tier.
     #[derive(Default)]
     struct MemStore(Mutex<std::collections::HashMap<String, String>>);
@@ -1329,14 +1339,14 @@ mod contract_tests {
             }
             Ok(src.iter().map(|s| format!("SV {s}")).collect())
         });
-        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume)).await;
+        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume), &no_progress).await;
         assert!(first.is_err(), "the run should have failed on the third batch");
         assert_eq!(*up.calls.lock().unwrap(), 3, "two good batches and the refusal");
         assert_eq!(store.len(), 2, "the two paid batches should have been remembered");
 
         // Second attempt, provider healthy. Only the batch that failed may reach it.
         let up2 = fake(|src: &[String]| Ok(src.iter().map(|s| format!("SV {s}")).collect()));
-        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume))
+        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume), &no_progress)
             .await
             .expect("the retry should finish");
         assert_eq!(*up2.calls.lock().unwrap(), 1, "the retry re-bought batches it already had");
@@ -1360,7 +1370,7 @@ mod contract_tests {
         // a single cue still gets three back — so every leaf is a wrong-length reply and keeps its
         // source. (One line back would have MATCHED a split-to-one batch and translated it.)
         let up = fake(|_: &[String]| Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
-        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume)).await;
+        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume), &no_progress).await;
         assert!(out.is_err(), "a film that translated nothing is not a translation");
         assert_eq!(store.len(), 0, "a kept-source leaf was remembered as if it were a translation");
     }
@@ -1375,21 +1385,21 @@ mod contract_tests {
         // Echoes the source back: right length, no translation. Trips the ratio gate.
         let echo = |src: &[String]| Ok(src.to_vec());
 
-        let fresh = run_translation(&fake(echo), &film, Duration::from_secs(600), None).await;
+        let fresh = run_translation(&fake(echo), &film, Duration::from_secs(600), None, &no_progress).await;
         assert!(fresh.is_err(), "an echo is not a translation");
 
         // Same film, same echo, but with everything served from the store the second time.
         let store = MemStore::default();
         let resume = Resume { store: &store, prefix: "p".into() };
-        let _ = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume)).await;
-        let replayed = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume)).await;
+        let _ = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume), &no_progress).await;
+        let replayed = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume), &no_progress).await;
         assert!(replayed.is_err(), "a replayed echo passed the gate a fresh one failed");
     }
 
     /// The harness with a deadline long enough never to be the thing under test, and no batch store
     /// — these cases are about what the model does, so nothing may be answered from a previous run.
     async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, String> {
-        run_translation(up, cues, Duration::from_secs(600), None).await
+        run_translation(up, cues, Duration::from_secs(600), None, &no_progress).await
     }
 
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, String> {
@@ -1553,7 +1563,7 @@ mod contract_tests {
         }
         // 400 cues is 10 batches at 20ms each; the deadline expires partway, far under the budget.
         let up = Slow(Mutex::new(0));
-        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None).await;
+        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None, &no_progress).await;
         // It stops CALLING — that is the deadline's whole job. One 40-cue batch splits into up to
         // 79 calls, so a deadline checked only between batches would let all of them run first.
         assert!(*up.0.lock().unwrap() < 20, "it kept calling past the deadline");
@@ -1693,7 +1703,7 @@ mod contract_tests {
         // was never sent is not evidence about translation quality.
         let groups = 5;
         let deadline = Duration::from_millis(20 * groups);
-        let out = run_translation(&up, &cues(2000), deadline, None).await;
+        let out = run_translation(&up, &cues(2000), deadline, None, &no_progress).await;
 
         let called = *up.0.lock().unwrap();
         // Groups that fit inside the deadline, plus one: `spent()` is strictly-greater, so the group
@@ -2054,7 +2064,7 @@ mod contract_tests {
                 retry: Some(Duration::from_secs(3600)),
             })
         });
-        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None).await;
+        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &no_progress).await;
         assert!(out.is_err());
         assert_eq!(*up.calls.lock().unwrap(), 1, "an hour-long backoff was taken inside a ten-minute run");
     }
