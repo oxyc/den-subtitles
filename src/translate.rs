@@ -10,14 +10,26 @@
 //!     names, tone and register stay consistent across batch boundaries (this is what beats a
 //!     literal MT pass).
 //!
-//! Batches run sequentially: continuity (the rolling context) depends on the previous batch, and a
-//! ~30-60s background job for a full film is well within the click-and-wait UX. Cheap models
-//! (gpt-4o-mini / gemini-flash / haiku) clear the "good enough to follow the movie" bar here.
+//! Batches run a few at a time (CONCURRENCY), not one at a time. The rolling context is shared and
+//! snapshotted as each batch starts, so a batch sees whatever has landed rather than specifically
+//! its predecessor — continuity degrades at the very start of a film, where the first few batches
+//! overlap with nothing translated yet, and is otherwise unchanged. Cheap models (gpt-4o-mini /
+//! gemini-flash / haiku) clear the "good enough to follow the movie" bar here.
+//!
+//! The window is what keeps the two guards honest. `buffered` does not start a batch until it enters
+//! the window, so the deadline check at the top of `translate_batch` still gates entry and at most
+//! CONCURRENCY calls are ever past it; and the quality gate's argument — `kept` only grows, so it can
+//! never refuse a film the final verdict would have passed — never depended on batch order at all.
+//! What overlap costs there is precision, not soundness: a few batches are already in flight when the
+//! gate fires, bounded by the window's size.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
+
+use futures_util::stream::{self, StreamExt};
 
 use serde_json::{json, Value};
 
@@ -29,6 +41,10 @@ use crate::userconfig::{LlmConfig, Provider};
 const BATCH: usize = 40;
 /// How many prior (source → translation) pairs to carry forward for cross-batch consistency.
 const CONTEXT_WINDOW: usize = 6;
+/// Batches in flight at once. Four cuts a film's wall clock to roughly a quarter while keeping the
+/// load on the viewer's own provider key modest — the run is spending their rate limit, and a burst
+/// wide enough to trip it turns a fast translation into a retrying one.
+const CONCURRENCY: usize = 4;
 /// Per-batch upstream bound for an LLM/DeepL call (above the client default; a completion is slower
 /// than a metadata fetch but must still be bounded).
 const LLM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -127,52 +143,58 @@ async fn run_translation(
     resume: Option<&Resume<'_>>,
 ) -> Result<Vec<Cue>, String> {
     let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
-    // Rolling context: the tail of already-translated pairs, refreshed as we go.
-    let mut context: Vec<(String, String)> = Vec::new();
+    // Rolling context: the tail of already-translated pairs, refreshed as batches land. Shared
+    // rather than owned now that batches overlap — each one snapshots what has finished so far.
+    // The lock is never held across an await, so a batch waits for no other batch.
+    let context: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
     // A wrong-length reply degrades to keeping the source text, which is right for one stray cue and
     // wrong for a film: a consistently misbehaving model hits that leaf for every cue and returns the
     // untranslated original, which then caches for 60 days as a successful translation.
     let budget = Budget {
         untranslated: AtomicUsize::new(0),
-        started: std::time::Instant::now(),
+        started: tokio::time::Instant::now(),
         deadline,
     };
 
-    for batch in cues.chunks(BATCH) {
-        // Calls were counted but never timed, and batches run in sequence at up to LLM_TIMEOUT
-        // each — so the permitted ceiling was measured in hours, long after the viewer gave up,
-        // still spending their key.
-        let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let translated = translate_batch(upstream, &sources, &context, &budget, resume).await?;
+    // Batches overlap, up to CONCURRENCY of them. `buffered` IS the bound — a batch's future does
+    // not start until it enters the window — which is what keeps the two guards below meaningful:
+    // the deadline is checked as a batch starts, so at most CONCURRENCY calls can ever be past it,
+    // and dropping this stream cancels whatever is still in flight.
+    //
+    // Results arrive in batch order regardless of which finished first, so a cue can never be
+    // reassembled against another cue's timing.
+    // Built eagerly (an async fn is lazy — constructing the future runs nothing) rather than through
+    // `StreamExt::map`, whose closure has to be generic over the item lifetime and cannot be, since
+    // every batch borrows the one `cues` slice.
+    let pending: Vec<_> = cues
+        .chunks(BATCH)
+        .map(|batch| one_batch(upstream, batch, &context, &budget, resume))
+        .collect();
+    let mut stream = stream::iter(pending).buffered(CONCURRENCY);
+
+    while let Some(batch) = stream.next().await {
+        let (batch, translated) = batch?;
         for (cue, text) in batch.iter().zip(translated) {
-            // Only a pair that actually CHANGED goes into the context. An unchanged one is either a
-            // name that legitimately stays put or a cue the model failed on and we fell back to
-            // source — and from here those are indistinguishable. The context is rendered into the
-            // next prompt as "already translated, do not re-translate", so handing it a failure
-            // presents that failure as precedent and invites the model to repeat it on the same
-            // word later in the film. An identity pair teaches it almost nothing anyway.
-            if text.trim() != cue.text.trim() {
-                context.push((cue.text.clone(), text.clone()));
-            }
             out.push(Cue { text, ..cue.clone() });
         }
-        if context.len() > CONTEXT_WINDOW {
-            context.drain(..context.len() - CONTEXT_WINDOW);
-        }
-        // Bail early on a film that is clearly not being translated: a wrong-length model costs
-        // 2n-1 calls a batch, so running to the end means thousands of paid calls to learn what the
-        // opening showed. Only after a real sample, though — the first batch is title cards and
-        // song lyrics, the harshest forty cues in the film.
-        let kept = budget.untranslated.load(Ordering::Relaxed);
-        // Bail early only when the verdict is already decided — that is, when the dead count alone
-        // exceeds the bar for the WHOLE film, so no amount of perfect translation in the cues still
-        // to come could rescue it. `kept` only grows, so this can never refuse a film the final
-        // verdict would have passed.
+        // Bail on a film that is clearly not being translated: a wrong-length model costs 2n-1 calls
+        // a batch, so running to the end means thousands of paid calls to learn what the opening
+        // showed.
+        //
+        // Bail only when the verdict is already decided — when the dead count alone exceeds the bar
+        // for the WHOLE film, so no amount of perfect translation in the cues still to come could
+        // rescue it. `kept` only grows, so this can never refuse a film the final verdict would have
+        // passed, and that argument does not depend on the order batches finish in.
         //
         // Judging the sample against itself is what cannot be done here: three batches of a
         // name-dense opening is not evidence about the ninety batches after it, and doing that
         // refused films whose true ratio was nowhere near the bar.
+        //
+        // What concurrency costs is precision, not soundness: up to CONCURRENCY-1 batches are
+        // already in flight when this fires, and they are cancelled unpaid only if they have not
+        // been sent yet. That is the price of the window, and it is bounded by its size.
+        let kept = budget.untranslated.load(Ordering::Relaxed);
         if unusable(kept, cues.len()) {
             return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
         }
@@ -181,6 +203,44 @@ async fn run_translation(
     // count and the same denominator, so a second one could never reach a different answer.
     debug_assert_eq!(out.len(), cues.len());
     Ok(out)
+}
+
+/// One batch: snapshot the context, translate, fold what changed back in. Returned with the cues it
+/// covers so the caller can reassemble against the right timings.
+///
+/// A named function rather than an inline async block only because an async block capturing a borrow
+/// of `cues` here cannot be inferred at the higher-ranked lifetime `StreamExt::map` wants.
+async fn one_batch<'c>(
+    upstream: &(dyn BatchCall + Sync),
+    batch: &'c [Cue],
+    context: &Mutex<Vec<(String, String)>>,
+    budget: &Budget,
+    resume: Option<&Resume<'_>>,
+) -> Result<(&'c [Cue], Vec<String>), String> {
+    let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+    // A snapshot of what has landed so far. The lock is released before the call — holding it across
+    // the await would serialize the batches straight back into a queue.
+    let snapshot = context.lock().unwrap().clone();
+    let translated = translate_batch(upstream, &sources, &snapshot, budget, resume).await?;
+    {
+        let mut ctx = context.lock().unwrap();
+        for (cue, text) in batch.iter().zip(translated.iter()) {
+            // Only a pair that actually CHANGED goes into the context. An unchanged one is either a
+            // name that legitimately stays put or a cue the model failed on and we fell back to
+            // source — and from here those are indistinguishable. The context is rendered into the
+            // next prompt as "already translated, do not re-translate", so handing it a failure
+            // presents that failure as precedent and invites the model to repeat it on the same word
+            // later in the film. An identity pair teaches it almost nothing anyway.
+            if text.trim() != cue.text.trim() {
+                ctx.push((cue.text.clone(), text.clone()));
+            }
+        }
+        let len = ctx.len();
+        if len > CONTEXT_WINDOW {
+            ctx.drain(..len - CONTEXT_WINDOW);
+        }
+    }
+    Ok((batch, translated))
 }
 
 /// Wall-clock ceiling for one film. Well past a healthy run (~30 sequential calls) and well short
@@ -220,7 +280,11 @@ fn unusable(kept: usize, seen: usize) -> bool {
 /// is actually reachable, so time is the bound that is kept.
 struct Budget {
     untranslated: AtomicUsize,
-    started: std::time::Instant,
+    /// Tokio's clock rather than `std`'s. Unpaused the two are the same thing, but the deadline is
+    /// now the only bound on a run that concurrency made faster than the wall clock it was tuned
+    /// against, and a test cannot drive a `std::time::Instant` — it would have to sleep for real and
+    /// hope, which is how a timing test becomes a flaky one.
+    started: tokio::time::Instant,
     deadline: Duration,
 }
 
@@ -981,6 +1045,47 @@ mod contract_tests {
         }
     }
 
+    /// Batches overlap, and the overlap is bounded. Unbounded fan-out on one BYOK key is a
+    /// guaranteed rate limit; none at all is a film taking four times as long as it needs to.
+    ///
+    /// Order is the other half: results must be reassembled in batch order however they finish, or a
+    /// cue lands on another cue's timing — the one corruption this harness exists to make impossible.
+    #[tokio::test(start_paused = true)]
+    async fn batches_overlap_but_only_so_many() {
+        struct Counting {
+            live: AtomicUsize,
+            peak: AtomicUsize,
+        }
+        impl BatchCall for Counting {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                let out: Vec<String> = sources.iter().map(|t| format!("T:{t}")).collect();
+                Box::pin(async move {
+                    // Long enough that a sequential harness could not overlap by accident.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    self.live.fetch_sub(1, Ordering::SeqCst);
+                    Ok(out)
+                })
+            }
+        }
+
+        let up = Counting { live: AtomicUsize::new(0), peak: AtomicUsize::new(0) };
+        // 400 cues is 10 batches — comfortably more than the window, so the window is what bounds it.
+        let out = run_translation_t(&up, &cues(400)).await.expect("a healthy provider must finish");
+
+        assert_eq!(up.peak.load(Ordering::SeqCst), CONCURRENCY, "the window was not the bound");
+        assert_eq!(out.len(), 400);
+        for (i, cue) in out.iter().enumerate() {
+            assert_eq!(cue.text, format!("T:line {i}"), "cue {i} was reassembled out of order");
+            assert_eq!(cue.index, i as u32 + 1, "cue {i} lost its index");
+        }
+    }
+
     /// A film that dies partway must not be re-bought from the start. The completed batches are
     /// remembered, so the retry pays only for what actually failed — before this, a run that died on
     /// the last batch threw away every translated cue before it and charged the viewer's key again
@@ -1066,7 +1171,7 @@ mod contract_tests {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
         let budget = Budget {
             untranslated: AtomicUsize::new(0),
-            started: std::time::Instant::now(),
+            started: tokio::time::Instant::now(),
             deadline: Duration::from_secs(600),
         };
         translate_batch(upstream, &src, &[], &budget, None).await
@@ -1196,7 +1301,11 @@ mod contract_tests {
     /// Calls were counted but never timed, and batches run in sequence at up to LLM_TIMEOUT each,
     /// so the permitted ceiling ran to hours — long after the viewer gave up, still spending their
     /// key. A run stops when its wall clock does, whatever the call count says.
-    #[tokio::test]
+    ///
+    /// Still true with batches overlapping: `buffered` does not start a batch's future until it
+    /// enters the window, so the deadline check at the top of `translate_batch` still gates entry
+    /// and at most CONCURRENCY calls can be past it at once.
+    #[tokio::test(start_paused = true)]
     async fn a_run_stops_when_its_deadline_passes() {
         // A call that takes real time, the way a provider does.
         struct Slow(Mutex<usize>);
@@ -1330,7 +1439,7 @@ mod contract_tests {
     /// translates the opening, the clock runs out, and the rest is never sent — folding those
     /// never-attempted cues into the same counter as legitimate unchanged ones put a 66%
     /// source-language track just under the bar, served and cached for sixty days.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slow_but_correct_provider_does_not_produce_a_half_translated_film() {
         struct Slow(Mutex<usize>);
         impl BatchCall for Slow {
@@ -1349,13 +1458,32 @@ mod contract_tests {
             }
         }
         let up = Slow(Mutex::new(0));
-        // 2000 cues is 50 batches at 20ms. The clock is set to run out well past halfway, so the
-        // skipped share lands UNDER the two-thirds bar — which is the whole point: at 80% skipped
-        // the ratio would refuse it anyway and prove nothing. 13a measured the live case at 66.0%.
-        let out = run_translation(&up, &cues(2000), Duration::from_millis(600), None).await;
+        // 2000 cues is 50 batches at 20ms, CONCURRENCY of them at a time — so the clock advances
+        // 20ms per group of CONCURRENCY. Under paused time that is exact: a 100ms deadline lets
+        // 5 groups through and stops the rest.
+        //
+        // The skipped share has to land UNDER the two-thirds bar, which is the whole point: at 80%
+        // skipped the ratio would refuse the film anyway and prove nothing. Here 20 of 50 batches
+        // are sent, so 60% is never attempted — under the bar, and still refused, because a cue that
+        // was never sent is not evidence about translation quality.
+        let groups = 5;
+        let deadline = Duration::from_millis(20 * groups);
+        let out = run_translation(&up, &cues(2000), deadline, None).await;
+
         let called = *up.0.lock().unwrap();
+        // Groups that fit inside the deadline, plus one: `spent()` is strictly-greater, so the group
+        // that starts exactly ON the deadline is still let through.
+        let sent = (groups as usize + 1) * CONCURRENCY;
         assert!(called < 50, "it kept calling past the deadline ({called} calls)");
+        assert!(called <= sent, "more batches went out than the deadline allowed ({called} calls)");
         assert!(called > 10, "the deadline tripped too early to test the ratio ({called} calls)");
+        // Under the two-thirds bar on skipped share, so only the "never sent is not unchanged" rule
+        // can refuse this film.
+        assert!(
+            (50 - called) * 3 < 50 * 2,
+            "{} of 50 batches skipped is over the ratio bar, so this proves nothing",
+            50 - called
+        );
         assert!(out.is_err(), "a film that was mostly never sent must not be served: {out:?}");
     }
 
