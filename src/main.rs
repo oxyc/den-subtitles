@@ -14,6 +14,7 @@ mod cache;
 mod config;
 mod fetch;
 mod httputil;
+mod inflight;
 mod opensubtitles;
 mod seal;
 mod srt;

@@ -383,6 +383,25 @@ async fn sync_and_cache(
         return httputil::srt_provisional(target);
     }
 
+    // One tier binary per key at a time. Concurrent requests for the same alignment were each
+    // spawning their own — a 90s alass run against the same stream, on a runtime with one thread —
+    // and the scratch-file tag below only made that safe, never rare.
+    let _flight = if wanted_sync {
+        let guard = state.inflight.acquire(&cache_key).await;
+        // Settled while we waited: the alignment we were about to run has already been run.
+        if let Some(hit) = state.cache.get(&cache_key) {
+            return httputil::srt(hit);
+        }
+        // And it may have failed while we waited, in which case re-running it now is the retry the
+        // marker exists to prevent.
+        if state.cache.get(&retry_marker).is_some() {
+            return httputil::srt_provisional(target);
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
     // Per-invocation unique temp tag: two concurrent requests for the same file must not share
     // scratch paths (one would read the other's half-written output and cache it for 60 days).
     let tag = format!("{}-{}", cache_key.replace(':', "-"), SYNC_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -717,16 +736,26 @@ pub async fn handle_translate(
         // this film reuses it.
         let translated = match state.cache.get(&body_key) {
             Some(body) => body,
-            None => match produce_translation(state, &client, llm, source.file_id, &lang, &body_key).await {
-                Ok(body) => body,
-                Err(e) => {
-                    // Log the detail (no key in these strings); hand the client a generic message
-                    // rather than echoing a raw upstream error body.
-                    eprintln!("translate: {imdb} → {lang} failed: {e}");
-                    state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-                    return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+            None => {
+                // One film, one bill. Two devices on the same title — or a second tap during a run
+                // that legitimately takes minutes — each used to start their own full translation,
+                // because a cache only collapses work that has already finished.
+                let _flight = state.inflight.acquire(&body_key).await;
+                match state.cache.get(&body_key) {
+                    // Produced while we waited. This is the branch the whole guard exists for.
+                    Some(body) => body,
+                    None => match produce_translation(state, &client, llm, source.file_id, &lang, &body_key).await {
+                        Ok(body) => body,
+                        Err(e) => {
+                            // Log the detail (no key in these strings); hand the client a generic
+                            // message rather than echoing a raw upstream error body.
+                            eprintln!("translate: {imdb} → {lang} failed: {e}");
+                            state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
+                            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+                        }
+                    },
                 }
-            },
+            }
         };
         // The cheap half. Run here even for the `.json` form so the engine's follow-up fetch is a
         // cache hit rather than an ffsubsync spawn with the viewer waiting on it.

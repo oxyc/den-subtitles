@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::cache::Cache;
 use crate::config::Config;
+use crate::inflight::InFlight;
 use crate::seal::Keyring;
 use crate::sync::SyncTools;
 
@@ -19,6 +20,9 @@ pub struct AppState {
     /// serve; the subtitle/translate routes 503 instead of the whole process refusing to boot.
     pub http: Option<reqwest::Client>,
     pub cache: Cache,
+    /// One worker per cache key for the two expensive jobs (an LLM translation, a sync subprocess).
+    /// The cache only collapses work that has already finished; this collapses work in progress.
+    pub inflight: InFlight,
     pub sync: SyncTools,
     /// Consecutive OpenSubtitles search failures — surfaced as `degraded` on /health (ADDON-02).
     pub os_fails: AtomicU32,
@@ -56,6 +60,14 @@ impl AppState {
                 None
             }
         };
-        Arc::new(AppState { cfg, config_keyring, http, cache, sync, os_fails: AtomicU32::new(0) })
+        Arc::new(AppState {
+            cfg,
+            config_keyring,
+            http,
+            cache,
+            inflight: InFlight::default(),
+            sync,
+            os_fails: AtomicU32::new(0),
+        })
     }
 }
