@@ -247,16 +247,32 @@ pub async fn handle_subtitles(
     httputil::json(StatusCode::OK, &json!({"subtitles": out}), "public, max-age=3600, stale-while-revalidate=3600")
 }
 
-/// The `file_id` of a trusted timing reference for Tier-1 reference alignment: any hash-matched sub,
-/// authored against this exact encode, so its timing is correct by construction (language doesn't
-/// matter — timing is language-independent).
+/// The `file_id` of a trusted timing reference for Tier-1 reference alignment: the BEST hash-matched
+/// sub, authored against this exact encode, so its timing is correct by construction (language
+/// doesn't matter — timing is language-independent).
+///
+/// Best, not first. This runs after `rank`, which sorts by language ascending, so taking the first
+/// hash match took the one belonging to the alphabetically-lowest language code — Arabic before
+/// English. Every hash match is equally correct about timing, but they are not equally useful AS a
+/// reference: a hash-matched forced/signs-only track is a handful of cues, and handing ffsubsync a
+/// near-empty reference produces a bad alignment that then caches for sixty days. `fit_score` has no
+/// cue count to work from, but trust/ratings/downloads separate a full dialogue track from a signs
+/// track well enough.
+///
+/// `Reverse` + `min_by_key` rather than `max_by_key`: both pick a highest score, but `max_by_key`
+/// returns the LAST of equal maxima and `min_by_key` the first. Ties are common here (two untrusted,
+/// unrated hash matches), and the anchor decides the `?ref=` in every URL we hand back — so it has to
+/// be the same choice on every request over the same cached list, not merely a valid one.
 ///
 /// `None` when the search produced no hash match at all. That is the gap behind the out-of-sync
 /// complaint: with no trusted anchor we deliberately do NOT align to an untrusted sub (that could
 /// make timing worse), so those subs are served as-is and only the Tier-2 audio resync — a user
 /// action, see `is_safe_resync_url` — can fix them.
 fn tier1_reference(subs: &[opensubtitles::Subtitle]) -> Option<i64> {
-    subs.iter().find(|s| s.hash_match).map(|s| s.file_id)
+    subs.iter()
+        .filter(|s| s.hash_match)
+        .min_by_key(|s| std::cmp::Reverse(opensubtitles::fit_score(s, None)))
+        .map(|s| s.file_id)
 }
 
 /// The reference `s` should be Tier-1 aligned against on fetch (`?ref=`), or `None` when it needs no
@@ -623,8 +639,32 @@ mod tests {
     fn tier1_reference_is_the_hash_match_or_none() {
         // No hash match anywhere → no anchor. This is the out-of-sync gap: Tier-1 can't run.
         assert_eq!(tier1_reference(&[sub(1, false), sub(2, false)]), None);
-        // A hash match becomes the anchor (the first one encountered).
+        // A hash match becomes the anchor, and a non-match never does.
         assert_eq!(tier1_reference(&[sub(1, false), sub(2, true), sub(3, true)]), Some(2));
+        // Among equally-scoring hash matches the choice is the FIRST, and it is stable: the anchor
+        // decides the `?ref=` in every URL handed back, so it must be the same answer every time the
+        // same cached list is ranked, not merely a valid one.
+        assert_eq!(tier1_reference(&[sub(3, true), sub(2, true), sub(1, true)]), Some(3));
+    }
+
+    /// The anchor is the BEST hash match, not the first one in language order. `tier1_reference`
+    /// runs after `rank` sorts by language ascending, so `find` handed ffsubsync whichever hash match
+    /// belonged to the alphabetically-lowest language code — and a hash-matched forced/signs-only
+    /// track is a handful of cues, which makes a poor reference and a bad alignment that then caches
+    /// for sixty days.
+    #[test]
+    fn the_anchor_is_the_best_hash_match_not_the_first() {
+        // A sparse signs track (first in language order) must lose to a well-used dialogue track.
+        let signs = Subtitle { downloads: 3, ..sub(1, true) };
+        let dialogue = Subtitle { downloads: 50_000, from_trusted: true, ..sub(2, true) };
+        assert_eq!(tier1_reference(&[signs.clone(), dialogue.clone()]), Some(2));
+        // And the order it arrives in doesn't change the answer.
+        assert_eq!(tier1_reference(&[dialogue, signs]), Some(2));
+
+        // A non-hash sub never becomes the anchor, however popular — being the same encode is the
+        // whole claim, and downloads are not evidence of that.
+        let popular_guess = Subtitle { downloads: 999_999, from_trusted: true, ..sub(9, false) };
+        assert_eq!(tier1_reference(&[popular_guess, sub(4, true)]), Some(4));
     }
 
     #[test]
