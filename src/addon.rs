@@ -563,7 +563,12 @@ async fn produce_translation(
     let source = opensubtitles::best_for(&subs, "en")
         .or_else(|| subs.first())
         .ok_or("no source subtitle to translate")?;
-    let raw = client.download(source.file_id).await?;
+    // Through the cache, not straight at the API. A `/download` call spends one of the viewer's
+    // daily OpenSubtitles credits on the CALL, not on the file fetch — and dodging that quota is the
+    // reason the proxy-and-cache design exists at all. Going direct re-paid for a file already
+    // sitting under `os:{file_id}`: once per retry after the ten-minute backoff, and once more for
+    // every additional target language of the same film.
+    let raw = subtitle_srt(state, &client, source.file_id).await?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
         return Err("source subtitle was empty".into());
