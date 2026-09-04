@@ -36,6 +36,66 @@ const LLM_TIMEOUT: Duration = Duration::from_secs(120);
 /// pathological/hostile SRT that would run unbounded (cost, wall-clock), so we refuse it.
 const MAX_CUES: usize = 6000;
 
+/// Where a finished batch is remembered between runs, so a film that dies at cue 1100 of 1200 does
+/// not re-buy the 1100 that worked. A trait rather than the cache itself, so the harness tests can
+/// drive the resume path without a disk tier.
+pub trait BatchStore: Sync {
+    fn get(&self, key: &str) -> Option<String>;
+    fn put(&self, key: String, value: String);
+}
+
+/// Batches are remembered only long enough to rescue a retry, not for the life of the finished
+/// translation. Once the whole film is cached under its own key these are redundant, and a film is
+/// ~150 of them — keeping a second copy of every translation for two months is a poor trade for a
+/// resume window. A day covers "it failed, I tried again this evening"; the ten-minute failure
+/// backoff means the retries that matter arrive far sooner than that.
+const BATCH_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+
+impl BatchStore for crate::cache::Cache {
+    fn get(&self, key: &str) -> Option<String> {
+        crate::cache::Cache::get(self, key)
+    }
+    fn put(&self, key: String, value: String) {
+        crate::cache::Cache::put(self, key, value, BATCH_TTL);
+    }
+}
+
+/// A store plus the prefix that scopes keys to one (provider, model, language). Without the prefix a
+/// DeepL batch and a GPT batch of the same lines would be the same entry.
+struct Resume<'a> {
+    store: &'a dyn BatchStore,
+    prefix: String,
+}
+
+/// Identity of one batch's translation: the exact source lines it covers.
+fn batch_key(prefix: &str, sources: &[String]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Length-delimited so ["ab","c"] cannot hash the same as ["a","bc"]. `str`'s own Hash impl
+    // already delimits, but a batch key naming the wrong lines would serve one scene's dialogue over
+    // another's, so it is spelled out rather than relied upon.
+    sources.len().hash(&mut h);
+    for s in sources {
+        s.len().hash(&mut h);
+        s.hash(&mut h);
+    }
+    format!("batch:{prefix}:{:016x}", h.finish())
+}
+
+/// How many of these translations came back unusable — blank, or an echo of the source. A blank
+/// source has nothing to translate, so it is never counted against the model.
+///
+/// One function because the live path and the resume path must score a batch identically: a film
+/// that was half-translated before a crash has to reach the same verdict on retry as it would have
+/// reached in one run.
+fn dead_count(translated: &[String], sources: &[String]) -> usize {
+    translated
+        .iter()
+        .zip(sources.iter())
+        .filter(|(t, s)| !s.trim().is_empty() && (t.trim().is_empty() || t.trim() == s.trim()))
+        .count()
+}
+
 /// Translate every cue's text into `target_lang` (a display name like "English"), preserving each
 /// cue's index/timing. Returns the same cues with translated `text`, or an error string.
 pub async fn translate(
@@ -43,6 +103,7 @@ pub async fn translate(
     llm: &LlmConfig,
     cues: &[Cue],
     target_lang: &str,
+    store: &dyn BatchStore,
 ) -> Result<Vec<Cue>, String> {
     if cues.is_empty() {
         return Ok(Vec::new());
@@ -50,7 +111,11 @@ pub async fn translate(
     if cues.len() > MAX_CUES {
         return Err(format!("subtitle too large: {} cues (max {MAX_CUES})", cues.len()));
     }
-    run_translation(&Upstream { client, llm, target_lang }, cues, RUN_DEADLINE).await
+    let resume = Resume {
+        store,
+        prefix: format!("{}:{}:{}", llm.provider.tag(), llm.model, canonical_lang(target_lang)),
+    };
+    run_translation(&Upstream { client, llm, target_lang }, cues, RUN_DEADLINE, Some(&resume)).await
 }
 
 /// The harness proper, over any upstream. Split from `translate` so the same-length contract and the
@@ -59,6 +124,7 @@ async fn run_translation(
     upstream: &(dyn BatchCall + Sync),
     cues: &[Cue],
     deadline: Duration,
+    resume: Option<&Resume<'_>>,
 ) -> Result<Vec<Cue>, String> {
     let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Rolling context: the tail of already-translated pairs, refreshed as we go.
@@ -78,7 +144,7 @@ async fn run_translation(
         // each — so the permitted ceiling was measured in hours, long after the viewer gave up,
         // still spending their key.
         let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let translated = translate_batch(upstream, &sources, &context, &budget).await?;
+        let translated = translate_batch(upstream, &sources, &context, &budget, resume).await?;
         for (cue, text) in batch.iter().zip(translated) {
             // Only a pair that actually CHANGED goes into the context. An unchanged one is either a
             // name that legitimately stays put or a cue the model failed on and we fell back to
@@ -235,9 +301,26 @@ async fn translate_batch(
     sources: &[String],
     context: &[(String, String)],
     budget: &Budget,
+    resume: Option<&Resume<'_>>,
 ) -> Result<Vec<String>, String> {
     if sources.is_empty() {
         return Ok(Vec::new());
+    }
+    // Already bought, in some earlier run of this film that did not reach the end. Checked before
+    // the deadline below on purpose: replaying what is already paid for costs nothing, and refusing
+    // it would make a resumed run fail in exactly the place the previous one did.
+    let key = resume.map(|r| batch_key(&r.prefix, sources));
+    if let (Some(r), Some(k)) = (resume, key.as_ref()) {
+        if let Some(cached) = r.store.get(k).and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()) {
+            // Length is re-checked rather than trusted: the same-length contract is the one thing
+            // holding cue and timing together, and a stored entry is as untrusted as a model reply.
+            if cached.len() == sources.len() {
+                // Scored exactly as a live reply would be, so a resumed film reaches the same
+                // verdict as one translated in a single run.
+                budget.untranslated.fetch_add(dead_count(&cached, sources), Ordering::Relaxed);
+                return Ok(cached);
+            }
+        }
     }
     // Out of money or out of time. The run did not finish, and saying so is the only honest answer:
     // a cue that was never sent is not evidence about translation quality, it is the absence of
@@ -257,27 +340,34 @@ async fn translate_batch(
 
     match result {
         Ok(v) if v.len() == sources.len() => {
-            // The right length is not the same as a translation. An echo of the source, or blanks,
-            // satisfies the count — and a cheap model does exactly that when the target language is
-            // a typo. Counted rather than rejected: a batch that legitimately matches (names,
-            // numbers, "OK") costs nothing, while a film-wide echo trips the gate.
-            let dead = v
-                .iter()
-                .zip(sources.iter())
-                .filter(|(t, s)| !s.trim().is_empty() && (t.trim().is_empty() || t.trim() == s.trim()))
-                .count();
-            budget.untranslated.fetch_add(dead, Ordering::Relaxed);
             // A blanked line is shipped as its source, the same choice the wrong-length leaf makes:
             // an untranslated line still shows the original language, a blank one shows nothing.
-            // Counting it above and then serving the blank anyway was the gap — below the ratio,
-            // those cues rendered empty in an otherwise successful film.
-            Ok(v.into_iter()
+            // Counting it and then serving the blank anyway was the gap — below the ratio, those
+            // cues rendered empty in an otherwise successful film.
+            let out: Vec<String> = v
+                .into_iter()
                 .zip(sources.iter())
                 // A blank source has nothing to translate, so anything the model invented for it is
                 // not a translation — it is a line the film does not contain. Both directions of
                 // blankness resolve to the source.
                 .map(|(t, s)| if t.trim().is_empty() || s.trim().is_empty() { s.clone() } else { t })
-                .collect())
+                .collect();
+            // The right length is not the same as a translation. An echo of the source, or blanks,
+            // satisfies the count — and a cheap model does exactly that when the target language is
+            // a typo. Counted rather than rejected: a batch that legitimately matches (names,
+            // numbers, "OK") costs nothing, while a film-wide echo trips the gate. Scored after the
+            // substitution above, which is score-neutral — a blank became its source, and both count
+            // as dead — and lets the resume path score the stored value the same way.
+            budget.untranslated.fetch_add(dead_count(&out, sources), Ordering::Relaxed);
+            // Remember it, so a run that dies later does not buy this batch again. Only this arm:
+            // the degraded leaves below kept the source text because the model would not cooperate,
+            // and storing that would turn one bad minute into a day of never retrying it.
+            if let (Some(r), Some(k)) = (resume, key) {
+                if let Ok(json) = serde_json::to_string(&out) {
+                    r.store.put(k, json);
+                }
+            }
+            Ok(out)
         }
         // A contract violation splits; an upstream refusal does not — splitting on that spent six
         // more calls against a provider that had just said no, with no backoff, before failing anyway.
@@ -286,8 +376,8 @@ async fn translate_batch(
             // don't thread the first half's output into the second here — keeps the split simple.
             let mid = sources.len() / 2;
             // Box the recursive futures — an async fn can't hold an unboxed future of itself.
-            let mut left = Box::pin(translate_batch(upstream, &sources[..mid], context, budget)).await?;
-            let right = Box::pin(translate_batch(upstream, &sources[mid..], context, budget)).await?;
+            let mut left = Box::pin(translate_batch(upstream, &sources[..mid], context, budget, resume)).await?;
+            let right = Box::pin(translate_batch(upstream, &sources[mid..], context, budget, resume)).await?;
             left.extend(right);
             Ok(left)
         }
@@ -798,9 +888,104 @@ mod contract_tests {
         Fake { reply, calls: Mutex::new(0) }
     }
 
-    /// The harness with a deadline long enough never to be the thing under test.
+    /// A batch store in memory, so the resume path is testable without a disk tier.
+    #[derive(Default)]
+    struct MemStore(Mutex<std::collections::HashMap<String, String>>);
+
+    impl BatchStore for MemStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.lock().unwrap().get(key).cloned()
+        }
+        fn put(&self, key: String, value: String) {
+            self.0.lock().unwrap().insert(key, value);
+        }
+    }
+
+    impl MemStore {
+        fn len(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+    }
+
+    /// A film that dies partway must not be re-bought from the start. The completed batches are
+    /// remembered, so the retry pays only for what actually failed — before this, a run that died on
+    /// the last batch threw away every translated cue before it and charged the viewer's key again
+    /// from cue one.
+    #[tokio::test]
+    async fn a_failed_run_resumes_instead_of_re_buying_what_worked() {
+        let store = MemStore::default();
+        let resume = Resume { store: &store, prefix: "openai:m:SV".into() };
+        let film = cues(120); // three batches of BATCH=40
+
+        // First attempt: the provider refuses once the third batch comes round. An Upstream refusal
+        // is not split-retried, so this is exactly one failed call after two good ones.
+        let up = fake(|src: &[String]| {
+            if src[0] == "line 80" {
+                return Err(CallError::Upstream("provider 429".into()));
+            }
+            Ok(src.iter().map(|s| format!("SV {s}")).collect())
+        });
+        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume)).await;
+        assert!(first.is_err(), "the run should have failed on the third batch");
+        assert_eq!(*up.calls.lock().unwrap(), 3, "two good batches and the refusal");
+        assert_eq!(store.len(), 2, "the two paid batches should have been remembered");
+
+        // Second attempt, provider healthy. Only the batch that failed may reach it.
+        let up2 = fake(|src: &[String]| Ok(src.iter().map(|s| format!("SV {s}")).collect()));
+        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume))
+            .await
+            .expect("the retry should finish");
+        assert_eq!(*up2.calls.lock().unwrap(), 1, "the retry re-bought batches it already had");
+
+        // And the film is whole, in order — a resumed run is not a half-translated one.
+        assert_eq!(done.len(), 120);
+        for (i, cue) in done.iter().enumerate() {
+            assert_eq!(cue.text, format!("SV line {i}"), "cue {i} came back wrong");
+            assert_eq!(cue.start, film[i].start, "cue {i} lost its timing");
+        }
+    }
+
+    /// The degraded leaves must NOT be remembered. Keeping the source text is what the harness does
+    /// when the model will not cooperate on a single cue; storing that would turn one bad minute into
+    /// a day of serving it back without ever retrying.
+    #[tokio::test]
+    async fn a_kept_source_is_not_remembered_as_a_translation() {
+        let store = MemStore::default();
+        let resume = Resume { store: &store, prefix: "p".into() };
+        // Always three lines, whatever it was asked for. A two-cue batch splits to single cues, and
+        // a single cue still gets three back — so every leaf is a wrong-length reply and keeps its
+        // source. (One line back would have MATCHED a split-to-one batch and translated it.)
+        let up = fake(|_: &[String]| Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume)).await;
+        assert!(out.is_err(), "a film that translated nothing is not a translation");
+        assert_eq!(store.len(), 0, "a kept-source leaf was remembered as if it were a translation");
+    }
+
+    /// A resumed run must reach the same verdict as one done in a single pass. The quality gate
+    /// counts unusable cues, and a batch answered from the store has to be scored the same way the
+    /// live reply was — otherwise a film that echoed its source would pass on retry simply because
+    /// nothing recounted it.
+    #[tokio::test]
+    async fn a_resumed_run_scores_the_same_as_a_fresh_one() {
+        let film = cues(80);
+        // Echoes the source back: right length, no translation. Trips the ratio gate.
+        let echo = |src: &[String]| Ok(src.to_vec());
+
+        let fresh = run_translation(&fake(echo), &film, Duration::from_secs(600), None).await;
+        assert!(fresh.is_err(), "an echo is not a translation");
+
+        // Same film, same echo, but with everything served from the store the second time.
+        let store = MemStore::default();
+        let resume = Resume { store: &store, prefix: "p".into() };
+        let _ = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume)).await;
+        let replayed = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume)).await;
+        assert!(replayed.is_err(), "a replayed echo passed the gate a fresh one failed");
+    }
+
+    /// The harness with a deadline long enough never to be the thing under test, and no batch store
+    /// — these cases are about what the model does, so nothing may be answered from a previous run.
     async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, String> {
-        run_translation(up, cues, Duration::from_secs(600)).await
+        run_translation(up, cues, Duration::from_secs(600), None).await
     }
 
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, String> {
@@ -810,7 +995,7 @@ mod contract_tests {
             started: std::time::Instant::now(),
             deadline: Duration::from_secs(600),
         };
-        translate_batch(upstream, &src, &[], &budget).await
+        translate_batch(upstream, &src, &[], &budget, None).await
     }
 
     /// A reply of the right LENGTH but the wrong SHAPE must not be accepted. `as_str()` on a non-string
@@ -960,7 +1145,7 @@ mod contract_tests {
         }
         // 400 cues is 10 batches at 20ms each; the deadline expires partway, far under the budget.
         let up = Slow(Mutex::new(0));
-        let out = run_translation(&up, &cues(400), Duration::from_millis(50)).await;
+        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None).await;
         // It stops CALLING — that is the deadline's whole job. One 40-cue batch splits into up to
         // 79 calls, so a deadline checked only between batches would let all of them run first.
         assert!(*up.0.lock().unwrap() < 20, "it kept calling past the deadline");
@@ -1093,7 +1278,7 @@ mod contract_tests {
         // 2000 cues is 50 batches at 20ms. The clock is set to run out well past halfway, so the
         // skipped share lands UNDER the two-thirds bar — which is the whole point: at 80% skipped
         // the ratio would refuse it anyway and prove nothing. 13a measured the live case at 66.0%.
-        let out = run_translation(&up, &cues(2000), Duration::from_millis(600)).await;
+        let out = run_translation(&up, &cues(2000), Duration::from_millis(600), None).await;
         let called = *up.0.lock().unwrap();
         assert!(called < 50, "it kept calling past the deadline ({called} calls)");
         assert!(called > 10, "the deadline tripped too early to test the ratio ({called} calls)");

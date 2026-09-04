@@ -571,7 +571,7 @@ fn translate_fail_key(
         "translate:{imdb}:{}:{}:{lang_key}:{}:{}",
         season.unwrap_or(0),
         episode.unwrap_or(0),
-        provider_tag(llm),
+        llm.provider.tag(),
         llm.model,
     )
 }
@@ -587,7 +587,7 @@ fn translate_fail_key(
 /// Keyed by provider+model too: stepping up to a bigger model to re-translate a title that read badly
 /// is meant to overwrite, and it can only do that if the model is part of the identity.
 fn translate_body_key(source_file_id: i64, lang_key: &str, llm: &LlmConfig) -> String {
-    format!("translate:{source_file_id}:{lang_key}:{}:{}", provider_tag(llm), llm.model)
+    format!("translate:{source_file_id}:{lang_key}:{}:{}", llm.provider.tag(), llm.model)
 }
 
 /// The subtitle to translate FROM: English for preference, best-quality otherwise.
@@ -812,22 +812,12 @@ async fn produce_translation(
     if cues.is_empty() {
         return Err("source subtitle was empty".into());
     }
-    let translated = translate::translate(client.http, llm, &cues, lang).await?;
+    // The cache doubles as the batch store: a run that dies at cue 1100 of 1200 leaves the 1100
+    // behind, so the retry the viewer is about to make re-buys only what actually failed.
+    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache).await?;
     let body = srt::serialize(&translated);
     state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
     Ok(body)
-}
-
-fn provider_tag(llm: &LlmConfig) -> &'static str {
-    use crate::userconfig::Provider::*;
-    match llm.provider {
-        OpenAI => "openai",
-        Anthropic => "anthropic",
-        Google => "google",
-        Xai => "xai",
-        OpenRouter => "openrouter",
-        DeepL => "deepl",
-    }
 }
 
 fn type_of(season: Option<i64>) -> &'static str {

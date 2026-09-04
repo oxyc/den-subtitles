@@ -30,6 +30,19 @@ impl Provider {
         })
     }
 
+    /// Stable short name for this provider. Goes into cache keys, so it is deliberately not the
+    /// Debug spelling: renaming a variant should not silently move every key that names it.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Provider::OpenAI => "openai",
+            Provider::Anthropic => "anthropic",
+            Provider::Google => "google",
+            Provider::Xai => "xai",
+            Provider::OpenRouter => "openrouter",
+            Provider::DeepL => "deepl",
+        }
+    }
+
     /// Sensible default model when the user leaves the field blank — the cheap/fast/decent tier.
     pub fn default_model(self) -> &'static str {
         match self {
