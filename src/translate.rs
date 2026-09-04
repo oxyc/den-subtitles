@@ -6,9 +6,15 @@
 //!   * each batch is sent as a JSON array of dialogue strings — timecodes/indices stay here;
 //!   * the reply MUST be a JSON array of the same length; a mismatch splits the batch and retries
 //!     (down to a single cue), so a merge/split/drop can never silently shift the rest of the film;
-//!   * a rolling window of the last few (source → translation) pairs rides along as context, so
-//!     names, tone and register stay consistent across batch boundaries (this is what beats a
-//!     literal MT pass).
+//!   * a glossary of the film's proper nouns and recurring terms, derived once up front, rides along
+//!     with every batch, together with a rolling window of the last few (source → translation)
+//!     pairs — so names, tone and register stay consistent across batch boundaries (this is what
+//!     beats a literal MT pass).
+//!
+//! The glossary pass is the one call that reads more than a batch. It does not weaken the contract
+//! above: what comes back is a term list, not a cue mapping, so nothing in that reply can renumber,
+//! merge or drop a cue — which is what "the model never sees the whole file" is there to guarantee.
+//! It is also best-effort throughout; a failed or unusable glossary is simply no glossary.
 //!
 //! Batches run a few at a time (CONCURRENCY), not one at a time. The rolling context is shared and
 //! snapshotted as each batch starts, so a batch sees whatever has landed rather than specifically
@@ -51,6 +57,13 @@ const LLM_TIMEOUT: Duration = Duration::from_secs(120);
 /// Ceiling on cues we'll translate for one title. A real film is ~1–3k cues; anything past this is a
 /// pathological/hostile SRT that would run unbounded (cost, wall-clock), so we refuse it.
 const MAX_CUES: usize = 6000;
+/// Characters of dialogue the glossary pass is allowed to read. A film is well under this; the cue
+/// ceiling above allows something several times larger, and one call carrying all of it would cost
+/// more than the translation it is meant to improve.
+const GLOSSARY_SAMPLE_CHARS: usize = 40_000;
+/// Terms kept from the glossary reply. Enough for a cast list and the invented vocabulary of a
+/// genre film, few enough that a model answering with a dictionary cannot inflate every later prompt.
+const MAX_GLOSSARY: usize = 60;
 
 /// Where a finished batch is remembered between runs, so a film that dies at cue 1100 of 1200 does
 /// not re-buy the 1100 that worked. A trait rather than the cache itself, so the harness tests can
@@ -157,6 +170,32 @@ async fn run_translation(
         deadline,
     };
 
+    // Terms the whole film has to agree on, derived once and pinned ahead of the rolling context in
+    // every batch. It is what carries a name from the third act back to the first, and it is what
+    // gives the opening batches — which now overlap, and so start with nothing translated yet — any
+    // continuity at all. Cached like a batch: a retry should not re-derive it.
+    let sample = glossary_sample(cues);
+    let glossary_key = resume.map(|r| batch_key(&format!("{}:glossary", r.prefix), &sample));
+    let glossary: Vec<(String, String)> = match (resume, glossary_key) {
+        (Some(r), Some(k)) => match r.store.get(&k).and_then(|s| serde_json::from_str(&s).ok()) {
+            Some(hit) => hit,
+            None => {
+                let built = upstream.glossary(&sample).await;
+                // Only a glossary that exists is worth remembering. "No glossary" is also what a
+                // failed or unparseable derivation returns, and storing that would hold a transient
+                // provider blip in place for a day — every retry that day translating the film
+                // without the terms it should have had.
+                if !built.is_empty() {
+                    if let Ok(json) = serde_json::to_string(&built) {
+                        r.store.put(k, json);
+                    }
+                }
+                built
+            }
+        },
+        _ => upstream.glossary(&sample).await,
+    };
+
     // Batches overlap, up to CONCURRENCY of them. `buffered` IS the bound — a batch's future does
     // not start until it enters the window — which is what keeps the two guards below meaningful:
     // the deadline is checked as a batch starts, so at most CONCURRENCY calls can ever be past it,
@@ -169,7 +208,7 @@ async fn run_translation(
     // every batch borrows the one `cues` slice.
     let pending: Vec<_> = cues
         .chunks(BATCH)
-        .map(|batch| one_batch(upstream, batch, &context, &budget, resume))
+        .map(|batch| one_batch(upstream, batch, &glossary, &context, &budget, resume))
         .collect();
     let mut stream = stream::iter(pending).buffered(CONCURRENCY);
 
@@ -213,14 +252,20 @@ async fn run_translation(
 async fn one_batch<'c>(
     upstream: &(dyn BatchCall + Sync),
     batch: &'c [Cue],
+    glossary: &[(String, String)],
     context: &Mutex<Vec<(String, String)>>,
     budget: &Budget,
     resume: Option<&Resume<'_>>,
 ) -> Result<(&'c [Cue], Vec<String>), String> {
     let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-    // A snapshot of what has landed so far. The lock is released before the call — holding it across
-    // the await would serialize the batches straight back into a queue.
-    let snapshot = context.lock().unwrap().clone();
+    // The glossary, then a snapshot of what has landed so far. Both render into the prompt as
+    // established pairs, so the glossary needs no separate plumbing — it is simply context that
+    // never rotates out. The lock is released before the call: holding it across the await would
+    // serialize the batches straight back into a queue.
+    let snapshot: Vec<(String, String)> = {
+        let ctx = context.lock().unwrap();
+        glossary.iter().chain(ctx.iter()).cloned().collect()
+    };
     let translated = translate_batch(upstream, &sources, &snapshot, budget, resume).await?;
     {
         let mut ctx = context.lock().unwrap();
@@ -360,6 +405,13 @@ fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap
     Some(Duration::from_secs(stated))
 }
 
+/// Terms the whole film agrees on, as (source → translation) pairs. Deliberately the same shape as
+/// the rolling context: the glossary is rendered into a prompt as established pairs that never
+/// rotate out, so it needs no plumbing of its own.
+type Glossary = Vec<(String, String)>;
+
+type GlossaryFuture<'a> = Pin<Box<dyn Future<Output = Glossary> + Send + 'a>>;
+
 /// One upstream call: a batch of source lines in, the same number of translated lines out (or an
 /// error). Taken as a parameter so the contract logic below is testable without a provider.
 trait BatchCall: Sync {
@@ -368,6 +420,60 @@ trait BatchCall: Sync {
         sources: &[String],
         context: &[(String, String)],
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>>;
+
+    /// Terms the whole film should agree on — proper nouns, forms of address, invented vocabulary —
+    /// derived once from a sample of the dialogue and then pinned into every batch's context.
+    ///
+    /// This is the one place a model sees more than a batch at a time, and it deliberately does not
+    /// touch the same-length contract: what comes back is a term list, not a cue mapping, so no
+    /// reply here can renumber, merge or drop a cue. That contract is what "the model never sees the
+    /// whole file" is protecting, and a glossary sits outside it.
+    ///
+    /// Best-effort by construction. The default is no glossary at all, which is what a provider with
+    /// no chat path uses and what keeps this out of the way of the contract tests.
+    fn glossary<'a>(
+        &'a self,
+        _sample: &'a [String],
+    ) -> GlossaryFuture<'a> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+/// The lines the glossary is derived from: the whole film when it fits, an even spread across it
+/// when it does not. Even, not the opening — a name introduced in the third act is exactly the one a
+/// rolling window of six pairs can never carry backwards, and the opening is the part the rolling
+/// context already covers.
+fn glossary_sample(cues: &[Cue]) -> Vec<String> {
+    let total: usize = cues.iter().map(|c| c.text.len() + 1).sum();
+    let stride = total.div_ceil(GLOSSARY_SAMPLE_CHARS).max(1);
+    cues.iter()
+        .step_by(stride)
+        .map(|c| c.text.clone())
+        .filter(|t| !t.trim().is_empty())
+        .collect()
+}
+
+/// Pull a `{"term": "translation"}` object out of a model reply, tolerating fences and prose the
+/// same way the array parser does. Anything unusable is simply no glossary.
+fn parse_glossary(text: &str) -> Vec<(String, String)> {
+    let Some(start) = text.find('{') else { return Vec::new() };
+    let Some(end) = text.rfind('}') else { return Vec::new() };
+    if end <= start {
+        return Vec::new();
+    }
+    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text[start..=end]) else {
+        return Vec::new();
+    };
+    map.into_iter()
+        // A term that is blank, unchanged, or the length of a sentence is not a glossary entry — the
+        // last of those is a model that answered with explanations, and it would ride in every
+        // subsequent prompt.
+        .filter(|(k, v)| {
+            let (k, v) = (k.trim(), v.trim());
+            !k.is_empty() && !v.is_empty() && k.len() <= 80 && v.len() <= 80 && k != v
+        })
+        .take(MAX_GLOSSARY)
+        .collect()
 }
 
 /// The live call, dispatched by provider.
@@ -390,6 +496,41 @@ impl BatchCall for Upstream<'_> {
                 // DeepL is a 1:1 text-array MT endpoint, not a chat model — no prompt, no JSON contract.
                 Provider::DeepL => deepl_translate(self.client, self.llm, &sources, self.target_lang).await,
                 _ => llm_translate(self.client, self.llm, &sources, self.target_lang, &context).await,
+            }
+        })
+    }
+
+    fn glossary<'a>(
+        &'a self,
+        sample: &'a [String],
+    ) -> GlossaryFuture<'a> {
+        Box::pin(async move {
+            // DeepL has no chat path and ignores context entirely, so there is nothing to give it.
+            if self.llm.provider == Provider::DeepL || sample.is_empty() {
+                return Vec::new();
+            }
+            let system = format!(
+                "You are preparing a translation glossary for a film's subtitles. From the dialogue \
+                 lines in the user's JSON array, identify the proper nouns, recurring forms of \
+                 address, titles, and invented or setting-specific vocabulary that must be rendered \
+                 the same way every time they appear. Give each one its {} rendering — a name that \
+                 should stay as it is maps to itself only if that is genuinely the right choice in \
+                 {}. Return ONLY a JSON object mapping the original term to its translation, at most \
+                 {MAX_GLOSSARY} entries, no commentary.",
+                self.target_lang, self.target_lang
+            );
+            let user = match serde_json::to_string(sample) {
+                Ok(json) => json,
+                Err(_) => return Vec::new(),
+            };
+            match call_chat_typed(self.client, self.llm, &system, &user).await {
+                Ok(text) => parse_glossary(&text),
+                // Never fatal. A film translates perfectly well without a glossary; it just has to
+                // lean on the rolling context alone, which is where it was before.
+                Err(e) => {
+                    eprintln!("translate: no glossary ({}) — continuing without one", e.into_message());
+                    Vec::new()
+                }
             }
         })
     }
@@ -1043,6 +1184,90 @@ mod contract_tests {
         fn len(&self) -> usize {
             self.0.lock().unwrap().len()
         }
+    }
+
+    /// The glossary reaches EVERY batch, including the first. That is the whole point of deriving it
+    /// up front: the rolling context is empty when the first batch runs, and now that batches
+    /// overlap it is empty for the first several — so without this, the opening of a film, where the
+    /// names are introduced, is the part translated with no continuity at all.
+    #[tokio::test(start_paused = true)]
+    async fn the_glossary_reaches_every_batch_including_the_first() {
+        struct WithGlossary(Mutex<Vec<Vec<(String, String)>>>);
+        impl BatchCall for WithGlossary {
+            fn call(
+                &self,
+                sources: &[String],
+                context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                self.0.lock().unwrap().push(context.to_vec());
+                let out: Vec<String> = sources.iter().map(|t| format!("T:{t}")).collect();
+                Box::pin(async move { Ok(out) })
+            }
+            fn glossary<'a>(
+                &'a self,
+                _sample: &'a [String],
+            ) -> GlossaryFuture<'a> {
+                Box::pin(async { vec![("Westeros".to_string(), "Västeros".to_string())] })
+            }
+        }
+
+        let up = WithGlossary(Mutex::new(Vec::new()));
+        let out = run_translation_t(&up, &cues(120)).await.expect("a healthy provider must finish");
+        assert_eq!(out.len(), 120);
+
+        let seen = up.0.lock().unwrap();
+        assert_eq!(seen.len(), 3, "three batches of 40");
+        for (i, ctx) in seen.iter().enumerate() {
+            assert!(
+                ctx.iter().any(|(k, v)| k == "Westeros" && v == "Västeros"),
+                "batch {i} was translated without the glossary: {ctx:?}"
+            );
+        }
+    }
+
+    /// A glossary is an improvement, never a contract. Anything unusable is simply no glossary, and
+    /// the film still translates on the rolling context alone.
+    #[test]
+    fn an_unusable_glossary_reply_is_no_glossary() {
+        // Fences and surrounding prose are fine — same tolerance the array parser has.
+        let fenced = "Here you go:\n```json\n{\"Westeros\": \"Västeros\", \"Ser\": \"Ser\"}\n```";
+        let parsed = parse_glossary(fenced);
+        assert_eq!(parsed, vec![("Westeros".to_string(), "Västeros".to_string())],
+            "a term that maps to itself teaches nothing and should be dropped");
+
+        for junk in ["", "no json here", "[1,2,3]", "{", "}{", "{\"a\": 1}"] {
+            assert!(parse_glossary(junk).is_empty(), "accepted junk: {junk:?}");
+        }
+
+        // A model that answers with explanations must not put a paragraph into every later prompt.
+        let chatty = format!("{{\"Ser\": \"{}\"}}", "a".repeat(200));
+        assert!(parse_glossary(&chatty).is_empty(), "an essay was accepted as a glossary entry");
+
+        // And a model answering with a dictionary is capped.
+        let huge: String = (0..500).map(|i| format!("\"t{i}\":\"x{i}\",")).collect();
+        assert_eq!(parse_glossary(&format!("{{{}}}", huge.trim_end_matches(','))).len(), MAX_GLOSSARY);
+    }
+
+    /// The sample spreads across the whole film rather than reading the opening: a name introduced in
+    /// the third act is exactly the one the rolling context can never carry backwards. And it stays
+    /// inside its character budget, because this call is meant to cost less than the translation it
+    /// improves.
+    #[test]
+    fn the_glossary_sample_spans_the_film_within_its_budget() {
+        // Small enough to read whole.
+        assert_eq!(glossary_sample(&cues(100)).len(), 100);
+
+        // Far past the budget: sampled down, still reaching the end of the film.
+        let long: Vec<Cue> = (0..MAX_CUES)
+            .map(|i| Cue { index: i as u32, start: 0, end: 0, text: format!("{i} {}", "x".repeat(60)) })
+            .collect();
+        let sample = glossary_sample(&long);
+        let chars: usize = sample.iter().map(|s| s.len() + 1).sum();
+        assert!(chars <= GLOSSARY_SAMPLE_CHARS, "sample ran to {chars} chars");
+        assert!(!sample.is_empty());
+        // The last sampled line comes from the closing stretch of the film, not the opening.
+        let last: usize = sample.last().unwrap().split(' ').next().unwrap().parse().unwrap();
+        assert!(last > MAX_CUES * 9 / 10, "the sample stopped at cue {last} of {MAX_CUES}");
     }
 
     /// Batches overlap, and the overlap is bounded. Unbounded fan-out on one BYOK key is a
