@@ -575,9 +575,21 @@ async fn produce_translation(
         api_base: opensubtitles::API,
     };
     // Prefer an English source (best-resourced), else whatever exists.
-    let subs = client.search(imdb, season, episode, "en", None).await?;
+    //
+    // Searching "en" made that "else" unreachable: the list it picks from could only ever hold
+    // English, so `.or_else` was dead code and a film with a perfectly good Spanish or French source
+    // returned "no source subtitle to translate". Asking for every language costs the same one round
+    // trip; the preference is expressed in the pick below, not in the query.
+    let subs = client.search(imdb, season, episode, "all", None).await?;
     let source = opensubtitles::best_for(&subs, "en")
-        .or_else(|| subs.first())
+        // No English at all. Take the best of what there is, by the same score and the same
+        // first-wins tie-break `tier1_reference` uses — `subs` arrives unranked from the API, so
+        // `.first()` was whichever result OpenSubtitles happened to list first. `fit_score` also
+        // sinks machine/AI-translated subs, which is what keeps us from translating a translation.
+        .or_else(|| {
+            subs.iter()
+                .min_by_key(|s| std::cmp::Reverse(opensubtitles::fit_score(s, None)))
+        })
         .ok_or("no source subtitle to translate")?;
     // Through the cache, not straight at the API. A `/download` call spends one of the viewer's
     // daily OpenSubtitles credits on the CALL, not on the file fetch — and dodging that quota is the
