@@ -228,6 +228,12 @@ impl Budget {
     fn spent(&self) -> bool {
         self.started.elapsed() > self.deadline
     }
+
+    /// What is left of the run's wall clock. Used to refuse a backoff that would outlast the run —
+    /// waiting past the deadline is just a slower way to fail.
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_sub(self.started.elapsed())
+    }
 }
 
 /// Why a call did not produce a usable batch.
@@ -240,23 +246,54 @@ impl Budget {
 #[derive(Debug)]
 enum CallError {
     Contract(String),
-    Upstream(String),
+    /// The provider refused. `retry` carries a minimum delay when the refusal is one that retrying
+    /// can fix — a 429 or a 5xx — and is `None` when it cannot: a 401 or a 400 means the key or the
+    /// request is wrong, and repeating it just spends the same wrong request again.
+    Upstream { message: String, retry: Option<Duration> },
 }
 
-/// Everything that reaches here as a bare string came from the transport or a provider status —
-/// the model's own misbehaviour is constructed explicitly as `Contract`.
+/// Everything that reaches here as a bare string came from the transport or a serialization step —
+/// the model's own misbehaviour is constructed explicitly as `Contract`, and a provider status
+/// carries its own retryability.
 impl From<String> for CallError {
     fn from(m: String) -> Self {
-        CallError::Upstream(m)
+        CallError::Upstream { message: m, retry: None }
     }
 }
 
 impl CallError {
+    /// A refusal that retrying cannot fix — a wrong key, a wrong request, a provider that does not
+    /// serve this path at all. Statuses that MIGHT be worth another go are built at the call sites
+    /// that have the response in hand, through `retry_after`.
+    fn upstream(message: impl Into<String>) -> CallError {
+        CallError::Upstream { message: message.into(), retry: None }
+    }
+
     fn into_message(self) -> String {
         match self {
-            CallError::Contract(m) | CallError::Upstream(m) => m,
+            CallError::Contract(m) | CallError::Upstream { message: m, .. } => m,
         }
     }
+}
+
+/// How long to wait before trying the same request again, or `None` if trying again cannot help.
+///
+/// Only rate limiting and the provider being unwell are worth repeating. `Some(ZERO)` means "worth
+/// retrying, no delay stated" — the caller still applies its own backoff on top.
+fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if status.as_u16() != 429 && !status.is_server_error() {
+        return None;
+    }
+    // The seconds form. The HTTP-date form is legal and rare here; failing to read one just falls
+    // back to our own schedule, which is the safe direction.
+    let stated = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        // A provider naming an hour is naming a wait longer than the whole run is allowed; the
+        // deadline check below turns that into a clean failure rather than a long doze.
+        .unwrap_or(0);
+    Some(Duration::from_secs(stated))
 }
 
 /// One upstream call: a batch of source lines in, the same number of translated lines out (or an
@@ -336,7 +373,7 @@ async fn translate_batch(
     if budget.spent() {
         return Err("translation ran out of time".to_string());
     }
-    let result = upstream.call(sources, context).await;
+    let result = call_with_retries(upstream, sources, context, budget).await;
 
     match result {
         Ok(v) if v.len() == sources.len() => {
@@ -392,6 +429,37 @@ async fn translate_batch(
     }
 }
 
+/// One batch, retried at the SAME SIZE when the provider refuses in a way that retrying can fix.
+///
+/// Not to be confused with the split, which is deliberately never done on an upstream refusal (see
+/// `translate_batch`): splitting spends six more calls immediately at a provider that just said no.
+/// But nothing else was done either, so a single 429 partway through ended a ten-minute job that was
+/// otherwise going fine, and the viewer paid for all of it again. Retrying the same batch after a
+/// wait is the opposite trade: one more call, at the same size, once the window has moved.
+async fn call_with_retries(
+    upstream: &(dyn BatchCall + Sync),
+    sources: &[String],
+    context: &[(String, String)],
+    budget: &Budget,
+) -> Result<Vec<String>, CallError> {
+    /// Attempts in total. Three is enough for a rate limiter's window to open; more would just
+    /// spend the run's deadline waiting.
+    const ATTEMPTS: u32 = 3;
+
+    let mut result = upstream.call(sources, context).await;
+    for attempt in 1..ATTEMPTS {
+        let Err(CallError::Upstream { retry: Some(stated), .. }) = &result else { break };
+        // One second, then four, unless the provider named a longer wait of its own.
+        let wait = (*stated).max(Duration::from_secs(1 << (2 * (attempt - 1))));
+        if wait >= budget.remaining() {
+            break;
+        }
+        tokio::time::sleep(wait).await;
+        result = upstream.call(sources, context).await;
+    }
+    result
+}
+
 /// Chat-model path (OpenAI / xAI / OpenRouter / Anthropic / Google). Sends a JSON array, parses a
 /// JSON array back.
 async fn llm_translate(
@@ -420,7 +488,7 @@ async fn llm_translate(
         user.push('\n');
     }
     user.push_str("Translate this JSON array:\n");
-    user.push_str(&serde_json::to_string(sources).map_err(|e| CallError::Upstream(e.to_string()))?);
+    user.push_str(&serde_json::to_string(sources).map_err(|e| CallError::upstream(e.to_string()))?);
 
     let text = call_chat_typed(client, llm, &system, &user).await?;
     parse_json_array(&text)
@@ -475,7 +543,7 @@ async fn call_chat_typed(
             }),
             Auth::GoogleKey,
         ),
-        Provider::DeepL => return Err(CallError::Upstream("DeepL does not use the chat path".into())),
+        Provider::DeepL => return Err(CallError::upstream("DeepL does not use the chat path")),
     };
 
     // Override the client's default timeout upward: an LLM completion is legitimately slower than an
@@ -492,10 +560,11 @@ async fn call_chat_typed(
     let resp = req.send().await.map_err(|e| format!("request failed: {}", e.without_url()))?;
     if !resp.status().is_success() {
         let code = resp.status();
+        let retry = retry_after(code, resp.headers());
         // The status only. This string is logged, and the body is the PROVIDER's text about a
         // request that carried the user's key — OpenAI's 401 quotes a masked form of it back, and a
         // self-hosted gateway is under no obligation to mask anything.
-        return Err(CallError::Upstream(format!("provider {code}")));
+        return Err(CallError::Upstream { message: format!("provider {code}"), retry });
     }
     let v = provider_json(resp).await?;
     // Contract, not Upstream: a 200 with no usable text is a safety filter or an empty candidate
@@ -565,7 +634,10 @@ async fn provider_json(resp: reqwest::Response) -> Result<Value, CallError> {
     let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_BODY)
         .await
         .map_err(|e| match e.starts_with("read body:") {
-            true => CallError::Upstream(e),
+            // Not marked retryable: the task at hand is 429s and 5xx, where the provider told us
+            // what is wrong. A mid-body stream failure is arguably worth another go too, but that is
+            // a separate judgement and it is not made here by accident.
+            true => CallError::upstream(e),
             false => CallError::Contract(e),
         })?;
     serde_json::from_slice(&bytes)
@@ -592,7 +664,7 @@ async fn deepl_translate(
 ) -> Result<Vec<String>, CallError> {
     let Some(code) = deepl_code(target_lang) else {
         // Upstream, not Contract: splitting the batch cannot make DeepL learn the language.
-        return Err(CallError::Upstream(format!("deepl has no code for {target_lang}")));
+        return Err(CallError::upstream(format!("deepl has no code for {target_lang}")));
     };
     let body = json!({ "text": sources, "target_lang": code });
     let resp = client
@@ -604,7 +676,9 @@ async fn deepl_translate(
         .await
         .map_err(|e| format!("request failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(CallError::Upstream(format!("deepl {}", resp.status())));
+        let code = resp.status();
+        let retry = retry_after(code, resp.headers());
+        return Err(CallError::Upstream { message: format!("deepl {code}"), retry });
     }
     let v = provider_json(resp).await?;
     let arr = v["translations"]
@@ -921,7 +995,7 @@ mod contract_tests {
         // is not split-retried, so this is exactly one failed call after two good ones.
         let up = fake(|src: &[String]| {
             if src[0] == "line 80" {
-                return Err(CallError::Upstream("provider 429".into()));
+                return Err(CallError::upstream("provider 429"));
             }
             Ok(src.iter().map(|s| format!("SV {s}")).collect())
         });
@@ -1547,19 +1621,95 @@ mod contract_tests {
         assert_eq!(out[300].text, "T:line 300");
     }
 
-    /// An upstream error must not be split-retried — that spent six more calls against a provider
+    /// An upstream error must not be SPLIT-retried — that spent six more calls against a provider
     /// that had just said no, with no backoff, and failed anyway.
-    #[tokio::test]
+    ///
+    /// Retrying the same batch at the same size is a different thing and is allowed (see
+    /// `call_with_retries`), so this can no longer assert a call count: it asserts the invariant the
+    /// count was standing in for. Every call the provider sees is the WHOLE batch — the fan-out never
+    /// widens — however many times we ask.
+    #[tokio::test(start_paused = true)]
     async fn an_upstream_error_is_not_split_retried() {
-        let up = fake(|_: &[String]| Err(CallError::Upstream("provider 429: rate limited".into())));
+        let sizes = Mutex::new(Vec::new());
+        let up = fake(|src: &[String]| {
+            sizes.lock().unwrap().push(src.len());
+            Err(CallError::Upstream {
+                message: "provider 429: rate limited".into(),
+                retry: Some(Duration::ZERO),
+            })
+        });
         assert!(run_translation_t(&up, &cues(40)).await.is_err());
-        assert_eq!(*up.calls.lock().unwrap(), 1, "a 429 was split-retried instead of surfacing");
+
+        let sizes = sizes.lock().unwrap();
+        assert!(!sizes.is_empty(), "the provider was never called");
+        assert!(
+            sizes.iter().all(|&n| n == 40),
+            "a refusal widened the fan-out instead of surfacing: {sizes:?}"
+        );
+    }
+
+    /// A refusal that retrying CAN fix is retried at the same size, and a transient one recovers
+    /// rather than ending a ten-minute job that was otherwise going fine.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_is_retried_and_recovers() {
+        let calls = Mutex::new(0usize);
+        let up = fake(|src: &[String]| {
+            let mut n = calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                return Err(CallError::Upstream {
+                    message: "provider 429".into(),
+                    retry: Some(Duration::from_secs(2)),
+                });
+            }
+            Ok(src.iter().map(|s| format!("T:{s}")).collect())
+        });
+        let out = run_translation_t(&up, &cues(40)).await.expect("a 429 that clears must not fail the film");
+        assert_eq!(out.len(), 40);
+        assert_eq!(out[0].text, "T:line 0");
+        assert_eq!(*calls.lock().unwrap(), 2, "the batch should have been retried exactly once");
+    }
+
+    /// A refusal that retrying CANNOT fix must surface immediately. Repeating a bad key just spends
+    /// the run's deadline asking the same wrong question.
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_key_is_not_retried() {
+        let up = fake(|_: &[String]| Err(CallError::upstream("provider 401: bad key")));
+        assert!(run_translation_t(&up, &cues(40)).await.is_err());
+        assert_eq!(*up.calls.lock().unwrap(), 1, "a 401 was retried");
+    }
+
+    /// Retries are bounded, so a provider that refuses forever cannot spend the whole deadline in
+    /// backoff and the run still fails as a refusal rather than as a timeout.
+    #[tokio::test(start_paused = true)]
+    async fn retries_are_bounded() {
+        let up = fake(|_: &[String]| {
+            Err(CallError::Upstream { message: "provider 503".into(), retry: Some(Duration::ZERO) })
+        });
+        let err = run_translation_t(&up, &cues(40)).await.expect_err("a permanent 503 must fail");
+        assert!(err.contains("503"), "the refusal should surface, not a timeout: {err}");
+        assert_eq!(*up.calls.lock().unwrap(), 3, "attempts should be capped at three");
+    }
+
+    /// A provider that names a wait longer than the run has left is not worth waiting for: the run
+    /// would be over before the retry landed.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_past_the_deadline_is_not_taken() {
+        let up = fake(|_: &[String]| {
+            Err(CallError::Upstream {
+                message: "provider 429".into(),
+                retry: Some(Duration::from_secs(3600)),
+            })
+        });
+        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None).await;
+        assert!(out.is_err());
+        assert_eq!(*up.calls.lock().unwrap(), 1, "an hour-long backoff was taken inside a ten-minute run");
     }
 
     /// A transport/auth error is not a contract violation: it must surface, not degrade to the source.
     #[tokio::test]
     async fn an_upstream_error_still_fails() {
-        let up = fake(|_: &[String]| Err(CallError::Upstream("provider 401: bad key".into())));
+        let up = fake(|_: &[String]| Err(CallError::upstream("provider 401: bad key")));
         assert!(run(&up, 4).await.is_err(), "an upstream failure must not become an untranslated film");
     }
 }
@@ -1690,14 +1840,14 @@ mod provider_reply_tests {
         let err = llm_translate(&http, &llm, &["a".to_string()], "Swedish", &[])
             .await
             .expect_err("a truncated stream must fail");
-        assert!(matches!(err, CallError::Upstream(_)), "a dead stream must propagate: {err:?}");
+        assert!(matches!(err, CallError::Upstream { .. }), "a dead stream must propagate: {err:?}");
     }
 
     /// But a provider REFUSING is upstream, and must not be split-retried.
     #[tokio::test]
     async fn a_provider_status_error_is_an_upstream_failure() {
         let err = call(r#"{"error":"nope"}"#, "429 Too Many Requests").await.unwrap_err();
-        assert!(matches!(err, CallError::Upstream(_)), "a 429 must propagate: {err:?}");
+        assert!(matches!(err, CallError::Upstream { .. }), "a 429 must propagate: {err:?}");
     }
 
     /// And a good reply still comes back.
@@ -1760,7 +1910,7 @@ mod deepl_tests {
         let err = deepl_translate(&http, &llm, &["a".to_string()], "Klingon")
             .await
             .expect_err("an unknown language was sent to DeepL");
-        assert!(matches!(err, CallError::Upstream(_)), "must not split-retry: {err:?}");
+        assert!(matches!(err, CallError::Upstream { .. }), "must not split-retry: {err:?}");
     }
 
     #[tokio::test]
