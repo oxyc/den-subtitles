@@ -160,6 +160,20 @@ impl Cache {
         self.mem_put(key, value, ttl);
     }
 
+    /// Remember this in memory only.
+    ///
+    /// `put` writes through to disk synchronously — an `fs::write` plus a rename, on the one runtime
+    /// thread that also serves every connection. That is the right trade for an artifact fetched once
+    /// and served for sixty days. It is the wrong one for something written a hundred and fifty times
+    /// per film, which exists only to rescue a retry a few minutes later and is redundant the moment
+    /// the finished artifact is cached.
+    ///
+    /// The cost is that these do not survive a restart. For the case they exist for — a run that
+    /// failed, retried by the same process while the viewer is still waiting — that is no loss.
+    pub fn put_mem(&self, key: String, value: String, ttl: Duration) {
+        self.mem_put(key, value, ttl);
+    }
+
     // ---- memory tier -------------------------------------------------------
 
     fn mem_get(&self, key: &str) -> Option<String> {
@@ -204,9 +218,32 @@ impl Cache {
     // ---- disk tier (best-effort) ------------------------------------------
 
     /// Filename for a key: url-safe base64 so any key (colons, slashes) is a valid single filename.
+    ///
+    /// Base64 is 4 bytes out per 3 in, and NAME_MAX is 255 on every filesystem this runs on — so a
+    /// key past ~190 bytes produces a name the OS refuses. That is reachable: a translate key carries
+    /// a model name and a language, each bounded but generously. The write then fails for every such
+    /// key forever, and the first one spends the process's one-shot "persistence degraded" warning,
+    /// so the next real disk problem says nothing.
+    ///
+    /// Long keys therefore get a hashed name instead. The prefix is kept readable so the store is
+    /// still greppable by namespace, and the hash is over the WHOLE key, so two long keys sharing a
+    /// prefix stay distinct.
     fn disk_path(&self, key: &str) -> Option<PathBuf> {
+        /// Bytes of key that base64 to a comfortably-legal filename.
+        const MAX_PLAIN: usize = 180;
+
         let dir = self.dir.as_ref()?;
-        let name = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes());
+        let encode = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let name = if key.len() <= MAX_PLAIN {
+            encode(key.as_bytes())
+        } else {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            // On a char boundary — a key is UTF-8 and a byte slice through a multibyte char panics.
+            let head: String = key.chars().take(32).collect();
+            format!("{}-{:016x}", encode(head.as_bytes()), h.finish())
+        };
         Some(dir.join(name))
     }
 

@@ -38,6 +38,13 @@ impl InFlight {
     pub async fn acquire(&self, key: &str) -> Guard<'_> {
         let lock = {
             let mut keys = self.keys.lock().unwrap();
+            // Sweep entries nobody holds any more. `Guard::drop` keeps an entry alive while a waiter
+            // still needs it, and relies on that waiter to remove it later — but a waiter whose
+            // request is CANCELLED never reaches `Guard::drop`, and leaves the entry behind with only
+            // the map referencing it. Keys here are request-shaped and unbounded, so those orphans
+            // accumulate for the life of the process. A count of one means map-only: nobody holds it,
+            // nobody is waiting on it.
+            keys.retain(|_, lock| Arc::strong_count(lock) > 1);
             keys.entry(key.to_string()).or_default().clone()
         };
         let permit = lock.lock_owned().await;
@@ -80,16 +87,45 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn set(&self, key: &str, done: usize, total: usize) {
-        self.jobs.lock().unwrap().insert(key.to_string(), (done, total));
+    /// Start reporting for `key`. The returned guard clears the entry when it drops.
+    ///
+    /// A guard rather than a matching `clear` call, because the third way out of a translation is
+    /// neither success nor failure: the client disconnects, hyper drops the handler future
+    /// mid-await, and a hand-written `clear` after that await never runs. The entry would then
+    /// outlive the process's interest in it — and since `handle_translate_status` checks progress
+    /// before the failure marker, a stale entry does not merely go stale, it MASKS the failure and
+    /// leaves a poller waiting on a run that is not happening.
+    pub fn start(&self, key: &str, total: usize) -> Reporter<'_> {
+        self.jobs.lock().unwrap().insert(key.to_string(), (0, total));
+        Reporter { owner: self, key: key.to_string() }
     }
 
     pub fn get(&self, key: &str) -> Option<(usize, usize)> {
         self.jobs.lock().unwrap().get(key).copied()
     }
 
-    pub fn clear(&self, key: &str) {
-        self.jobs.lock().unwrap().remove(key);
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+}
+
+/// Reports progress for one job, and stops reporting however the job ends — returned, failed, or
+/// dropped underneath us.
+pub struct Reporter<'a> {
+    owner: &'a Progress,
+    key: String,
+}
+
+impl Reporter<'_> {
+    pub fn set(&self, done: usize, total: usize) {
+        self.owner.jobs.lock().unwrap().insert(self.key.clone(), (done, total));
+    }
+}
+
+impl Drop for Reporter<'_> {
+    fn drop(&mut self) {
+        self.owner.jobs.lock().unwrap().remove(&self.key);
     }
 }
 
@@ -124,6 +160,54 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 1, "two workers held the same key at once");
         // And the map does not grow a permanent entry per key ever seen.
         assert_eq!(flight.tracked(), 0, "the key outlived the last guard");
+    }
+
+    /// A reporter that is DROPPED rather than finished stops reporting. This is the case a matching
+    /// `clear` call after the await cannot cover — the request is cancelled mid-run and that line
+    /// never executes — and a stale entry does not merely go stale: `handle_translate_status` checks
+    /// progress before the failure marker, so it MASKS the failure and leaves a client polling a run
+    /// that is not happening.
+    #[test]
+    fn a_dropped_reporter_stops_reporting() {
+        let progress = Progress::default();
+        {
+            let reporter = progress.start("job", 100);
+            reporter.set(40, 100);
+            assert_eq!(progress.get("job"), Some((40, 100)));
+        }
+        assert_eq!(progress.get("job"), None, "a cancelled run went on reporting itself as working");
+        assert_eq!(progress.tracked(), 0);
+    }
+
+    /// A waiter that is CANCELLED never reaches `Guard::drop`, so it cannot remove the entry it was
+    /// keeping alive. Nothing else was watching that entry, and the keys here are request-shaped and
+    /// unbounded, so the orphans accumulate for the life of the process.
+    #[tokio::test]
+    async fn a_cancelled_waiter_does_not_orphan_its_key() {
+        let flight = Arc::new(InFlight::default());
+        let first = flight.acquire("k").await;
+
+        let waiter = {
+            let flight = flight.clone();
+            tokio::spawn(async move {
+                let _held = flight.acquire("k").await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            })
+        };
+        // Let the waiter reach the lock and queue behind `first`.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(flight.tracked(), 1);
+
+        // `first` releases while the waiter is still queued, so the entry is deliberately kept for
+        // it — and then the waiter is cancelled before it can ever take, or release, the key.
+        drop(first);
+        waiter.abort();
+        let _ = waiter.await;
+
+        // Nothing is left holding it, so the next acquire must not find it still there.
+        let unrelated = flight.acquire("other").await;
+        drop(unrelated);
+        assert_eq!(flight.tracked(), 0, "a cancelled waiter left its key in the map forever");
     }
 
     /// Different keys are independent — a slow translation must not block an unrelated one.

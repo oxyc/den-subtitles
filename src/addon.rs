@@ -464,6 +464,14 @@ async fn subtitle_srt(state: &Arc<AppState>, client: &opensubtitles::Client<'_>,
     if let Some(hit) = state.cache.get(&key) {
         return Ok(hit);
     }
+    // Single-flighted, because this is the one call that spends a METERED credit: OpenSubtitles
+    // charges the viewer's daily download allowance on the API call itself, and the anonymous
+    // allowance is a handful per day. Two devices opening the same title, or the twenty picker URLs
+    // that all carry the same `?ref=`, would each buy the same file.
+    let _flight = state.inflight.acquire(&key).await;
+    if let Some(hit) = state.cache.get(&key) {
+        return Ok(hit);
+    }
     let body = client.download(file_id).await?;
     state.cache.put(key, body.clone(), CACHE_TTL);
     Ok(body)
@@ -609,9 +617,11 @@ fn translation_source(subs: &[opensubtitles::Subtitle]) -> Option<&opensubtitles
         if s.lang.eq_ignore_ascii_case("en") {
             score += ENGLISH;
         }
-        // Reverse for a highest-score-wins pick that takes the FIRST of equal scores: the chosen
-        // source is part of the translation's cache key, so an unstable pick buys the film twice.
-        std::cmp::Reverse(score)
+        // Highest score wins, and `file_id` breaks a tie. Taking "the first of equal scores" was not
+        // good enough: first means first IN THE LIST, and the list arrives in an order OpenSubtitles
+        // chooses. The chosen source is part of the translation's cache key, so a pick that depends
+        // on the order buys the same film twice.
+        (std::cmp::Reverse(score), s.file_id)
     })
 }
 
@@ -735,22 +745,40 @@ pub async fn handle_translate(
     };
     let client = os_client(http, &cfg);
 
-    // The extras carry this stream's OSHash. It does NOT choose the source (see
-    // `opensubtitles::text_score`) — what it does is make the search return `moviehash_match` flags,
-    // which is what makes a Tier-1 anchor findable at all. Without it every translation is served on
-    // whatever timing its source happened to have, which is what used to happen to all of them.
+    // TWO searches, and the difference between them is the whole cost model of this endpoint.
+    //
+    // The hashed one exists to make `moviehash_match` flags appear, which is what makes a Tier-1
+    // anchor findable. The UNHASHED one is what the source is chosen from, and it has to be unhashed:
+    // OpenSubtitles floats hash matches to the top and returns one page, so the same title yields a
+    // differently-ordered and differently-truncated list per encode. Choosing from that resolves two
+    // encodes of one film to two sources, which is two `translate_body_key`s and two full-price
+    // translations of the same dialogue — the exact cost keying by source file was meant to avoid.
+    //
+    // Both are cached under `search:` and the unhashed one is shared with every other encode of the
+    // title, so the steady-state cost of the pair is one round trip, no download credits.
     let hash = search_hash(extra);
-    let subs = match cached_search(state, &client, &imdb, season, episode, hash.as_deref()).await {
-        Ok(s) => s,
-        Err(_) => {
-            state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
-        }
+    let Ok(candidates) = cached_search(state, &client, &imdb, season, episode, None).await else {
+        state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
+        return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
     };
-    let Some(source) = translation_source(&subs) else {
+    let Some(source) = translation_source(&candidates) else {
         return httputil::text(StatusCode::NOT_FOUND, "no source subtitle to translate");
     };
-    let body_key = translate_body_key(source.file_id, &lang_key, llm);
+    let source_id = source.file_id;
+    let body_key = translate_body_key(source_id, &lang_key, llm);
+
+    // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
+    // either there is no anchor to find, and the answer would be the list we already have.
+    let anchored = match hash.as_deref().filter(|_| cfg.auto_sync) {
+        Some(h) => cached_search(state, &client, &imdb, season, episode, Some(h))
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    // Whether the SOURCE is hash-matched to this encode is a fact about the hashed list, and the
+    // source was deliberately chosen from the other one — so it is looked up rather than read off
+    // the candidate, whose `hash_match` is false by construction.
+    let source_in_sync = anchored.iter().any(|s| s.file_id == source_id && s.hash_match);
 
     // Tier 2 is a user action against the track itself, so it is only read on the `.srt` form — the
     // `.json` form's job is to warm and hand back a URL. Vetted before it can reach a cache key, for
@@ -767,11 +795,20 @@ pub async fn handle_translate(
     // The translated body inherits its source's timing, so it needs the same Tier-1 correction the
     // source itself would get from the picker: nothing when the source is already hash-matched to
     // this encode, and otherwise the anchor.
-    let anchor = if cfg.auto_sync { tier1_reference(&subs) } else { None };
-    let ref_id = tier1_ref_for(source, anchor);
+    let ref_id = match source_in_sync {
+        true => None,
+        false => tier1_reference(&anchored).filter(|&r| r != source_id),
+    };
     let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
 
-    if state.cache.get(&cache_key).is_none() {
+    // Read once, not twice. Asking again on the settled path could miss what the first read saw —
+    // LRU eviction and TTL expiry both happen between two reads — and answer "not translated" for a
+    // translation that exists and had just been confirmed.
+    if let Some(settled) = state.cache.get(&cache_key) {
+        if !want_json {
+            return httputil::srt(settled);
+        }
+    } else {
         // The expensive half: the translated text, cached against the source file so every encode of
         // this film reuses it.
         let translated = match state.cache.get(&body_key) {
@@ -781,6 +818,14 @@ pub async fn handle_translate(
                 // that legitimately takes minutes — each used to start their own full translation,
                 // because a cache only collapses work that has already finished.
                 let _flight = state.inflight.acquire(&body_key).await;
+                // The marker was read at the top of this handler, before the wait. Everything queued
+                // behind a run that then FAILED would sail past that stale read and each start its
+                // own full-price translation, with no backoff — N waiters, N films, on the viewer's
+                // own key. The marker exists to stop exactly that, so it is read again now that we
+                // know how the wait ended. `sync_and_cache` re-checks its marker for this reason.
+                if state.cache.get(&failed_recently).is_some() {
+                    return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
+                }
                 match state.cache.get(&body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
                     Some(body) => body,
@@ -822,12 +867,6 @@ pub async fn handle_translate(
         if !want_json {
             return resp;
         }
-    } else if !want_json {
-        // Settled already, in whichever variant this request asked for.
-        return match state.cache.get(&cache_key) {
-            Some(body) => httputil::srt(body),
-            None => httputil::text(StatusCode::NOT_FOUND, "not translated"),
-        };
     }
 
     let base = self_base(state, headers, config);
@@ -917,14 +956,15 @@ async fn produce_translation(
     // Progress is published under the JOB key rather than the body key, so `.status` can answer a
     // poll from the request alone — deriving the body key needs a search, and a poll happens every
     // second while the expensive thing runs.
-    state.progress.set(job_key, 0, cues.len());
+    let reporter = state.progress.start(job_key, cues.len());
     let translated = translate::translate(client.http, llm, &cues, lang, &state.cache, &|done, total| {
-        state.progress.set(job_key, done, total);
+        reporter.set(done, total);
     })
     .await;
-    // Cleared on both paths: a failed run that left its last count behind would report a translation
-    // frozen partway for as long as the process lived.
-    state.progress.clear(job_key);
+    // Dropped however this ends — returned, failed, or the request cancelled out from under us
+    // mid-run. That third case is the one a matching `clear` call could not cover, and it is the one
+    // that leaves `.status` insisting a dead run is still working.
+    drop(reporter);
 
     let body = srt::serialize(&translated?);
     state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
@@ -1387,7 +1427,8 @@ mod translate_retry_tests {
         assert_eq!(read(resp).await["state"], "idle");
 
         // A run in progress reports how far it has got.
-        state.progress.set(&job_key, 340, 1200);
+        let reporter = state.progress.start(&job_key, 1200);
+        reporter.set(340, 1200);
         let body = read(handle_translate_status(&state, &config, "tt0111161", "Swedish").await).await;
         assert_eq!(body["state"], "working");
         assert_eq!(body["done"], 340);
@@ -1397,15 +1438,17 @@ mod translate_retry_tests {
         let other = read(handle_translate_status(&state, &config, "tt0111161", "Finnish").await).await;
         assert_eq!(other["state"], "idle", "a different language saw Swedish's progress");
 
-        // Once it finishes, the entry is gone; a remembered failure is reported as one so a client
-        // stops waiting for a run that is being backed off.
-        state.progress.clear(&job_key);
+        // However the run ends — including cancelled mid-await, which is what the guard is for — the
+        // entry goes. A remembered failure is then reported as one, so a client stops waiting for a
+        // run that is being backed off rather than polling a stale "working" forever.
+        drop(reporter);
         state.cache.put(format!("{SYNCFAIL}{job_key}"), "1".into(), SYNC_RETRY_TTL);
         let body = read(handle_translate_status(&state, &config, "tt0111161", "Swedish").await).await;
         assert_eq!(body["state"], "failed");
 
         // Spellings of one language are one job here too, or a poll would never find its own run.
-        state.progress.set(&job_key, 1, 2);
+        let reporter = state.progress.start(&job_key, 2);
+        reporter.set(1, 2);
         let by_code = read(handle_translate_status(&state, &config, "tt0111161", "sv").await).await;
         assert_eq!(by_code["state"], "working", "a code and a name polled different jobs");
     }

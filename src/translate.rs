@@ -61,9 +61,17 @@ const MAX_CUES: usize = 6000;
 /// ceiling above allows something several times larger, and one call carrying all of it would cost
 /// more than the translation it is meant to improve.
 const GLOSSARY_SAMPLE_CHARS: usize = 40_000;
-/// Terms kept from the glossary reply. Enough for a cast list and the invented vocabulary of a
-/// genre film, few enough that a model answering with a dictionary cannot inflate every later prompt.
-const MAX_GLOSSARY: usize = 60;
+/// Terms kept from the glossary reply, and the longest either side of one may be.
+///
+/// These bound something that rides in EVERY batch prompt, so their product is multiplied by the
+/// batch count: at 40 terms and 40 characters a side, a worst-case glossary is ~3.5 KB per prompt and
+/// ~120 KB across a 35-batch film. At the 60×80 they started as it was ~10 KB and ~350 KB — several
+/// times the dialogue being translated, on a model the viewer is paying for by the token.
+///
+/// A term longer than 40 characters is not a term. It is a model answering with an explanation, and
+/// the cost of letting one through is paid on every remaining batch.
+const MAX_GLOSSARY: usize = 40;
+const MAX_GLOSSARY_TERM: usize = 40;
 
 /// Where a finished batch is remembered between runs, so a film that dies at cue 1100 of 1200 does
 /// not re-buy the 1100 that worked. A trait rather than the cache itself, so the harness tests can
@@ -84,8 +92,13 @@ impl BatchStore for crate::cache::Cache {
     fn get(&self, key: &str) -> Option<String> {
         crate::cache::Cache::get(self, key)
     }
+    /// Memory only. A film is ~150 batches, and the write-through `put` is a blocking `fs::write`
+    /// plus a rename on the one runtime thread — a hundred and fifty of those, per translation,
+    /// against the thread that is also serving every other connection. These entries are redundant
+    /// the moment the finished translation is cached, and the retry they exist to rescue arrives
+    /// minutes later in the same process.
     fn put(&self, key: String, value: String) {
-        crate::cache::Cache::put(self, key, value, BATCH_TTL);
+        crate::cache::Cache::put_mem(self, key, value, BATCH_TTL);
     }
 }
 
@@ -450,13 +463,32 @@ trait BatchCall: Sync {
 /// rolling window of six pairs can never carry backwards, and the opening is the part the rolling
 /// context already covers.
 fn glossary_sample(cues: &[Cue]) -> Vec<String> {
+    /// A cue longer than this is not dialogue anyone needs a glossary term from — it is a lyric
+    /// block, an embedded credit dump, or a hostile file. Taken as a prefix rather than skipped, so
+    /// a name at the start of one still counts.
+    const MAX_CUE: usize = 400;
+
     let total: usize = cues.iter().map(|c| c.text.len() + 1).sum();
     let stride = total.div_ceil(GLOSSARY_SAMPLE_CHARS).max(1);
-    cues.iter()
-        .step_by(stride)
-        .map(|c| c.text.clone())
-        .filter(|t| !t.trim().is_empty())
-        .collect()
+    let mut out = Vec::new();
+    // The stride alone is not a bound. It divides by the AVERAGE length, so a file whose bytes are
+    // concentrated in a few cues — one 4 MB cue among a thousand short ones — strides right past the
+    // arithmetic and puts the whole thing in a single prompt: a glossary call costing more than the
+    // film it was meant to improve. The budget has to be counted, not estimated.
+    let mut budget = GLOSSARY_SAMPLE_CHARS;
+    for cue in cues.iter().step_by(stride) {
+        let text = cue.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        // On a char boundary: this is arbitrary downloaded text, and a byte slice through a
+        // multibyte character panics.
+        let clipped: String = text.chars().take(MAX_CUE).collect();
+        let Some(left) = budget.checked_sub(clipped.len() + 1) else { break };
+        budget = left;
+        out.push(clipped);
+    }
+    out
 }
 
 /// Pull a `{"term": "translation"}` object out of a model reply, tolerating fences and prose the
@@ -476,7 +508,11 @@ fn parse_glossary(text: &str) -> Vec<(String, String)> {
         // subsequent prompt.
         .filter(|(k, v)| {
             let (k, v) = (k.trim(), v.trim());
-            !k.is_empty() && !v.is_empty() && k.len() <= 80 && v.len() <= 80 && k != v
+            !k.is_empty()
+                && !v.is_empty()
+                && k.len() <= MAX_GLOSSARY_TERM
+                && v.len() <= MAX_GLOSSARY_TERM
+                && k != v
         })
         .take(MAX_GLOSSARY)
         .collect()
@@ -660,8 +696,12 @@ async fn call_with_retries(
     let mut result = upstream.call(sources, context).await;
     for attempt in 1..ATTEMPTS {
         let Err(CallError::Upstream { retry: Some(stated), .. }) = &result else { break };
-        // One second, then four, unless the provider named a longer wait of its own.
-        let wait = (*stated).max(Duration::from_secs(1 << (2 * (attempt - 1))));
+        // One second, then four, unless the provider named a longer wait of its own — plus a spread
+        // of up to a second. Without it the CONCURRENCY batches in flight are rate-limited together,
+        // sleep in lockstep, and retry in the same instant, which is the burst that got them refused.
+        // Derived from the batch rather than a random source: same effect, nothing new to seed.
+        let spread = Duration::from_millis((sources.len() as u64 * 137) % 1000);
+        let wait = (*stated).max(Duration::from_secs(1 << (2 * (attempt - 1)))) + spread;
         if wait >= budget.remaining() {
             break;
         }
@@ -1278,6 +1318,20 @@ mod contract_tests {
         // The last sampled line comes from the closing stretch of the film, not the opening.
         let last: usize = sample.last().unwrap().split(' ').next().unwrap().parse().unwrap();
         assert!(last > MAX_CUES * 9 / 10, "the sample stopped at cue {last} of {MAX_CUES}");
+
+        // The budget must hold when the bytes are CONCENTRATED, not just when they are spread. A
+        // stride divides by the average length, so one enormous cue among many short ones strides
+        // straight past the arithmetic — and that one cue is then the whole prompt.
+        let mut skewed: Vec<Cue> = (0..1000)
+            .map(|i| Cue { index: i, start: 0, end: 0, text: "x".into() })
+            .collect();
+        skewed[0].text = "y".repeat(4 * 1024 * 1024);
+        let chars: usize = glossary_sample(&skewed).iter().map(|s| s.len() + 1).sum();
+        assert!(chars <= GLOSSARY_SAMPLE_CHARS, "one huge cue put {chars} chars in the prompt");
+
+        // A multibyte cue is clipped on a character boundary, not a byte one.
+        let wide = vec![Cue { index: 1, start: 0, end: 0, text: "é".repeat(5000) }];
+        assert!(!glossary_sample(&wide).is_empty(), "a multibyte cue was dropped entirely");
     }
 
     /// Batches overlap, and the overlap is bounded. Unbounded fan-out on one BYOK key is a

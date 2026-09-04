@@ -150,7 +150,13 @@ fn serialize_with(cues: &[Cue], ms_sep: char, header: &str) -> String {
             if !first {
                 out.push('\n');
             }
-            out.push_str(line);
+            // WebVTT reads `&` and `<` as markup in a cue payload, so a line like "5 < 6 & rising" —
+            // perfectly ordinary SRT — is malformed VTT, and a strict parser drops or mangles the
+            // cue. SRT has no such rule and must be written through untouched.
+            match ms_sep {
+                '.' => out.push_str(&line.replace('&', "&amp;").replace('<', "&lt;")),
+                _ => out.push_str(line),
+            }
             first = false;
         }
         out.push('\n');
@@ -215,6 +221,14 @@ mod tests {
         // already accepts either separator.
         let round_tripped = parse(vtt.trim_start_matches("WEBVTT\n\n"));
         assert_eq!(round_tripped, cues);
+
+        // `&` and `<` are markup in a VTT payload. Ordinary dialogue containing them is well-formed
+        // SRT and malformed VTT, which a strict parser drops rather than renders.
+        let awkward = parse("1\n00:00:01,000 --> 00:00:02,000\n5 < 6 & rising\n");
+        let vtt = serialize_vtt(&awkward);
+        assert!(vtt.contains("5 &lt; 6 &amp; rising"), "a VTT payload was not escaped: {vtt:?}");
+        // And SRT has no such rule, so it must be written through untouched.
+        assert!(serialize(&awkward).contains("5 < 6 & rising"), "SRT was escaped when it must not be");
     }
 
     #[test]
