@@ -118,16 +118,27 @@ fn push_cue(cues: &mut Vec<Cue>, block: &[&str]) {
 
 /// Serialize cues back to a well-formed SRT (LF newlines, blank-line separated, trailing newline).
 pub fn serialize(cues: &[Cue]) -> String {
-    let mut out = String::new();
+    serialize_with(cues, ',', "")
+}
+
+/// The same document as WebVTT: a `WEBVTT` header, and `.` rather than `,` before the milliseconds.
+/// One implementation rather than two, because the part worth getting right — dropping a blank line
+/// inside a cue, which ends that cue for every reader downstream — is the same in both formats.
+pub fn serialize_vtt(cues: &[Cue]) -> String {
+    serialize_with(cues, '.', "WEBVTT\n\n")
+}
+
+fn serialize_with(cues: &[Cue], ms_sep: char, header: &str) -> String {
+    let mut out = String::from(header);
     for (i, c) in cues.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
         out.push_str(&c.index.to_string());
         out.push('\n');
-        out.push_str(&format_ts(c.start));
+        out.push_str(&format_ts(c.start, ms_sep));
         out.push_str(" --> ");
-        out.push_str(&format_ts(c.end));
+        out.push_str(&format_ts(c.end, ms_sep));
         out.push('\n');
         // Blank lines are dropped, not written: one inside a cue's text ENDS that cue for every
         // reader downstream, silently losing the rest of it. A translation model's output reaches
@@ -177,16 +188,34 @@ fn parse_ts(s: &str) -> Option<u64> {
     Some(total)
 }
 
-fn format_ts(ms: u64) -> String {
+fn format_ts(ms: u64, ms_sep: char) -> String {
     let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
     let (m, rem) = (rem / 60_000, rem % 60_000);
     let (s, milli) = (rem / 1000, rem % 1000);
-    format!("{h:02}:{m:02}:{s:02},{milli:03}")
+    format!("{h:02}:{m:02}:{s:02}{ms_sep}{milli:03}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WebVTT is the same document with a header and a different millisecond separator — and the
+    /// separator must land in the TIMECODE only. A blanket comma-to-dot replacement would rewrite
+    /// the dialogue, which is the obvious way to implement this and the reason it shares a
+    /// serializer with the SRT path instead.
+    #[test]
+    fn vtt_is_the_same_document_with_vtt_timecodes() {
+        let cues = parse("1\n00:00:01,000 --> 00:00:04,000\nWait, no.\n");
+        let vtt = serialize_vtt(&cues);
+        assert!(vtt.starts_with("WEBVTT\n\n"), "a WebVTT file needs its header: {vtt:?}");
+        assert!(vtt.contains("00:00:01.000 --> 00:00:04.000"), "timecodes must use a dot: {vtt:?}");
+        assert!(vtt.contains("Wait, no."), "the dialogue's own comma was rewritten: {vtt:?}");
+
+        // And it is still the same cues: VTT timecodes parse back through the same reader, which
+        // already accepts either separator.
+        let round_tripped = parse(vtt.trim_start_matches("WEBVTT\n\n"));
+        assert_eq!(round_tripped, cues);
+    }
 
     #[test]
     fn round_trips_a_basic_cue() {

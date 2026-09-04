@@ -119,14 +119,20 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             addon::handle_subtitles(state, &parts.headers, config, id, extra).await
         }
         "subtitle" => {
-            // /<config>/subtitle/<file_id>.srt[?ref=<id>|?resync=<stream-url>]
+            // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>]
             let file = segs.get(2).copied().unwrap_or("");
-            match file.strip_suffix(".srt").and_then(|n| n.parse::<i64>().ok()) {
+            let (stem, want_vtt) = split_subtitle_format(file);
+            match stem.and_then(|n| n.parse::<i64>().ok()) {
                 Some(file_id) => {
                     let query = parts.uri.query().unwrap_or("");
                     let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
                     let resync = query_get(query, "resync");
-                    addon::handle_subtitle_file(state, config, file_id, ref_id, resync).await
+                    let resp = addon::handle_subtitle_file(state, config, file_id, ref_id, resync).await;
+                    if want_vtt {
+                        httputil::to_vtt(resp).await
+                    } else {
+                        resp
+                    }
                 }
                 None => httputil::text(StatusCode::BAD_REQUEST, "bad file id"),
             }
@@ -147,15 +153,23 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             if let Some(lang) = last.strip_suffix(".status") {
                 return addon::handle_translate_status(state, config, id, lang).await;
             }
-            let (lang, want_json) = if let Some(l) = last.strip_suffix(".json") {
-                (l, true)
+            let (lang, want_json, want_vtt) = if let Some(l) = last.strip_suffix(".json") {
+                (l, true, false)
             } else if let Some(l) = last.strip_suffix(".srt") {
-                (l, false)
+                (l, false, false)
+            } else if let Some(l) = last.strip_suffix(".vtt") {
+                (l, false, true)
             } else {
                 return httputil::text(StatusCode::NOT_FOUND, "not found");
             };
             let resync = query_get(parts.uri.query().unwrap_or(""), "resync");
-            addon::handle_translate(state, &parts.headers, config, id, extra, lang, want_json, resync).await
+            let resp =
+                addon::handle_translate(state, &parts.headers, config, id, extra, lang, want_json, resync).await;
+            if want_vtt {
+                httputil::to_vtt(resp).await
+            } else {
+                resp
+            }
         }
         _ => httputil::text(StatusCode::NOT_FOUND, "not found"),
     }
@@ -176,6 +190,17 @@ fn query_get(query: &str, key: &str) -> Option<String> {
 
 fn strip_json(seg: &str) -> Option<&str> {
     seg.strip_suffix(".json")
+}
+
+/// Split a subtitle filename into its stem and the format asked for. SRT is what the engine takes;
+/// VTT is the same document for a client that needs a `<track>`, and is rendered from the finished
+/// SRT at the response rather than anywhere inside the sync ladder.
+fn split_subtitle_format(file: &str) -> (Option<&str>, bool) {
+    match (file.strip_suffix(".srt"), file.strip_suffix(".vtt")) {
+        (Some(stem), _) => (Some(stem), false),
+        (_, Some(stem)) => (Some(stem), true),
+        _ => (None, false),
+    }
 }
 
 async fn run(cfg: Config) -> std::io::Result<()> {

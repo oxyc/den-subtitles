@@ -87,6 +87,50 @@ fn srt_cached(body: String, cache_control: &str) -> Response<Body> {
         .unwrap()
 }
 
+/// Re-render a subtitle response as WebVTT.
+///
+/// Applied at the router, once, rather than threaded through the sync ladder as a format flag: every
+/// path that can produce a subtitle — a cache hit, a fresh download, an alignment, a translation, the
+/// provisional fallback — would otherwise need to carry it, and each is a place to get it wrong.
+///
+/// Anything that is not a subtitle body (an error, a 304) passes through untouched. The ETag is
+/// recomputed because the bytes are genuinely different, and the caching directive is carried over
+/// because whether the body is settled or provisional is not changed by re-rendering it.
+pub async fn to_vtt(resp: Response<Body>) -> Response<Body> {
+    use http_body_util::BodyExt;
+
+    let is_subtitle = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/x-subrip"));
+    if resp.status() != StatusCode::OK || !is_subtitle {
+        return resp;
+    }
+    let cache_control = resp
+        .headers()
+        .get(CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("no-store")
+        .to_string();
+    // `Full` is already in memory, so this await resolves immediately and cannot stall the thread.
+    let bytes = match resp.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return text(StatusCode::INTERNAL_SERVER_ERROR, "subtitle body unavailable"),
+    };
+    let Ok(srt) = std::str::from_utf8(&bytes) else {
+        return text(StatusCode::INTERNAL_SERVER_ERROR, "subtitle body was not utf-8");
+    };
+    let vtt = crate::srt::serialize_vtt(&crate::srt::parse(srt));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/vtt; charset=utf-8")
+        .header(CACHE_CONTROL, cache_control)
+        .header(ETAG, etag_of(vtt.as_bytes()))
+        .body(Full::new(Bytes::from(vtt)))
+        .unwrap()
+}
+
 /// Honor a conditional GET: if the request's `If-None-Match` matches the response's `ETag`,
 /// collapse to a `304 Not Modified` that keeps the `ETag` + `Cache-Control` headers and drops the
 /// body. A no-op for responses without an ETag (errors, `no-store`) or a non-matching request.

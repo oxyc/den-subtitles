@@ -4,7 +4,7 @@
 //!   GET /manifest.json                                  unconfigured manifest
 //!   GET /<config>/manifest.json                         configured manifest
 //!   GET /<config>/subtitles/<type>/<id>/<extra>.json    native subs (OpenSubtitles, hash-matched)
-//!   GET /<config>/subtitle/<file_id>.srt                proxy+cache one OpenSubtitles file
+//!   GET /<config>/subtitle/<file_id>.(srt|vtt)          proxy+cache one OpenSubtitles file
 //!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.json  app-driven: kick off/await a translation → { url }
 //!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.srt   the translated SRT (cache hit after the .json warmed it)
 //!   GET /<config>/translate/<type>/<id>/<extra>/<lang>.status how far a running translation has got
