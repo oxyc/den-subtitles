@@ -30,7 +30,17 @@ pub async fn capped_bytes(resp: reqwest::Response, max: usize) -> Result<Vec<u8>
     Ok(out)
 }
 
-/// Capped body → lossy UTF-8 text (subtitle files can carry odd encodings).
+/// Capped body → lossy UTF-8 text.
+///
+/// Lossy is safe here because of a guarantee that lives outside this repo: the api.opensubtitles.com
+/// `/download` endpoint converts on its side, so the file behind the temporary link it hands back is
+/// UTF-8 whatever encoding the uploader used. Subtitle files in the wild are full of Windows-1251 and
+/// ISO-8859-2, and this function would turn one of those into replacement characters silently —
+/// `srt::has_a_cue` only inspects timing and index lines, which are ASCII either way, so a mojibake'd
+/// file passes every check and caches for sixty days looking fine.
+///
+/// Written down because nothing else records it and no test can pin it. If a second path ever fetches
+/// a subtitle from somewhere that makes no such promise, this is the line that has to change first.
 pub async fn capped_text(resp: reqwest::Response, max: usize) -> Result<String, String> {
     let bytes = capped_bytes(resp, max).await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())

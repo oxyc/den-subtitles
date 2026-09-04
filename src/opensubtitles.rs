@@ -99,7 +99,10 @@ impl<'a> Client<'a> {
             .post(format!("{}/download", self.api_base))
             .header("Api-Key", self.api_key)
             .header("User-Agent", "den-subtitles v0.1")
-            .json(&serde_json::json!({ "file_id": file_id }));
+            // `sub_format` asked for rather than assumed. `srt::parse` is an SRT parser and nothing
+            // downstream handles ASS or WebVTT, so the format was already load-bearing — it was just
+            // whatever the endpoint happened to default to.
+            .json(&serde_json::json!({ "file_id": file_id, "sub_format": "srt" }));
         if let Some(t) = self.token {
             req = req.bearer_auth(t);
         }
