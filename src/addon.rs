@@ -311,7 +311,7 @@ pub async fn handle_subtitle_file(
         None => None,
     };
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
-    let cache_key = sync_cache_key(file_id, &resync_url, ref_id);
+    let cache_key = sync_cache_key(&os_base_key(file_id), &resync_url, ref_id);
     if let Some(hit) = state.cache.get(&cache_key) {
         return httputil::srt(hit);
     }
@@ -333,6 +333,28 @@ pub async fn handle_subtitle_file(
         }
     };
 
+    sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &format!("subtitle {file_id}")).await
+}
+
+/// Run the sync ladder over an SRT we already hold, and apply the caching rules that go with it.
+///
+/// Shared by the two things that produce a servable subtitle: the OpenSubtitles proxy and the
+/// translation endpoint. A translated body is an SRT with the source's timings (the harness never
+/// lets the model touch a timecode), so it aligns exactly like a downloaded one — and it needs to,
+/// because it inherits whatever offset the source it was translated from had.
+///
+/// `cache_key` must already be namespaced for the tier being run (see `sync_cache_key`), and
+/// `resync_url` must already be vetted. `what` names the job in log lines only.
+#[allow(clippy::too_many_arguments)]
+async fn sync_and_cache(
+    state: &Arc<AppState>,
+    client: &opensubtitles::Client<'_>,
+    cache_key: String,
+    target: String,
+    ref_id: Option<i64>,
+    resync_url: Option<String>,
+    what: &str,
+) -> Response<Body> {
     // A sync that just failed is not retried on every request — the binary spawn, or a 90s alass
     // timeout, would be paid again per request. The marker is separate from `cache_key` so that key
     // never holds anything but a settled answer.
@@ -350,22 +372,22 @@ pub async fn handle_subtitle_file(
         match state.sync.sync_to_audio(&target, &url, &tag).await {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("subtitle: resync {file_id} failed: {e}");
+                eprintln!("sync: resync of {what} failed: {e}");
                 None
             }
         }
     } else if let Some(r) = ref_id {
         // Tier 1 — reference-align against the hash-matched sub (no audio needed).
-        match subtitle_srt(state, &client, r).await {
+        match subtitle_srt(state, client, r).await {
             Ok(reference) => match state.sync.sync_to_reference(&target, &reference, &tag).await {
                 Ok(s) => Some(s),
                 Err(e) => {
-                    eprintln!("subtitle: align {file_id} to {r} failed: {e}");
+                    eprintln!("sync: aligning {what} to {r} failed: {e}");
                     None
                 }
             },
             Err(e) => {
-                eprintln!("subtitle: reference {r} for {file_id} unavailable: {e}");
+                eprintln!("sync: reference {r} for {what} unavailable: {e}");
                 None
             }
         }
@@ -373,32 +395,33 @@ pub async fn handle_subtitle_file(
         None
     };
 
-    // A sync that was ASKED FOR and did not happen is not the answer to this key — it is the raw sub
-    // standing in. Caching it for 60 days makes one broken afternoon permanent: the URL is
-    // deterministic, so every later request is a cache hit and the sync never runs again. Remember it
-    // briefly so a retry loop doesn't re-spawn the binary per request, and let it heal.
+    // A sync that was ASKED FOR and did not happen is not the answer to this key — it is the
+    // unaligned body standing in. Caching it for 60 days makes one broken afternoon permanent: the
+    // URL is deterministic, so every later request is a cache hit and the sync never runs again.
+    // Remember it briefly so a retry loop doesn't re-spawn the binary per request, and let it heal.
     match synced {
         // The alignment happened: this body IS the answer to this key.
         Some(body) => {
             state.cache.put(cache_key, body.clone(), CACHE_TTL);
             httputil::srt(body)
         }
-        // Asked for and didn't happen. The raw sub stands in, and is NOT written to `cache_key` —
-        // caching it there made one broken afternoon permanent, since the URL is deterministic and
-        // every later request became a hit that never retried. Only the "don't re-spawn for a
-        // moment" marker is remembered; the raw body is already cached under `os:{file_id}`.
+        // Asked for and didn't happen. The unaligned body stands in, and is NOT written to
+        // `cache_key` — caching it there made one broken afternoon permanent, since the URL is
+        // deterministic and every later request became a hit that never retried. Only the "don't
+        // re-spawn for a moment" marker is remembered; the unaligned body is already cached under
+        // its own base key.
         None if wanted_sync => {
             state.cache.put(retry_marker, "1".into(), SYNC_RETRY_TTL);
             httputil::srt_provisional(target)
         }
-        // No sync was asked for, so the raw sub is the answer. `subtitle_srt` already cached it.
+        // No sync was asked for, so the body we have is the answer, and it is already cached.
         None => httputil::srt(target),
     }
 }
 
 /// Fetch a subtitle's SRT, cached by file id (the raw, un-synced text — reused as a sync input).
 async fn subtitle_srt(state: &Arc<AppState>, client: &opensubtitles::Client<'_>, file_id: i64) -> Result<String, String> {
-    let key = format!("os:{file_id}");
+    let key = os_base_key(file_id);
     if let Some(hit) = state.cache.get(&key) {
         return Ok(hit);
     }
@@ -468,15 +491,25 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Cache key for one proxied subtitle, namespaced by sync mode so the raw / reference-aligned /
-/// audio-resynced variants of the same `file_id` never collide (else an aligned sub would be served
-/// from the raw entry, or vice versa). A resync URL takes precedence over a `ref` — it's the
-/// stronger Tier-2 correction — mirroring the dispatch in `handle_subtitle_file`.
-fn sync_cache_key(file_id: i64, resync_url: &Option<String>, ref_id: Option<i64>) -> String {
+/// The cache key for one raw OpenSubtitles file: the unaligned body that every sync variant of it
+/// hangs off. Also what `subtitle_srt` files it under.
+fn os_base_key(file_id: i64) -> String {
+    format!("os:{file_id}")
+}
+
+/// Cache key for one servable subtitle, namespaced by sync mode so the unaligned / reference-aligned
+/// / audio-resynced variants of the same body never collide (else an aligned sub would be served
+/// from the unaligned entry, or vice versa). A resync URL takes precedence over a `ref` — it's the
+/// stronger Tier-2 correction — mirroring the dispatch in `sync_and_cache`.
+///
+/// `base` is the identity of the UNALIGNED body: `os:{file_id}` for a proxied subtitle, or the
+/// translate key for a translated one. Taking a base rather than a file id is what lets a translated
+/// body carry the same tier namespacing, on the same rules, without a second copy of them.
+fn sync_cache_key(base: &str, resync_url: &Option<String>, ref_id: Option<i64>) -> String {
     match (resync_url, ref_id) {
-        (Some(url), _) => format!("os:{file_id}:resync:{}", short_hash(url)),
-        (None, Some(r)) => format!("os:{file_id}:ref:{r}"),
-        (None, None) => format!("os:{file_id}"),
+        (Some(url), _) => format!("{base}:resync:{}", short_hash(url)),
+        (None, Some(r)) => format!("{base}:ref:{r}"),
+        (None, None) => base.to_string(),
     }
 }
 
@@ -728,9 +761,9 @@ mod tests {
 
     #[test]
     fn sync_cache_key_separates_raw_ref_and_resync() {
-        let raw = sync_cache_key(5, &None, None);
-        let aligned = sync_cache_key(5, &None, Some(9));
-        let resynced = sync_cache_key(5, &Some("http://host/s.mkv".into()), None);
+        let raw = sync_cache_key(&os_base_key(5), &None, None);
+        let aligned = sync_cache_key(&os_base_key(5), &None, Some(9));
+        let resynced = sync_cache_key(&os_base_key(5), &Some("http://host/s.mkv".into()), None);
         assert_eq!(raw, "os:5");
         assert_eq!(aligned, "os:5:ref:9");
         assert!(resynced.starts_with("os:5:resync:"));
@@ -739,7 +772,7 @@ mod tests {
         assert_ne!(raw, resynced);
         assert_ne!(aligned, resynced);
         // resync (Tier-2) takes precedence over a ref (Tier-1) when both are present.
-        let both = sync_cache_key(5, &Some("http://host/s.mkv".into()), Some(9));
+        let both = sync_cache_key(&os_base_key(5), &Some("http://host/s.mkv".into()), Some(9));
         assert_eq!(both, resynced);
     }
 
@@ -829,12 +862,12 @@ mod sync_fallback_tests {
     #[test]
     fn a_rejected_resync_target_leaves_a_plain_request() {
         let vetted: Option<String> = None; // what the SSRF guard leaves behind
-        assert_eq!(sync_cache_key(5, &vetted, Some(9)), "os:5:ref:9");
-        assert_eq!(sync_cache_key(5, &vetted, None), "os:5");
+        assert_eq!(sync_cache_key(&os_base_key(5), &vetted, Some(9)), "os:5:ref:9");
+        assert_eq!(sync_cache_key(&os_base_key(5), &vetted, None), "os:5");
         // Two different targets stay distinct, so one stream's alignment is never served for another.
         assert_ne!(
-            sync_cache_key(5, &Some("http://host/a.mkv".into()), None),
-            sync_cache_key(5, &Some("http://host/b.mkv".into()), None)
+            sync_cache_key(&os_base_key(5), &Some("http://host/a.mkv".into()), None),
+            sync_cache_key(&os_base_key(5), &Some("http://host/b.mkv".into()), None)
         );
     }
 
@@ -849,9 +882,9 @@ mod sync_fallback_tests {
         }
         // And the key builder really does produce keys inside that namespace, for every tier.
         for key in [
-            sync_cache_key(5, &None, None),
-            sync_cache_key(5, &None, Some(9)),
-            sync_cache_key(5, &Some("http://host/a.mkv".into()), None),
+            sync_cache_key(&os_base_key(5), &None, None),
+            sync_cache_key(&os_base_key(5), &None, Some(9)),
+            sync_cache_key(&os_base_key(5), &Some("http://host/a.mkv".into()), None),
         ] {
             assert!(BODY_PREFIXES.iter().any(|p| key.starts_with(p)), "unnamespaced body key: {key}");
             assert!(!key.starts_with(SYNCFAIL));
