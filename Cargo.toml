@@ -23,7 +23,7 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-base64 = "0.22"
+base64 = "0.23"
 # Sealed config-in-URL (docs mirror of den-scout/docs/SEALED-CONFIG.md): decrypt a config sealed to
 # the addon's X25519 key. `seal` = libsodium crypto_box_seal (X25519 + XSalsa20-Poly1305, blake2b nonce),
 # byte-compatible with the Go addon + the browser bundle. Decrypt-only here → no rng needed.
