@@ -615,6 +615,44 @@ fn translation_source(subs: &[opensubtitles::Subtitle]) -> Option<&opensubtitles
     })
 }
 
+/// Translations one install may START in a day.
+///
+/// A viewer watches a film, or an evening of episodes. This sits far above that and far below what
+/// an install URL in the wrong hands could spend — and it is the viewer's own provider account that
+/// gets spent, which is why the ceiling exists at all. Every other bound here caps ONE run:
+/// `MAX_CUES` its size, `RUN_DEADLINE` its wall clock, the ten-minute marker its retries. None of
+/// them bounds breadth — distinct titles times distinct languages, each one a fresh paid film.
+const DAILY_TRANSLATIONS: u64 = 50;
+/// Two days, so a day's counter falls out of the store on its own rather than needing a sweep.
+const QUOTA_TTL: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// Key for one install's translation count today. The config segment is a bearer secret and this key
+/// becomes a filename in the disk tier, so the segment is hashed rather than named.
+fn quota_key(config: &str, now: std::time::SystemTime) -> String {
+    let day = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
+    format!("quota:{}:{day}", short_hash(config))
+}
+
+/// Take one from today's allowance, or refuse. Charged only where a run actually BEGINS: a cache
+/// hit, a resumed batch, and the `.srt` half of the app's own two-request flow are all free, because
+/// none of them spends anything.
+fn charge_translation(state: &Arc<AppState>, config: &str) -> bool {
+    let key = quota_key(config, std::time::SystemTime::now());
+    let used: u64 = state.cache.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
+    if used >= DAILY_TRANSLATIONS {
+        return false;
+    }
+    // Read-modify-write, and deliberately not atomic: two runs starting in the same instant can both
+    // read `used` and both write `used + 1`, so the count can undershoot by the number of concurrent
+    // starts. This is an abuse ceiling, not an accounting record — being a few under on a burst
+    // costs nothing, and the alternative is holding a lock over the whole cache for a counter.
+    state.cache.put(key, (used + 1).to_string(), QUOTA_TTL);
+    true
+}
+
 fn short_hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -746,6 +784,16 @@ pub async fn handle_translate(
                 match state.cache.get(&body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
                     Some(body) => body,
+                    // Charged here and nowhere else: this is the one path that starts a run, and it
+                    // is already behind the cache check and the single-flight guard, so nothing that
+                    // merely waited for someone else's work is counted against the allowance.
+                    None if !charge_translation(state, config) => {
+                        eprintln!("translate: {imdb} → {lang} refused, install is over its daily allowance");
+                        return httputil::text(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "translation allowance for today is used up",
+                        );
+                    }
                     None => match produce_translation(state, &client, llm, source.file_id, &lang, &body_key, &job_key).await {
                         Ok(body) => body,
                         Err(e) => {
@@ -1289,6 +1337,32 @@ mod translate_retry_tests {
         // some neighbour — the whole reason `canonical_lang` refuses to guess a code.
         assert_ne!(key("Hebrew"), key("Thai"));
         assert_ne!(key("Brazilian Portuguese"), key("Portuguese"));
+    }
+
+    /// The allowance bounds BREADTH, which nothing else did: every other limit caps one run, and an
+    /// install URL in the wrong hands spends the viewer's own provider account one fresh film at a
+    /// time. It is charged per install per day, and two installs do not share one.
+    #[test]
+    fn the_daily_allowance_is_per_install_and_per_day() {
+        let state = state("quota");
+        let one = config_segment();
+        let two = format!("{}x", config_segment());
+
+        for i in 0..DAILY_TRANSLATIONS {
+            assert!(charge_translation(&state, &one), "refused run {i} inside the allowance");
+        }
+        assert!(!charge_translation(&state, &one), "the allowance did not stop anything");
+
+        // A different install has its own, and is not held back by the first one's spending.
+        assert!(charge_translation(&state, &two), "one install's allowance blocked another's");
+
+        // And the counter is per day: yesterday's key is a different key, so a spent day does not
+        // carry over into the next one.
+        let now = std::time::SystemTime::now();
+        let yesterday = now - Duration::from_secs(86_400);
+        assert_ne!(quota_key(&one, now), quota_key(&one, yesterday));
+        // The hash is of the config, so the secret itself never lands in a filename.
+        assert!(!quota_key(&one, now).contains(&one));
     }
 
     /// `.status` answers from the request alone — no search, no upstream call — because it is polled
