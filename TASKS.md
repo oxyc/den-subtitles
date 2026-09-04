@@ -144,7 +144,28 @@ Nothing is keyed to the config segment. `MAX_CUES` (`translate.rs:37`), `RUN_DEA
 backoff each cap one *run*; what is uncapped is **breadth** — distinct titles × languages, each a
 fresh paid film against a URL that is a bearer secret.
 
-### 14. Widen the Tier-1 anchor — as a deliberate relaxation, with a guard
+### 14. Widen the Tier-1 anchor — SKIPPED, premise does not hold
+
+**Not implemented.** The premise is that a release-group match makes a subtitle usable as a timing
+anchor. It does not, and the reason is sharper than "it might be wrong".
+
+An anchor is worth having for exactly one property: its timing is known-correct. A hash match has
+that by construction — OpenSubtitles is asserting the sub was authored against this exact encode. A
+release-group match asserts something else entirely: same *encode*, nothing about whether *this
+upload* is correctly timed against it. Uploaders hand-shift subs routinely.
+
+And the two facts pull apart in the case that matters. If a release-matched sub is correctly timed,
+the target probably already agrees with it and the alignment is a no-op. If it is mis-timed, we have
+just aligned a good subtitle onto a bad reference and made it worse — for the no-hash-match case,
+which is the common one currently served correctly as-is.
+
+The proposed shift guard bounds the damage rather than fixing the reasoning: it caps how wrong a bad
+anchor can make things, while still preferring a guess over the honest "served as-is". That trades a
+known-correct behaviour for a speculative one, in the direction of priority 1.
+
+Tier 2 remains the answer for a no-hash-match sub, and it is one the user asks for explicitly.
+
+### 14b. Original proposal, for the record
 `tier1_reference` (`addon.rs:258`) accepts only `hash_match`. A release-group match is evidence about
 the *encode*, not about this upload being correctly timed against it, and uploaders hand-shift subs
 routinely; it is weighted 3000 for *ranking* (`opensubtitles.rs:224`), where being wrong costs a
@@ -160,7 +181,16 @@ download POST (`opensubtitles.rs:102`) so the SRT-only assumption in `srt::parse
 than incidental.
 
 ### 16. Nice-to-have
-- Series prefetch of the next episode (the only background task today is the hourly sweep,
-  `main.rs:186`).
-- `/login` to mint `osToken` (config-only today, `userconfig.rs:82`).
-- WebVTT output route (SRT-only today, `httputil.rs:83`).
+
+- **WebVTT output route — done.** Rendered at the router from the finished response, so no format
+  flag runs through the sync ladder.
+- **Series prefetch — SKIPPED.** It would start a full translation of an episode the viewer has not
+  asked for, spending their own provider account on a guess. That is the exact cost task 13 was added
+  to bound, and the two land in the same release: adding a daily ceiling and then quietly consuming
+  it speculatively is incoherent. Worth revisiting only behind an explicit opt-in, and with prefetched
+  runs charged to a separate allowance from the ones a viewer asked for.
+- **`/login` to mint `osToken` — SKIPPED.** It means accepting an OpenSubtitles username and password,
+  which is a materially larger credential surface than the current design has anywhere: every secret
+  today is a token the user pastes once, and none is a reusable account password. The gain is saving
+  one paste during setup. Wrong trade for this codebase, where the config segment is already a bearer
+  secret handled with some care.
