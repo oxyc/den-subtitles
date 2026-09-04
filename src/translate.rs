@@ -574,6 +574,32 @@ fn deepl_code(lang: &str) -> Option<&'static str> {
     })
 }
 
+/// The cache-key form of a target language.
+///
+/// Case, surrounding space and internal spacing are not different languages, but they were different
+/// cache keys — and a translate cache key is a whole film's LLM bill charged to the viewer's own key.
+/// "Swedish", "swedish" and " Swedish " bought the same film three times, and nothing about a repeat
+/// request ever hit the cache.
+///
+/// Where `deepl_code` knows the language its code is the canonical form, so a request naming the code
+/// ("sv") and one naming the language ("Swedish") meet as well. That table is the only name↔code
+/// mapping in the tree and stays the only one — a second copy here is a place for the two to drift,
+/// and the drift would be silent. Editing it moves cache keys, which costs a re-translation: fine for
+/// a cache, worth knowing before you edit.
+///
+/// A language the table doesn't carry (Hebrew, Thai, Vietnamese — all fine for a chat model, none of
+/// them DeepL languages) keeps its normalized name, which still merges the casing and spacing
+/// variants. It is deliberately not a guess: `deepl_code` documents at length what guessing a code
+/// from the first two letters cost, and this is the same table saying "I don't know this one".
+pub fn canonical_lang(lang: &str) -> String {
+    // split_whitespace collapses runs and trims both ends in one pass.
+    let normalized = lang.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+    match deepl_code(&normalized) {
+        Some(code) => code.to_string(),
+        None => normalized,
+    }
+}
+
 /// Extract a JSON string array from model output, tolerating markdown code fences and leading prose
 /// by scanning for the first `[` … matching `]`.
 fn parse_json_array(text: &str) -> Option<Vec<String>> {

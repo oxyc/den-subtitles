@@ -480,6 +480,28 @@ fn sync_cache_key(file_id: i64, resync_url: &Option<String>, ref_id: Option<i64>
     }
 }
 
+/// Cache key for one translated title. Built here rather than inline so the handler and the tests
+/// cannot drift apart on it — the same reason `sync_cache_key` exists, and `lang` in particular is
+/// now canonicalized rather than taken verbatim (see `translate::canonical_lang`).
+///
+/// Keyed by provider+model as well: stepping up to a bigger model to re-translate a title that read
+/// badly is meant to overwrite, and it can only do that if the model is part of the identity.
+fn translate_cache_key(
+    imdb: &str,
+    season: Option<i64>,
+    episode: Option<i64>,
+    lang_key: &str,
+    llm: &LlmConfig,
+) -> String {
+    format!(
+        "translate:{imdb}:{}:{}:{lang_key}:{}:{}",
+        season.unwrap_or(0),
+        episode.unwrap_or(0),
+        provider_tag(llm),
+        llm.model,
+    )
+}
+
 fn short_hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -508,19 +530,28 @@ pub async fn handle_translate(
     let Some((imdb, season, episode)) = parse_id(id) else {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_id");
     };
+    // The path segment arrives percent-encoded ("Brazilian%20Portuguese"), and nothing decoded it.
+    // So the escape sequence went into the cache key AND was interpolated into the prompt of every
+    // batch — the model was asked to translate into "Brazilian%20Portuguese", and the encoded and
+    // decoded spellings of one language bought the film twice.
+    let lang_seg = lang;
+    let lang = httputil::percent_decode_path(lang_seg);
     // A language name, not an essay. This lands in a cache key that becomes a filename — the same
     // hazard `search_hash` already bounds `videoHash` against — and it is interpolated into the
     // prompt of every batch, so its length multiplies the bill against the viewer's own key.
     if lang.is_empty() || lang.len() > MAX_LANG {
         return httputil::text(StatusCode::BAD_REQUEST, "bad_lang");
     }
-    let cache_key = format!(
-        "translate:{imdb}:{}:{}:{lang}:{}:{}",
-        season.unwrap_or(0),
-        episode.unwrap_or(0),
-        provider_tag(llm),
-        llm.model,
-    );
+    // Case and spacing are not different languages, but they were different cache keys, and a key
+    // here is a whole film's LLM bill. Canonicalized separately from the name we send the model: the
+    // prompt reads better with the viewer's own spelling, and the key only has to be stable.
+    let lang_key = translate::canonical_lang(&lang);
+    // All-whitespace survives the length check and normalizes to nothing, which would file every such
+    // request under one shared key.
+    if lang_key.is_empty() {
+        return httputil::text(StatusCode::BAD_REQUEST, "bad_lang");
+    }
+    let cache_key = translate_cache_key(&imdb, season, episode, &lang_key, llm);
 
     // Warm the cache if needed (both the .json and .srt forms share it).
     let failed_recently = format!("{SYNCFAIL}{cache_key}");
@@ -535,7 +566,7 @@ pub async fn handle_translate(
         if state.cache.get(&failed_recently).is_some() {
             return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
         }
-        if let Err(e) = produce_translation(state, &cfg, llm, &imdb, season, episode, lang, &cache_key).await {
+        if let Err(e) = produce_translation(state, &cfg, llm, &imdb, season, episode, &lang, &cache_key).await {
             // Log the detail (no key in these strings); hand the client a generic message rather than
             // echoing a raw upstream error body.
             eprintln!("translate: {imdb} → {lang} failed: {e}");
@@ -546,7 +577,10 @@ pub async fn handle_translate(
 
     if want_json {
         let base = self_base(state, headers, config);
-        let url = format!("{base}/translate/{}/{}/{}.srt", type_of(season), id, lang);
+        // The segment as it arrived, not the decoded name: this is a URL, and handing back a decoded
+        // "Brazilian Portuguese" would put a raw space in it. The client fetching this lands on the
+        // same cache key it just warmed, whichever spelling it used.
+        let url = format!("{base}/translate/{}/{}/{}.srt", type_of(season), id, lang_seg);
         return httputil::json(StatusCode::OK, &json!({ "url": url }), "no-store");
     }
     match state.cache.get(&cache_key) {
@@ -894,11 +928,11 @@ mod translate_retry_tests {
         let config = config_segment();
         let cfg = userconfig::decode(state.config_keyring.as_ref(), &config).expect("test config decodes");
         let llm = cfg.llm.as_ref().expect("test config carries an llm");
-        let cache_key = format!("translate:tt0111161:0:0:Swedish:{}:{}", provider_tag(llm), llm.model);
+        // From the real key builder, not a literal: `lang` is canonicalized on the way into the key,
+        // so a literal silently stopped addressing the same entry the handler reads.
+        let cache_key = translate_cache_key("tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
         state.cache.put(format!("{SYNCFAIL}{cache_key}"), "1".into(), SYNC_RETRY_TTL);
 
-        // No HTTP client is configured in this state, so reaching the upstream would fail
-        // differently — a 502 here means the marker short-circuited before any of that.
         let resp = handle_translate(
             &state,
             &HeaderMap::new(),
@@ -916,9 +950,42 @@ mod translate_retry_tests {
         )
         .to_string();
         assert_ne!(body.trim(), "1", "the retry marker was served as the response body");
-        // "recently" is what says the marker short-circuited rather than a fresh attempt failing:
-        // with no HTTP client both paths end in a 502, so the status alone proves nothing.
+        // "recently" is what says the marker short-circuited rather than a fresh attempt failing.
+        // The config's OpenSubtitles key is a test string, so an attempt that got as far as the
+        // upstream would ALSO come back 502 — the status alone proves nothing, only the body does.
         assert!(body.contains("recently"), "the marker did not short-circuit; body: {body}");
+    }
+
+    /// Spellings of one language are one cache key. A translate key is a whole film's LLM bill
+    /// against the viewer's own provider account, and "Swedish" / "swedish" / " Swedish " / "sv"
+    /// each bought that film separately — no repeat request could ever hit the cache. The encoded
+    /// spelling counted too: the segment was never percent-decoded, so "Brazilian%20Portuguese" was
+    /// a fifth key AND the language name the model was handed in every batch prompt.
+    #[test]
+    fn spellings_of_one_language_share_a_cache_key() {
+        let llm = LlmConfig {
+            provider: userconfig::Provider::OpenAI,
+            model: "gpt-4o-mini".into(),
+            api_key: "k".into(),
+        };
+        let key = |lang: &str| {
+            let decoded = httputil::percent_decode_path(lang);
+            translate_cache_key("tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)
+        };
+
+        let swedish = key("Swedish");
+        for same in ["swedish", "SWEDISH", "  Swedish  ", "sv", "SV"] {
+            assert_eq!(key(same), swedish, "{same:?} was billed as a separate film");
+        }
+        // Percent-encoding is a spelling of the same language too.
+        assert_eq!(key("Brazilian%20Portuguese"), key("brazilian portuguese"));
+
+        // Different languages must still be different films.
+        assert_ne!(key("Finnish"), swedish);
+        // And a language the table doesn't carry keeps its own identity rather than collapsing into
+        // some neighbour — the whole reason `canonical_lang` refuses to guess a code.
+        assert_ne!(key("Hebrew"), key("Thai"));
+        assert_ne!(key("Brazilian Portuguese"), key("Portuguese"));
     }
 
     /// An over-long language name is refused before it can become a filename or a prompt. The same
@@ -943,16 +1010,19 @@ mod translate_retry_tests {
     }
 
     /// And the marker is scoped to the translation it belongs to: another language is a different
-    /// job and must still be attempted. Proven by the marker the ATTEMPT leaves behind — this state
-    /// has no HTTP client, so a Finnish run gets as far as failing on that and recording it, which
-    /// a short-circuit would never do.
+    /// job and must still be attempted. Proven by the marker the ATTEMPT leaves behind — the test
+    /// config's OpenSubtitles key is a test string, so a Finnish run gets as far as failing on the
+    /// upstream and recording that, which a short-circuit would never do.
     #[tokio::test]
     async fn a_remembered_failure_does_not_block_a_different_translation() {
         let state = state("scoping");
         let config = config_segment();
         let cfg = userconfig::decode(state.config_keyring.as_ref(), &config).unwrap();
         let llm = cfg.llm.as_ref().unwrap();
-        let key_for = |lang: &str| format!("translate:tt0111161:0:0:{lang}:{}:{}", provider_tag(llm), llm.model);
+        // Through the real builder and the real canonicalizer, so the keys the test addresses are
+        // the keys the handler writes.
+        let key_for =
+            |lang: &str| translate_cache_key("tt0111161", None, None, &translate::canonical_lang(lang), llm);
         state.cache.put(format!("{SYNCFAIL}{}", key_for("Swedish")), "1".into(), SYNC_RETRY_TTL);
 
         let finnish_marker = format!("{SYNCFAIL}{}", key_for("Finnish"));
