@@ -211,6 +211,7 @@ async fn run_translation(
     // wrong for a film: a consistently misbehaving model hits that leaf for every cue and returns the
     // untranslated original, which then caches for 60 days as a successful translation.
     let budget = Budget {
+        billed: std::sync::atomic::AtomicBool::new(false),
         untranslated: AtomicUsize::new(0),
         started: tokio::time::Instant::now(),
         deadline,
@@ -241,6 +242,13 @@ async fn run_translation(
         },
         _ => upstream.glossary(&sample).await,
     };
+    // A glossary that came back non-empty is a call that was made and billed, before any batch. It
+    // cannot be seen in the assembled output, so it is recorded here or not at all. (An empty one is
+    // ambiguous — a refusal and a film with no proper nouns look the same — so it is not counted,
+    // which errs toward refunding.)
+    if !glossary.is_empty() {
+        budget.billed.store(true, Ordering::Relaxed);
+    }
 
     // Batches overlap, up to CONCURRENCY of them. `buffered` IS the bound — a batch's future does
     // not start until it enters the window — which is what keeps the two guards below meaningful:
@@ -266,7 +274,7 @@ async fn run_translation(
         let (batch, translated) = match batch {
             Ok(v) => v,
             Err(mut e) => {
-                e.spent = !out.is_empty();
+                e.spent = budget.billed.load(Ordering::Relaxed);
                 return Err(e);
             }
         };
@@ -384,6 +392,12 @@ fn unusable(kept: usize, seen: usize) -> bool {
 /// sized below it, it becomes a stricter quality gate than the quality gate. Time is the bound that
 /// is actually reachable, so time is the bound that is kept.
 struct Budget {
+    /// Has any call come back successfully — i.e. has the viewer's key actually been billed?
+    ///
+    /// Not inferable from the assembled output: batches run CONCURRENCY-wide and surface in order, so
+    /// a refusal on the first one leaves the output empty while three others were sent and paid for.
+    /// The glossary is billed before any batch and never appears there at all.
+    billed: std::sync::atomic::AtomicBool,
     untranslated: AtomicUsize,
     /// Tokio's clock rather than `std`'s. Unpaused the two are the same thing, but the deadline is
     /// now the only bound on a run that concurrency made faster than the wall clock it was tuned
@@ -460,8 +474,23 @@ impl CallError {
 /// dead key would otherwise spend all of it — and a metered download per title — having sent no
 /// tokens at all. A timeout or a content filter looks the same from here and is genuinely per-title.
 fn is_credential_refusal(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 400 | 401 | 403)
+    matches!(
+        status.as_u16(),
+        // The key is wrong, revoked, or the request shape is.
+        400 | 401 | 403
+        // Out of money, which is the commoner way a BYOK key dies — not revoked, just spent.
+        // 402 is OpenRouter's "insufficient credits"; 456 is DeepL's character quota. Anthropic
+        // says it with a 400, which the line above already covers.
+        | 402 | 456
+    )
 }
+
+// Knowingly NOT here: a 429 carrying OpenAI's `insufficient_quota` or Google's `RESOURCE_EXHAUSTED`,
+// which are billing failures wearing a rate limit's status. Telling them from a real rate limit
+// needs the response body, and this path deliberately never reads it — the body is the provider's
+// text about a request that carried the user's key, and it is logged. Calling every exhausted 429 a
+// credential failure would give a merely rate-limited install an install-wide block and a refund it
+// did not earn, which is the worse error of the two.
 
 fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if status.as_u16() != 429 && !status.is_server_error() {
@@ -676,6 +705,10 @@ async fn translate_batch(
         return Err("translation ran out of time".to_string().into());
     }
     let result = call_with_retries(upstream, sources, context, budget).await;
+    // A call that came back is a call that was billed, whatever we go on to think of its contents.
+    if result.is_ok() {
+        budget.billed.store(true, Ordering::Relaxed);
+    }
 
     match result {
         Ok(v) if v.len() == sources.len() => {
@@ -1456,6 +1489,34 @@ mod contract_tests {
         });
         let err = run_translation_t(&up, &cues(120)).await.expect_err("a 401 must fail the run");
         assert!(err.spent, "a refusal after two paid batches claimed nothing was spent");
+
+        // The case inferring from the assembled output could not see: the FIRST batch is refused,
+        // slowly, while its neighbours in the concurrency window answer and are billed. Results
+        // surface in order, so the output is still empty when the error arrives — but three calls
+        // went out and the viewer's key paid for them.
+        struct SlowFirst;
+        impl BatchCall for SlowFirst {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                let first = sources[0] == "line 0";
+                let out: Vec<String> = sources.iter().map(|s| format!("T:{s}")).collect();
+                Box::pin(async move {
+                    match first {
+                        // Long enough that the rest of the window lands first.
+                        true => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Err(CallError::upstream("provider 403"))
+                        }
+                        false => Ok(out),
+                    }
+                })
+            }
+        }
+        let err = run_translation_t(&SlowFirst, &cues(160)).await.expect_err("a 403 must fail the run");
+        assert!(err.spent, "batches billed in the concurrency window were not counted as spend");
     }
 
     /// A film that dies partway must not be re-bought from the start. The completed batches are
@@ -1542,6 +1603,7 @@ mod contract_tests {
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, TranslateError> {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
         let budget = Budget {
+            billed: std::sync::atomic::AtomicBool::new(false),
             untranslated: AtomicUsize::new(0),
             started: tokio::time::Instant::now(),
             deadline: Duration::from_secs(600),
