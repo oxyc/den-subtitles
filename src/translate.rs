@@ -90,11 +90,15 @@ static RETRY_TICK: AtomicU64 = AtomicU64::new(0);
 pub struct TranslateError {
     pub message: String,
     pub credential_refused: bool,
+    /// Whether any batch had already completed when this failed. Batches run several wide and
+    /// surface in order, so a refusal in batch k arrives after 0..k-1 have been billed to the
+    /// viewer's key — and a refund is only honest when there was nothing to refund from.
+    pub spent: bool,
 }
 
 impl From<String> for TranslateError {
     fn from(message: String) -> Self {
-        TranslateError { message, credential_refused: false }
+        TranslateError { message, credential_refused: false, spent: false }
     }
 }
 
@@ -255,7 +259,17 @@ async fn run_translation(
     let mut stream = stream::iter(pending).buffered(CONCURRENCY);
 
     while let Some(batch) = stream.next().await {
-        let (batch, translated) = batch?;
+        // Record whether anything had already been paid for before this failed. Batches surface in
+        // order, so a completed one means real tokens were billed to the viewer's key, and a caller
+        // deciding whether to refund a charge needs to know that rather than assume the failure
+        // arrived on the first call.
+        let (batch, translated) = match batch {
+            Ok(v) => v,
+            Err(mut e) => {
+                e.spent = !out.is_empty();
+                return Err(e);
+            }
+        };
         for (cue, text) in batch.iter().zip(translated) {
             out.push(Cue { text, ..cue.clone() });
         }
@@ -716,7 +730,7 @@ async fn translate_batch(
         // The provider's own verdict on the credential travels with the message. It is the one
         // failure the caller must not charge a slot for, since nothing was spent to earn it.
         Err(CallError::Upstream { message, fatal: true, .. }) => {
-            Err(TranslateError { message, credential_refused: true })
+            Err(TranslateError { message, credential_refused: true, spent: false })
         }
         Err(e) => Err(e.into_message().into()),
     }
@@ -1422,6 +1436,26 @@ mod contract_tests {
             assert_eq!(cue.text, format!("T:line {i}"), "cue {i} was reassembled out of order");
             assert_eq!(cue.index, i as u32 + 1, "cue {i} lost its index");
         }
+    }
+
+    /// A failure has to say whether anything had been paid for before it. The caller refunds a daily
+    /// allowance slot on a refused credential, and that is only honest when the refusal arrived
+    /// before any tokens were billed — batches run several wide and surface in order, so a refusal
+    /// in a later batch comes after earlier ones have been charged to the viewer's key.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_says_whether_anything_was_paid_for() {
+        // Fails on the very first batch: nothing billed.
+        let up = fake(|_: &[String]| Err(CallError::upstream("provider 401")));
+        let err = run_translation_t(&up, &cues(120)).await.expect_err("a 401 must fail the run");
+        assert!(!err.spent, "a first-batch refusal claimed money had been spent");
+
+        // Fails only once the third batch is reached: the first two were paid for.
+        let up = fake(|src: &[String]| match src[0] == "line 80" {
+            true => Err(CallError::upstream("provider 401")),
+            false => Ok(src.iter().map(|s| format!("T:{s}")).collect()),
+        });
+        let err = run_translation_t(&up, &cues(120)).await.expect_err("a 401 must fail the run");
+        assert!(err.spent, "a refusal after two paid batches claimed nothing was spent");
     }
 
     /// A film that dies partway must not be re-bought from the start. The completed batches are

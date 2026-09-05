@@ -1060,12 +1060,6 @@ pub async fn handle_translate(
     if state.cache.get(&failed_recently).is_some() {
         return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
     }
-    // A refused credential is about the install, not this title, so the title-scoped marker above
-    // can never catch it — every film is a fresh key. Checked here, before any network call, because
-    // the cost it prevents is a metered subtitle download per title browsed.
-    if state.cache.get_mem(&credential_refused_key(config, llm)).is_some() {
-        return httputil::text(StatusCode::BAD_GATEWAY, "the AI provider refused this key");
-    }
 
     let Some(http) = state.http.as_ref() else {
         return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "translation service unavailable");
@@ -1210,6 +1204,20 @@ pub async fn handle_translate(
                                 "translation allowance for today is used up",
                             );
                         }
+                        // A refused credential is about the install, not this title, so the
+                        // title-scoped marker cannot catch it — every film is a fresh key.
+                        //
+                        // But it belongs HERE, beside the allowance check and behind every cache
+                        // read, for the same reason that one does. Checked at the top of the handler
+                        // it refused translations that were already bought and cached: serving one
+                        // makes no provider call at all, so a dead key was making the install's
+                        // entire existing library unavailable, re-armed by every new title browsed.
+                        if state.cache.get_mem(&credential_refused_key(config, llm)).is_some() {
+                            return httputil::text(
+                                StatusCode::BAD_GATEWAY,
+                                "the AI provider refused this key",
+                            );
+                        }
                         let source_id = match pinned {
                             Some(id) => id,
                             None => {
@@ -1295,6 +1303,14 @@ pub async fn handle_translate(
                                 "1".into(),
                                 SYNC_RETRY_TTL,
                             );
+                            // The per-title marker too, even though this is meant to be a fact about
+                            // the install. `is_credential_refusal` reads a 400/403 as one, and those
+                            // are not exclusively about credentials — OpenRouter answers 403 when a
+                            // model's moderation trips, and this file already notes that film
+                            // dialogue trips content filters routinely. Without a per-title marker
+                            // such a title re-arms the install-wide one every ten minutes forever,
+                            // and takes every other title down with it each time.
+                            state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
                             return httputil::text(
                                 StatusCode::BAD_GATEWAY,
                                 "the AI provider refused this key",
@@ -1556,7 +1572,13 @@ async fn produce_translation(
     // nothing, so it is given back.
     let translated = translated.map_err(|e| match e.credential_refused {
         true => {
-            refund_translation(state, config);
+            // Refunded only when nothing was spent. A refusal that arrives on the first call — the
+            // dead-key case, and the one this exists for — bought nothing; one that arrives after
+            // some batches landed was paid for in real tokens, and giving the slot back for it would
+            // be the same accounting mistake in the other direction.
+            if !e.spent {
+                refund_translation(state, config);
+            }
             TranslationFailure::Credential(e.message)
         }
         false => TranslationFailure::Model(e.message),
