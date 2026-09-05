@@ -56,7 +56,7 @@ const CONCURRENCY: usize = 4;
 const LLM_TIMEOUT: Duration = Duration::from_secs(120);
 /// Ceiling on cues we'll translate for one title. A real film is ~1–3k cues; anything past this is a
 /// pathological/hostile SRT that would run unbounded (cost, wall-clock), so we refuse it.
-const MAX_CUES: usize = 6000;
+pub const MAX_CUES: usize = 6000;
 /// Characters of dialogue the glossary pass is allowed to read. A film is well under this; the cue
 /// ceiling above allows something several times larger, and one call carrying all of it would cost
 /// more than the translation it is meant to improve.
@@ -90,6 +90,9 @@ static RETRY_TICK: AtomicU64 = AtomicU64::new(0);
 pub struct TranslateError {
     pub message: String,
     pub credential_refused: bool,
+    /// Whether the refusal can ONLY be about the credential. Decides whether the whole install is
+    /// blocked briefly or just this title — see `is_certainly_the_key`.
+    pub key_certain: bool,
     /// Whether any batch had already completed when this failed. Batches run several wide and
     /// surface in order, so a refusal in batch k arrives after 0..k-1 have been billed to the
     /// viewer's key — and a refund is only honest when there was nothing to refund from.
@@ -98,7 +101,7 @@ pub struct TranslateError {
 
 impl From<String> for TranslateError {
     fn from(message: String) -> Self {
-        TranslateError { message, credential_refused: false, spent: false }
+        TranslateError { message, credential_refused: false, key_certain: false, spent: false }
     }
 }
 
@@ -228,6 +231,13 @@ async fn run_translation(
             Some(hit) => hit,
             None => {
                 let built = upstream.glossary(&sample).await;
+                // Billed where the CALL happens, not where the value lands. Flagging it on the
+                // result meant a glossary served from the store — no call at all — counted as
+                // spend, so a retry against a dead key looked paid-for and lost its refund. The
+                // batch resume path already returns before its own flag for this reason.
+                if !built.is_empty() {
+                    budget.billed.store(true, Ordering::Relaxed);
+                }
                 // Only a glossary that exists is worth remembering. "No glossary" is also what a
                 // failed or unparseable derivation returns, and storing that would hold a transient
                 // provider blip in place for a day — every retry that day translating the film
@@ -240,15 +250,14 @@ async fn run_translation(
                 built
             }
         },
-        _ => upstream.glossary(&sample).await,
+        _ => {
+            let built = upstream.glossary(&sample).await;
+            if !built.is_empty() {
+                budget.billed.store(true, Ordering::Relaxed);
+            }
+            built
+        }
     };
-    // A glossary that came back non-empty is a call that was made and billed, before any batch. It
-    // cannot be seen in the assembled output, so it is recorded here or not at all. (An empty one is
-    // ambiguous — a refusal and a film with no proper nouns look the same — so it is not counted,
-    // which errs toward refunding.)
-    if !glossary.is_empty() {
-        budget.billed.store(true, Ordering::Relaxed);
-    }
 
     // Batches overlap, up to CONCURRENCY of them. `buffered` IS the bound — a batch's future does
     // not start until it enters the window — which is what keeps the two guards below meaningful:
@@ -436,7 +445,7 @@ enum CallError {
     /// `fatal` narrows that further: the refusal is about the CREDENTIAL, not the moment, so it will
     /// happen identically for the next film. Worth telling the caller apart from a timeout, which
     /// looks the same from here and is genuinely per-title.
-    Upstream { message: String, retry: Option<Duration>, fatal: bool },
+    Upstream { message: String, retry: Option<Duration>, fatal: bool, key_certain: bool },
 }
 
 /// Everything that reaches here as a bare string came from the transport or a serialization step —
@@ -444,7 +453,7 @@ enum CallError {
 /// carries its own retryability.
 impl From<String> for CallError {
     fn from(m: String) -> Self {
-        CallError::Upstream { message: m, retry: None, fatal: false }
+        CallError::Upstream { message: m, retry: None, fatal: false, key_certain: false }
     }
 }
 
@@ -453,7 +462,7 @@ impl CallError {
     /// serve this path at all. Statuses that MIGHT be worth another go are built at the call sites
     /// that have the response in hand, through `retry_after`.
     fn upstream(message: impl Into<String>) -> CallError {
-        CallError::Upstream { message: message.into(), retry: None, fatal: false }
+        CallError::Upstream { message: message.into(), retry: None, fatal: false, key_certain: false }
     }
 
     fn into_message(self) -> String {
@@ -483,6 +492,18 @@ fn is_credential_refusal(status: reqwest::StatusCode) -> bool {
         // says it with a 400, which the line above already covers.
         | 402 | 456
     )
+}
+
+/// Of those, which ones can ONLY be about the credential?
+///
+/// A 401, a 402 and a 456 say the key is wrong or empty, and the next film will go the same way — so
+/// it is worth blocking the whole install for a few minutes rather than discovering it title by
+/// title. A 400 or a 403 is ambiguous: OpenRouter answers 403 when a model's moderation trips, and
+/// this file already notes that film dialogue trips content filters routinely. Blocking the install
+/// on one of those lets a series whose dialogue upsets a filter take every other title down with it,
+/// ten minutes at a time, as the viewer works through the episodes.
+fn is_certainly_the_key(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 402 | 456)
 }
 
 // Knowingly NOT here: a 429 carrying OpenAI's `insufficient_quota` or Google's `RESOURCE_EXHAUSTED`,
@@ -762,8 +783,8 @@ async fn translate_batch(
         }
         // The provider's own verdict on the credential travels with the message. It is the one
         // failure the caller must not charge a slot for, since nothing was spent to earn it.
-        Err(CallError::Upstream { message, fatal: true, .. }) => {
-            Err(TranslateError { message, credential_refused: true, spent: false })
+        Err(CallError::Upstream { message, fatal: true, key_certain, .. }) => {
+            Err(TranslateError { message, credential_refused: true, key_certain, spent: false })
         }
         Err(e) => Err(e.into_message().into()),
     }
@@ -911,7 +932,7 @@ async fn call_chat_typed(
         // The status only. This string is logged, and the body is the PROVIDER's text about a
         // request that carried the user's key — OpenAI's 401 quotes a masked form of it back, and a
         // self-hosted gateway is under no obligation to mask anything.
-        return Err(CallError::Upstream { message: format!("provider {code}"), retry, fatal: is_credential_refusal(code) });
+        return Err(CallError::Upstream { message: format!("provider {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(code) });
     }
     let v = provider_json(resp).await?;
     // Contract, not Upstream: a 200 with no usable text is a safety filter or an empty candidate
@@ -1025,7 +1046,7 @@ async fn deepl_translate(
     if !resp.status().is_success() {
         let code = resp.status();
         let retry = retry_after(code, resp.headers());
-        return Err(CallError::Upstream { message: format!("deepl {code}"), retry, fatal: is_credential_refusal(code) });
+        return Err(CallError::Upstream { message: format!("deepl {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(code) });
     }
     let v = provider_json(resp).await?;
     let arr = v["translations"]
@@ -1468,6 +1489,36 @@ mod contract_tests {
         for (i, cue) in out.iter().enumerate() {
             assert_eq!(cue.text, format!("T:line {i}"), "cue {i} was reassembled out of order");
             assert_eq!(cue.index, i as u32 + 1, "cue {i} lost its index");
+        }
+    }
+
+    /// Which refusals are about the key, and which of those are certainly about the key.
+    ///
+    /// The second question decides whether a whole install is blocked for ten minutes. A 403 is also
+    /// what a provider answers when a model's moderation trips on the dialogue, and blocking the
+    /// install on that lets one series take every other title down with it as the viewer works
+    /// through the episodes.
+    #[test]
+    fn only_the_unambiguous_statuses_block_the_whole_install() {
+        use reqwest::StatusCode;
+
+        // Out of credit is the commonest way a BYOK key dies, and it is unambiguous.
+        for code in [401u16, 402, 456] {
+            let s = StatusCode::from_u16(code).unwrap();
+            assert!(is_credential_refusal(s), "{code} was not read as a credential refusal");
+            assert!(is_certainly_the_key(s), "{code} should block the install");
+        }
+        // Ambiguous: the key, or this film's dialogue. Refused and refunded, but per-title.
+        for code in [400u16, 403] {
+            let s = StatusCode::from_u16(code).unwrap();
+            assert!(is_credential_refusal(s), "{code} was not read as a credential refusal");
+            assert!(!is_certainly_the_key(s), "{code} must not block the whole install");
+        }
+        // And the moment, not the key: these retry and stay per-title.
+        for code in [429u16, 500, 503] {
+            let s = StatusCode::from_u16(code).unwrap();
+            assert!(!is_credential_refusal(s), "{code} was blamed on the credential");
+            assert!(!is_certainly_the_key(s));
         }
     }
 
@@ -2197,7 +2248,7 @@ mod contract_tests {
             sizes.lock().unwrap().push(src.len());
             Err(CallError::Upstream {
                 message: "provider 429: rate limited".into(),
-                retry: Some(Duration::ZERO), fatal: false,
+                retry: Some(Duration::ZERO), fatal: false, key_certain: false,
             })
         });
         assert!(run_translation_t(&up, &cues(40)).await.is_err());
@@ -2221,7 +2272,7 @@ mod contract_tests {
             if *n == 1 {
                 return Err(CallError::Upstream {
                     message: "provider 429".into(),
-                    retry: Some(Duration::from_secs(2)), fatal: false,
+                    retry: Some(Duration::from_secs(2)), fatal: false, key_certain: false,
                 });
             }
             Ok(src.iter().map(|s| format!("T:{s}")).collect())
@@ -2246,7 +2297,7 @@ mod contract_tests {
     #[tokio::test(start_paused = true)]
     async fn retries_are_bounded() {
         let up = fake(|_: &[String]| {
-            Err(CallError::Upstream { message: "provider 503".into(), retry: Some(Duration::ZERO), fatal: false })
+            Err(CallError::Upstream { message: "provider 503".into(), retry: Some(Duration::ZERO), fatal: false, key_certain: false })
         });
         let err = run_translation_t(&up, &cues(40)).await.expect_err("a permanent 503 must fail");
         assert!(err.message.contains("503"), "the refusal should surface, not a timeout: {}", err.message);
@@ -2261,7 +2312,7 @@ mod contract_tests {
         let up = fake(|_: &[String]| {
             Err(CallError::Upstream {
                 message: "provider 429".into(),
-                retry: Some(Duration::from_secs(3600)), fatal: false,
+                retry: Some(Duration::from_secs(3600)), fatal: false, key_certain: false,
             })
         });
         let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &no_progress).await;

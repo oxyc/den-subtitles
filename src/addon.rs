@@ -1296,13 +1296,20 @@ pub async fn handle_translate(
                         // The provider refused the key itself. Remembered install-wide rather than
                         // per title, because that is the scope of the fact — and no per-title
                         // marker, since the title is innocent and will work once the key does.
-                        Err(TranslationFailure::Credential(m)) => {
-                            eprintln!("translate: provider refused this install's credential: {m}");
-                            state.cache.put_mem(
-                                credential_refused_key(config, llm),
-                                "1".into(),
-                                SYNC_RETRY_TTL,
-                            );
+                        Err(TranslationFailure::Credential { message, key_certain }) => {
+                            eprintln!("translate: provider refused this install's credential: {message}");
+                            // The install-wide block only when the status can ONLY mean the key.
+                            // A 400 or a 403 might be this film's dialogue tripping a content
+                            // filter, and blocking the install on that lets one series take every
+                            // other title down with it, ten minutes at a time, as the viewer works
+                            // through the episodes. The per-title marker below covers that case.
+                            if key_certain {
+                                state.cache.put_mem(
+                                    credential_refused_key(config, llm),
+                                    "1".into(),
+                                    SYNC_RETRY_TTL,
+                                );
+                            }
                             // The per-title marker too, even though this is meant to be a fact about
                             // the install. `is_credential_refusal` reads a 400/403 as one, and those
                             // are not exclusively about credentials — OpenRouter answers 403 when a
@@ -1462,7 +1469,11 @@ enum TranslationFailure {
     /// The provider refused the credential itself. Distinct because it will happen identically for
     /// the next title, so it earns an install-wide backoff rather than a per-title one — and because
     /// nothing was spent to learn it, so the allowance slot is given back.
-    Credential(String),
+    ///
+    /// `key_certain` says whether it can only be about the credential. A 401 or an empty balance
+    /// can; a 400 or a 403 might instead be this film's dialogue tripping a content filter, and
+    /// blocking a whole install on one of those lets a series take every other title down with it.
+    Credential { message: String, key_certain: bool },
 }
 
 /// Carry a download failure's own verdict through to the pin.
@@ -1490,7 +1501,7 @@ impl TranslationFailure {
         match self {
             TranslationFailure::Source(m)
             | TranslationFailure::Model(m)
-            | TranslationFailure::Credential(m) => m,
+            | TranslationFailure::Credential { message: m, .. } => m,
             TranslationFailure::Allowance => "daily translation allowance used up",
         }
     }
@@ -1538,6 +1549,18 @@ async fn produce_translation(
         // which of two agreeing checks happened to run first.
         return Err(TranslationFailure::Source("source subtitle was empty".into()));
     }
+    // The size gate, before the charge rather than inside `translate`. It is a refusal, not a run:
+    // `translate` returns on it without making a single call, so charging first spent a slot on a
+    // film that sent nothing — and the per-title marker throttles that to six an hour rather than
+    // stopping it, so anything that kept asking ate the day's allowance. The cue count is known
+    // three lines above; this is the same argument the download already gets.
+    if cues.len() > translate::MAX_CUES {
+        return Err(TranslationFailure::Model(format!(
+            "subtitle too large: {} cues (max {})",
+            cues.len(),
+            translate::MAX_CUES
+        )));
+    }
     // Charged HERE — the last point before the first token is spent, and after everything that can
     // fail without spending one.
     //
@@ -1579,7 +1602,7 @@ async fn produce_translation(
             if !e.spent {
                 refund_translation(state, config);
             }
-            TranslationFailure::Credential(e.message)
+            TranslationFailure::Credential { message: e.message, key_certain: e.key_certain }
         }
         false => TranslationFailure::Model(e.message),
     })?;
