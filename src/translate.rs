@@ -231,7 +231,6 @@ async fn run_translation(
     resume: Option<&Resume<'_>>,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<Cue>, TranslateError> {
-    let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Rolling context: the tail of already-translated pairs, refreshed as batches land. Shared
     // rather than owned now that batches overlap — each one snapshots what has finished so far.
     // The lock is never held across an await, so a batch waits for no other batch.
@@ -247,6 +246,13 @@ async fn run_translation(
         deadline,
     };
 
+    // Every exit from here down is stamped with the same measurement, once, at the bottom. Asking
+    // each `return Err` to remember it is what went wrong before: the upstream-failure exit set it
+    // and the quality gate did not, so a film that billed two thirds of its batches and then failed
+    // the ratio reported `spent: false` and had its allowance slot refunded. That is the one failure
+    // that repeats identically on every title, so the daily ceiling never engaged for it.
+    let outcome: Result<Vec<Cue>, TranslateError> = async {
+    let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Terms the whole film has to agree on, derived once and pinned ahead of the rolling context in
     // every batch. It is what carries a name from the third act back to the first, and it is what
     // gives the opening batches — which now overlap, and so start with nothing translated yet — any
@@ -257,14 +263,15 @@ async fn run_translation(
         (Some(r), Some(k)) => match r.store.get(&k).and_then(|s| serde_json::from_str(&s).ok()) {
             Some(hit) => hit,
             None => {
+                // Billed where the CALL was ACCEPTED, which is what `Some` means and what neither
+                // of the two things this has been asks. "A call was made" charges the dead key for
+                // a refusal it was never billed for and loses its refund; "the result is non-empty"
+                // treats a 200 whose JSON will not parse as free, and that one is paid for.
                 let built = upstream.glossary(&sample).await;
-                // Billed where the CALL happens, not where the value lands. Flagging it on the
-                // result meant a glossary served from the store — no call at all — counted as
-                // spend, so a retry against a dead key looked paid-for and lost its refund. The
-                // batch resume path already returns before its own flag for this reason.
-                if !built.is_empty() {
+                if built.is_some() {
                     budget.billed.store(true, Ordering::Relaxed);
                 }
+                let built = built.unwrap_or_default();
                 // Only a glossary that exists is worth remembering. "No glossary" is also what a
                 // failed or unparseable derivation returns, and storing that would hold a transient
                 // provider blip in place for a day — every retry that day translating the film
@@ -279,10 +286,10 @@ async fn run_translation(
         },
         _ => {
             let built = upstream.glossary(&sample).await;
-            if !built.is_empty() {
+            if built.is_some() {
                 budget.billed.store(true, Ordering::Relaxed);
             }
-            built
+            built.unwrap_or_default()
         }
     };
 
@@ -303,17 +310,7 @@ async fn run_translation(
     let mut stream = stream::iter(pending).buffered(CONCURRENCY);
 
     while let Some(batch) = stream.next().await {
-        // Record whether anything had already been paid for before this failed. Batches surface in
-        // order, so a completed one means real tokens were billed to the viewer's key, and a caller
-        // deciding whether to refund a charge needs to know that rather than assume the failure
-        // arrived on the first call.
-        let (batch, translated) = match batch {
-            Ok(v) => v,
-            Err(mut e) => {
-                e.spent = budget.billed.load(Ordering::Relaxed);
-                return Err(e);
-            }
-        };
+        let (batch, translated) = batch?;
         for (cue, text) in batch.iter().zip(translated) {
             out.push(Cue { text, ..cue.clone() });
         }
@@ -346,6 +343,17 @@ async fn run_translation(
     // count and the same denominator, so a second one could never reach a different answer.
     debug_assert_eq!(out.len(), cues.len());
     Ok(out)
+    }
+    .await;
+
+    // The measurement, applied to whatever came back. Batches surface in order, so a completed one
+    // means real tokens were billed to the viewer's key — and the allowance slot is refunded on
+    // `!spent` for every failure kind, so a wrong answer here is a slot given back for a film that
+    // was paid for.
+    outcome.map_err(|mut e| {
+        e.spent = budget.billed.load(Ordering::Relaxed);
+        e
+    })
 }
 
 /// One batch: snapshot the context, translate, fold what changed back in. Returned with the cues it
@@ -578,7 +586,17 @@ fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap
 /// rotate out, so it needs no plumbing of its own.
 type Glossary = Vec<(String, String)>;
 
-type GlossaryFuture<'a> = Pin<Box<dyn Future<Output = Glossary> + Send + 'a>>;
+/// `None` means the provider never accepted a call, so nothing was billed — no chat path, an empty
+/// sample, or a request it refused. `Some` means a call went through and was paid for, and an empty
+/// vec inside one is a real answer that yielded no usable terms.
+///
+/// The distinction is worth a type because both halves of it cost money in opposite directions. A
+/// refused call charges nothing, and treating it as spend loses the allowance refund on exactly the
+/// dead-key run the refund exists for. An accepted call charges for up to `GLOSSARY_SAMPLE_CHARS` of
+/// input whatever comes back, and reading its empty result as "no call" refunded work already paid
+/// for — a 200 whose JSON will not parse, or whose every term `parse_glossary` filters, both land
+/// there.
+type GlossaryFuture<'a> = Pin<Box<dyn Future<Output = Option<Glossary>> + Send + 'a>>;
 
 /// One upstream call: a batch of source lines in, the same number of translated lines out (or an
 /// error). Taken as a parameter so the contract logic below is testable without a provider.
@@ -603,7 +621,7 @@ trait BatchCall: Sync {
         &'a self,
         _sample: &'a [String],
     ) -> GlossaryFuture<'a> {
-        Box::pin(async { Vec::new() })
+        Box::pin(async { None })
     }
 }
 
@@ -698,7 +716,7 @@ impl BatchCall for Upstream<'_> {
         Box::pin(async move {
             // DeepL has no chat path and ignores context entirely, so there is nothing to give it.
             if self.llm.provider == Provider::DeepL || sample.is_empty() {
-                return Vec::new();
+                return None;
             }
             let system = format!(
                 "You are preparing a translation glossary for a film's subtitles. From the dialogue \
@@ -712,15 +730,18 @@ impl BatchCall for Upstream<'_> {
             );
             let user = match serde_json::to_string(sample) {
                 Ok(json) => json,
-                Err(_) => return Vec::new(),
+                Err(_) => return None,
             };
             match call_chat_typed(self.client, self.llm, &system, &user).await {
-                Ok(text) => parse_glossary(&text),
+                // Accepted, so billed — even when `parse_glossary` keeps nothing out of it.
+                Ok(text) => Some(parse_glossary(&text)),
                 // Never fatal. A film translates perfectly well without a glossary; it just has to
-                // lean on the rolling context alone, which is where it was before.
+                // lean on the rolling context alone, which is where it was before. And `None`, not
+                // an empty glossary: a refused call was not paid for, and the run's refund turns on
+                // that difference.
                 Err(e) => {
                     eprintln!("translate: no glossary ({}) — continuing without one", e.into_message());
-                    Vec::new()
+                    None
                 }
             }
         })
@@ -1418,7 +1439,7 @@ mod contract_tests {
                 &'a self,
                 _sample: &'a [String],
             ) -> GlossaryFuture<'a> {
-                Box::pin(async { vec![("Westeros".to_string(), "Västeros".to_string())] })
+                Box::pin(async { Some(vec![("Westeros".to_string(), "Västeros".to_string())]) })
             }
         }
 
@@ -1630,6 +1651,20 @@ mod contract_tests {
         }
         let err = run_translation_t(&SlowFirst, &cues(160)).await.expect_err("a 403 must fail the run");
         assert!(err.spent, "batches billed in the concurrency window were not counted as spend");
+
+        // The QUALITY GATE exit, which is the expensive one and the one that used to answer this
+        // wrong. `unusable` is a ratio against the whole film, so it cannot fire before two thirds
+        // of the batches have come back — every one of them billed. Reporting `spent: false` here
+        // refunded the allowance slot for a film that had just been paid for, and this is the single
+        // failure that repeats identically on every title, so the daily ceiling never engaged.
+        let up = fake(|src: &[String]| Ok(src.to_vec())); // echoes: every cue falls to the keep leaf
+        let err = run_translation_t(&up, &cues(120)).await.expect_err("an echoing model must fail");
+        assert!(
+            err.message.contains("unusable"),
+            "expected the quality gate, got: {}",
+            err.message
+        );
+        assert!(err.spent, "a film refused by the quality gate claimed nothing had been paid for");
     }
 
     /// A film that dies partway must not be re-bought from the start. The completed batches are

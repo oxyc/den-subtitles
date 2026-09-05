@@ -939,13 +939,12 @@ fn quota_key(config: &str, now: std::time::SystemTime) -> String {
     format!("quota:{}:{day}", short_hash(config))
 }
 
-/// Take one from today's allowance, or refuse. Charged only where a run actually BEGINS: a cache
-/// hit, a resumed batch, and the `.srt` half of the app's own two-request flow are all free, because
-/// none of them spends anything.
-/// Give a slot back, for a run that was charged and then spent nothing.
+/// Give a slot back, for a run that was charged and then spent nothing at all.
 ///
-/// Only the provider refusing the credential qualifies: that answer arrives on the first call, before
-/// a token is sent. A timeout or a rate limit may well have spent plenty.
+/// "Nothing at all" is both resources, not just the model: a request that bought a metered
+/// OpenSubtitles credit keeps its slot even though no token was sent, because the daily allowance is
+/// what bounds how many distinct titles can spend credits. The caller decides — see the two
+/// conditions at the one call site.
 fn refund_translation(state: &Arc<AppState>, config: &str) {
     let key = quota_key(config, std::time::SystemTime::now());
     let used: u64 = state.cache.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1018,9 +1017,14 @@ fn refusal_scope(
     if spent {
         return RefusalScope::Series;
     }
+    // Nothing billed and the status is ambiguous, so this rests on corroboration — and `spent` is a
+    // weaker witness here than it looks. A content filter that objects to a show's dialogue objects
+    // to the GLOSSARY sample too, which is drawn from that same dialogue, so the filtered case often
+    // reaches here having billed nothing at all rather than arriving above.
     match ambiguous_refusal_escalates(state, config, llm, title) {
-        true => RefusalScope::Install,
-        false => RefusalScope::TitleOnly,
+        Corroboration::Unrelated => RefusalScope::Install,
+        Corroboration::SameSeries => RefusalScope::Series,
+        Corroboration::None => RefusalScope::TitleOnly,
     }
 }
 
@@ -1036,16 +1040,44 @@ fn refusal_scope(
 /// The memory of the last refusal deliberately outlives the block it can arm. Sharing a lifetime
 /// with it meant that every time the block lapsed the evidence had lapsed too, so re-arming took two
 /// fresh titles and two more metered downloads, every window.
+///
+/// What the second title IS decides how far it reaches. Two episodes of one show corroborate
+/// nothing about the key — a content filter objects to a show, and a season is the browsing pattern
+/// that produces two refusals fastest — so they arm the series. It takes an unrelated title to
+/// implicate the credential. Reading any second title as the install let a filtered series take the
+/// library down ten minutes at a time, which is what the doc above says must not happen; reading a
+/// season as one title, which the previous shape did, left it with no throttle at all.
 fn ambiguous_refusal_escalates(
     state: &Arc<AppState>,
     config: &str,
     llm: &LlmConfig,
     title: &str,
-) -> bool {
+) -> Corroboration {
     let seen = ambiguous_refusal_key(config, llm);
-    let escalate = matches!(state.cache.get_mem(&seen), Some(other) if other != title);
+    let verdict = match state.cache.get_mem(&seen) {
+        // The same title repeating is still one film's dialogue, however many times it repeats.
+        Some(prev) if prev == title => Corroboration::None,
+        Some(prev) if series_of(&prev) == series_of(title) => Corroboration::SameSeries,
+        Some(_) => Corroboration::Unrelated,
+        None => Corroboration::None,
+    };
     state.cache.put_mem(seen, title.to_string(), 2 * SYNC_RETRY_TTL);
-    escalate
+    verdict
+}
+
+/// What a second ambiguous refusal corroborates.
+enum Corroboration {
+    /// Nothing yet, or the same title again.
+    None,
+    /// Another episode of the show that refused last time.
+    SameSeries,
+    /// A different show or a film — the part that implicates the credential rather than a script.
+    Unrelated,
+}
+
+/// The series half of a `title_id`. `imdb` ids carry no colon, so the first segment is the show.
+fn series_of(title: &str) -> &str {
+    title.split(':').next().unwrap_or(title)
 }
 
 /// Is today's allowance already gone? A read, not a charge.
@@ -1061,6 +1093,9 @@ fn allowance_used_up(state: &Arc<AppState>, config: &str) -> bool {
     used >= DAILY_TRANSLATIONS
 }
 
+/// Take one from today's allowance, or refuse. Charged only where a run actually BEGINS: a cache
+/// hit, a resumed batch, and the `.srt` half of the app's own two-request flow are all free, because
+/// none of them spends anything.
 fn charge_translation(state: &Arc<AppState>, config: &str) -> bool {
     let key = quota_key(config, std::time::SystemTime::now());
     let used: u64 = state.cache.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1668,6 +1703,11 @@ async fn produce_translation(
     if allowance_used_up(state, config) {
         return Err(TranslationFailure::Allowance);
     }
+    // Whether this request is about to spend a metered OpenSubtitles credit, asked BEFORE the fetch
+    // because afterwards the answer is always "it is cached now". Read pessimistically: a source
+    // already on disk costs nothing, and anything else is assumed to have cost a credit, which is
+    // the safe direction for a quota whose free tier is a handful a day.
+    let source_was_cached = state.cache.get(&os_base_key(source_file_id)).is_some();
     // A download failure is NOT charged to the source. An exhausted daily credit and a dead upload
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
     // on it would re-pick the source, and re-buy every language of the film, because the viewer ran
@@ -1746,15 +1786,18 @@ async fn produce_translation(
     // None of the harness's failures says anything about which file was chosen, so none of them
     // touches the pin.
     let translated = translated.map_err(|e| {
-        // The slot exists to meter what the viewer's key is billed, so what it answers to is
-        // `spent`, not the shape of the failure. A run that made no upstream call bought nothing
-        // and gives the slot back; one refused after some batches landed was paid for in real
-        // tokens and keeps it, since refunding that is the same accounting mistake reversed.
+        // Refunded only when this request spent NOTHING — no tokens on the viewer's key and no
+        // metered OpenSubtitles credit. Both halves are load-bearing and each was wrong on its own.
         //
-        // This was once asked only of credential refusals, and the gap showed on a resumed run: its
-        // batches all came back from the store, the assembled result tripped the `unusable` ratio
-        // gate, and a slot went on a run that had not called the provider once.
-        if !e.spent {
+        // Asking only about the failure's shape missed the resumed run whose batches all came back
+        // from the store and then tripped the ratio gate: a slot for a run that never called the
+        // provider. Asking only about tokens gave the slot back for a request that had just bought
+        // a metered download — and the daily allowance is the ONLY thing bounding how many distinct
+        // titles a viewer can burn credits on, since a `Model` failure arms no install-wide marker
+        // the way a credential refusal does. A typo'd model name answers 404 for every title, so a
+        // twenty-episode season became twenty credits out of a free tier of a handful, with the
+        // counter back where it started each time.
+        if !e.spent && source_was_cached {
             refund_translation(state, config);
         }
         match e.credential_refused {
@@ -2284,11 +2327,17 @@ mod translate_retry_tests {
         // handler diverging from it, which is how the series case got in.
         let refuse = |title: &str| ambiguous_refusal_escalates(&films, "install-one", &llm, title);
 
-        assert!(!refuse("tt0111161:0:0"), "one title blocked the whole install");
+        assert!(matches!(refuse("tt0111161:0:0"), Corroboration::None), "one title corroborated");
         // The same title again is still one film — a filtered film must not escalate by repeating.
-        assert!(!refuse("tt0111161:0:0"), "the same title twice blocked the install");
-        // A different one is the signal that this is the key, not the dialogue.
-        assert!(refuse("tt0068646:0:0"), "two distinct titles did not escalate");
+        assert!(
+            matches!(refuse("tt0111161:0:0"), Corroboration::None),
+            "the same title twice corroborated itself"
+        );
+        // An UNRELATED one is the signal that this is the key, not the dialogue.
+        assert!(
+            matches!(refuse("tt0068646:0:0"), Corroboration::Unrelated),
+            "two unrelated films did not implicate the credential"
+        );
 
         // Episodes of one series are DIFFERENT titles here. `parse_id` returns the SERIES id, so
         // building this from that alone made every episode read as one title and the escalation
@@ -2306,8 +2355,22 @@ mod translate_retry_tests {
         let series = state("ambiguous-series");
         let refuse = |title: &str| ambiguous_refusal_escalates(&series, "install-one", &llm, title);
         let ep = |s, e| title_id("tt1234567", Some(s), Some(e));
-        assert!(!refuse(&ep(2, 5)), "one episode blocked the whole install");
-        assert!(refuse(&ep(2, 6)), "the next episode of the same series did not escalate");
+        assert!(matches!(refuse(&ep(2, 5)), Corroboration::None), "one episode corroborated");
+        // A second EPISODE is a second title, so it is evidence — but only about the show. A content
+        // filter objects to a script, and a season is the fastest way to produce two refusals, so
+        // reading this as the credential let one filtered show block the library ten minutes at a
+        // time. It takes something unrelated to say anything about the key.
+        assert!(
+            matches!(refuse(&ep(2, 6)), Corroboration::SameSeries),
+            "the next episode of the same series did not corroborate the show"
+        );
+        assert!(
+            matches!(refuse("tt0111161:0:0"), Corroboration::Unrelated),
+            "a film after a series did not implicate the credential"
+        );
+        // Series ids compared as ids, not as prefixes of the whole title string.
+        assert_eq!(series_of(&ep(2, 6)), "tt1234567");
+        assert_ne!(series_of(&ep(2, 6)), series_of("tt12345678:2:6"));
 
         // The real decision, not a copy of it spelled inline — the previous version of this test
         // re-typed the rule as a closure, which passes just as happily when the handler stops
@@ -2333,9 +2396,14 @@ mod translate_retry_tests {
             series_refused_key("install-three", &llm, "tt1234567"),
             "one install's filtered series backed off another install"
         );
-        // A dead key bills nothing, so it still escalates to the install on the second title.
+        // A dead key bills nothing, so it rests on corroboration — and a second EPISODE is not the
+        // corroboration that implicates a key. This is the case `spent` cannot catch: a content
+        // filter that objects to a show's dialogue objects to the glossary sample drawn from that
+        // same dialogue, so the filtered run often bills nothing and arrives here rather than above.
         assert!(matches!(scope(false, false, &ep(4, 1)), RefusalScope::TitleOnly));
-        assert!(matches!(scope(false, false, &ep(4, 2)), RefusalScope::Install));
+        assert!(matches!(scope(false, false, &ep(4, 2)), RefusalScope::Series));
+        // An unrelated title is what implicates the credential.
+        assert!(matches!(scope(false, false, "tt0068646:0:0"), RefusalScope::Install));
         // And an unambiguous status blocks at once, billed or not — a key revoked mid-run is dead.
         assert!(matches!(scope(true, true, &ep(5, 1)), RefusalScope::Install));
 
