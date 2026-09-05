@@ -263,10 +263,10 @@ async fn run_translation(
         (Some(r), Some(k)) => match r.store.get(&k).and_then(|s| serde_json::from_str(&s).ok()) {
             Some(hit) => hit,
             None => {
-                // Billed where the CALL was ACCEPTED, which is what `Some` means and what neither
-                // of the two things this has been asks. "A call was made" charges the dead key for
-                // a refusal it was never billed for and loses its refund; "the result is non-empty"
-                // treats a 200 whose JSON will not parse as free, and that one is paid for.
+                // Billed where the CALL WAS ANSWERED, which is what `Some` means, and neither of the
+                // two things this has been asks that. "A call was made" charges the dead key for a
+                // refusal it was never billed for and loses its refund; "the result is non-empty"
+                // treats a 200 whose JSON will not parse as free, and that one is paid for in full.
                 let built = upstream.glossary(&sample).await;
                 if built.is_some() {
                     budget.billed.store(true, Ordering::Relaxed);
@@ -735,10 +735,17 @@ impl BatchCall for Upstream<'_> {
             match call_chat_typed(self.client, self.llm, &system, &user).await {
                 // Accepted, so billed — even when `parse_glossary` keeps nothing out of it.
                 Ok(text) => Some(parse_glossary(&text)),
-                // Never fatal. A film translates perfectly well without a glossary; it just has to
-                // lean on the rolling context alone, which is where it was before. And `None`, not
-                // an empty glossary: a refused call was not paid for, and the run's refund turns on
-                // that difference.
+                // Never fatal either way. A film translates perfectly well without a glossary; it
+                // just leans on the rolling context alone, which is where it was before.
+                //
+                // But WHICH failure decides whether this was paid for, and the two look alike from
+                // here. `Contract` is a 200 charged for in full whose body was prose or empty — the
+                // safety-filtered film is exactly this, and it is the one whose batches then fail
+                // the same way. `Upstream` is a refusal, or a transport error, and costs nothing.
+                Err(CallError::Contract(m)) => {
+                    eprintln!("translate: no glossary ({m}) — continuing without one");
+                    Some(Vec::new())
+                }
                 Err(e) => {
                     eprintln!("translate: no glossary ({}) — continuing without one", e.into_message());
                     None
@@ -791,8 +798,16 @@ async fn translate_batch(
         return Err("translation ran out of time".to_string().into());
     }
     let result = call_with_retries(upstream, sources, context, budget).await;
-    // A call that came back is a call that was billed, whatever we go on to think of its contents.
-    if result.is_ok() {
+    // A call that came back is a call that was billed, whatever we go on to think of its contents —
+    // and `Contract` is exactly that: a 200 the provider charged for, whose body then turned out to
+    // be prose, unparseable, oversized, or empty because a safety filter emptied it. Reading it as
+    // unbilled was the expensive half of this: a `Contract` reply splits the batch, so ONE such
+    // batch is 2n-1 = 79 billed calls, and a film that answers this way throughout reaches the
+    // quality gate at batch 21 having bought ~1,660 of them — then reported spending nothing and had
+    // its allowance slot refunded, which is the ceiling that was supposed to stop it. `Upstream`
+    // stays unbilled: a refusal is charged for nothing, and so is a transport failure, which arrives
+    // here as one.
+    if matches!(result, Ok(_) | Err(CallError::Contract(_))) {
         budget.billed.store(true, Ordering::Relaxed);
     }
 
@@ -1665,6 +1680,26 @@ mod contract_tests {
             err.message
         );
         assert!(err.spent, "a film refused by the quality gate claimed nothing had been paid for");
+
+        // And the same gate reached by CONTRACT failures, which is the dear way to reach it and the
+        // one an echoing model cannot stand in for. A `Contract` reply is a 200 the provider charged
+        // for whose body was prose or empty — a safety filter on a 200 does this — and it SPLITS,
+        // so one batch is 2n-1 calls rather than one. Asserting only through the `Ok` path let this
+        // report `spent: false` after some 1,660 billed calls, and the slot went back.
+        let up = fake(|_: &[String]| Err(CallError::Contract("model did not return a JSON array".into())));
+        let err = run_translation_t(&up, &cues(120)).await.expect_err("a prose model must fail");
+        assert!(
+            err.message.contains("unusable"),
+            "expected the quality gate, got: {}",
+            err.message
+        );
+        assert!(err.spent, "a film of billed 200s claimed nothing had been paid for");
+
+        // The other side of that line: a refusal is charged for nothing, and a transport error
+        // arrives here as one. This is the dead-key run the refund exists for.
+        let up = fake(|_: &[String]| Err(CallError::upstream("connection reset")));
+        let err = run_translation_t(&up, &cues(120)).await.expect_err("a dead transport must fail");
+        assert!(!err.spent, "a run that never reached the provider was billed for it");
     }
 
     /// A film that dies partway must not be re-bought from the start. The completed batches are
