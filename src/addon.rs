@@ -582,7 +582,14 @@ async fn subtitle_srt(
         return Err(e);
     }
     let body = match client.download(file_id).await {
-        Ok(body) => body,
+        Ok(body) => {
+            // A success clears the record. Without this the counter tallies failures across a whole
+            // day with no credit for the successes between them, so a file that works nine times out
+            // of ten still gets convicted on its second bad afternoon — and the verdict is the one
+            // thing trusted to drop a pin shared by every install.
+            forget_failure(state, file_id);
+            body
+        }
         Err(e) => {
             remember_failure(state, client, file_id, &e);
             return Err(e);
@@ -670,10 +677,22 @@ fn dead_file_key(file_id: i64) -> String {
     format!("{SYNCFAIL}dl:gone:{}", os_base_key(file_id))
 }
 
-/// "The link for this file failed once." One strike, shared, and it lasts as long as the verdict it
-/// can become: a second failure inside its lifetime promotes to `dead_file_key`.
-fn suspect_file_key(file_id: i64) -> String {
-    format!("{SYNCFAIL}dl:suspect:{}", os_base_key(file_id))
+/// "Stop asking about this file for a moment." Short, shared, and it DOES gate — which is what keeps
+/// a burst of requests for one failing file to a single spent credit.
+fn suspect_backoff_key(file_id: i64) -> String {
+    format!("{SYNCFAIL}dl:backoff:{}", os_base_key(file_id))
+}
+
+/// "This file failed at this time." The promotion counter, holding the unix second of the first
+/// failure — deliberately NOT the same key as the gate above.
+///
+/// One key tried to be both and could not. Gating on the counter made the promotion unreachable,
+/// since the attempt whose failure would confirm the strike was the attempt being refused. Not
+/// gating on it made the promotion instant: twenty picker URLs all fetch the same reference, so
+/// waiter one wrote the strike and waiter two confirmed it milliseconds later — two failures from
+/// one incident, fabricating a verdict that is supposed to mean two occasions.
+fn suspect_strike_key(file_id: i64) -> String {
+    format!("{SYNCFAIL}dl:strike:{}", os_base_key(file_id))
 }
 
 /// "This credential could not fetch this file just now." Quota, a revoked key, a blip — facts about
@@ -693,21 +712,41 @@ fn remembered_failure(
     if state.cache.get(&dead_file_key(file_id)).is_some() {
         return Some(opensubtitles::DownloadError::Gone(format!("file {file_id} is gone (remembered)")));
     }
-    // A live STRIKE is deliberately not consulted here.
-    //
-    // It was, and that made the promotion it exists for unreachable: this function is the last thing
-    // checked before the only download call in the program, so a strike refused the very attempt
-    // whose failure would have confirmed it. A junk upload then looped forever — one metered credit
-    // and one of the fifty daily translations per cycle — and never became `Gone`, so it never
-    // unpinned either. Letting the second attempt through costs one more credit and buys a verdict.
+    // The BACKOFF gates; the strike counter deliberately does not. A burst of requests for one
+    // failing file must cost one credit, not one each — but the attempt that confirms a strike has
+    // to be allowed through, and it is, ten minutes later when this lapses.
     //
     // `get_mem` to match `put_mem` — going through `get` would probe a disk tier nothing writes to.
+    if state.cache.get_mem(&suspect_backoff_key(file_id)).is_some() {
+        return Some(opensubtitles::DownloadError::Suspect(format!(
+            "file {file_id} would not download (remembered)"
+        )));
+    }
     if state.cache.get_mem(&unavailable_file_key(client, file_id)).is_some() {
         return Some(opensubtitles::DownloadError::Unavailable(format!(
             "file {file_id} unavailable (remembered)"
         )));
     }
     None
+}
+
+/// Seconds since the epoch. Wall clock rather than a monotonic instant because it is stored and
+/// compared across requests; a backward clock step just delays a promotion.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Drop the suspicion record for a file that has just downloaded cleanly.
+///
+/// Only the two `Suspect` keys. A `Gone` verdict is not forgotten here: it is the API's own answer
+/// about the id, or a confirmed pair, and it gates this function's caller — so reaching a success
+/// with one live is not something a clean download should quietly overwrite.
+fn forget_failure(state: &Arc<AppState>, file_id: i64) {
+    state.cache.remove_mem(&suspect_backoff_key(file_id));
+    state.cache.remove_mem(&suspect_strike_key(file_id));
 }
 
 /// Remember a download failure so the next request does not spend a credit rediscovering it.
@@ -725,15 +764,22 @@ fn remember_failure(
     use opensubtitles::DownloadError::*;
     match e {
         Gone(_) => state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL),
-        // Second failure inside the strike's window: two independent link failures on one file is
-        // enough. The strike lasts as long as the verdict, so the pair costs two metered credits and
-        // then a day of quiet — rather than one credit every ten minutes forever, which is what a
-        // short strike that could never promote actually did.
+        // Two failures on two OCCASIONS promote. The gate is always refreshed, so a burst costs one
+        // credit; the counter promotes only when the earlier failure is at least a backoff window
+        // old, so the confirming attempt is one that genuinely had to be let through rather than a
+        // sibling from the same instant.
         Suspect(_) => {
-            let strike = suspect_file_key(file_id);
-            match state.cache.get_mem(&strike).is_some() {
-                true => state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL),
-                false => state.cache.put_mem(strike, "1".into(), DEAD_FILE_TTL),
+            state.cache.put_mem(suspect_backoff_key(file_id), "1".into(), SYNC_RETRY_TTL);
+            let strike = suspect_strike_key(file_id);
+            let first = state.cache.get_mem(&strike).and_then(|v| v.parse::<u64>().ok());
+            match first {
+                Some(then) if unix_seconds().saturating_sub(then) >= SYNC_RETRY_TTL.as_secs() => {
+                    state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL)
+                }
+                // Already counted, too recent to confirm — leave it, so the clock keeps running from
+                // the FIRST failure rather than being pushed forward by every sibling in a burst.
+                Some(_) => {}
+                None => state.cache.put_mem(strike, unix_seconds().to_string(), DEAD_FILE_TTL),
             }
         }
         Unavailable(_) => {
@@ -1930,21 +1976,38 @@ mod translate_retry_tests {
         remember_failure(&state, &client, 5, &DownloadError::Gone("404".into()));
         assert!(matches!(remembered_failure(&state, &client, 5), Some(DownloadError::Gone(_))));
 
-        // One suspect link fetch is a strike, not a verdict. It must NOT read back as anything — the
-        // gate is the last thing checked before the only download call, so a strike that gated would
-        // refuse the very attempt whose failure confirms it, and the promotion below could never
-        // happen. That is what made a junk upload loop forever at a credit a cycle.
+        // One suspect link fetch earns a short backoff, so a burst of requests for the same file
+        // costs one credit rather than one each. It reads back as `Suspect`, which refuses without
+        // unpinning anything.
+        remember_failure(&state, &client, 6, &DownloadError::Suspect("link 404".into()));
+        assert!(matches!(remembered_failure(&state, &client, 6), Some(DownloadError::Suspect(_))));
+
+        // A sibling from the SAME incident must not confirm it. Twenty picker URLs all fetch the
+        // same reference, so two failures land milliseconds apart — one event, and the verdict they
+        // would fabricate is the only one trusted to drop a pin shared by every install.
         remember_failure(&state, &client, 6, &DownloadError::Suspect("link 404".into()));
         assert!(
-            remembered_failure(&state, &client, 6).is_none(),
-            "a strike gated the retry that has to promote it"
+            state.cache.get(&dead_file_key(6)).is_none(),
+            "a burst confirmed itself and fabricated a verdict"
         );
-        // The second attempt is what earns the verdict, and from then on it is remembered — so the
-        // pair costs two metered credits and then a day of quiet.
+
+        // A failure on a LATER occasion does confirm it. Backdating the strike past the backoff
+        // window stands in for waiting one out.
+        let long_ago = (unix_seconds() - SYNC_RETRY_TTL.as_secs() - 1).to_string();
+        state.cache.put_mem(suspect_strike_key(6), long_ago, DEAD_FILE_TTL);
         remember_failure(&state, &client, 6, &DownloadError::Suspect("link 404".into()));
         assert!(
             matches!(remembered_failure(&state, &client, 6), Some(DownloadError::Gone(_))),
-            "a repeat was not escalated"
+            "a second occasion did not confirm the file is dead"
+        );
+
+        // And a clean download clears the record, so a file that works nine times in ten is never
+        // convicted by two bad afternoons a day apart.
+        remember_failure(&state, &client, 8, &DownloadError::Suspect("blip".into()));
+        forget_failure(&state, 8);
+        assert!(
+            remembered_failure(&state, &client, 8).is_none(),
+            "a success left the file under suspicion"
         );
 
         // A credential's own trouble is remembered per credential, not for everyone: one install

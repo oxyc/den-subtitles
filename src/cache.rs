@@ -255,6 +255,16 @@ impl Cache {
         }
     }
 
+    /// Forget a memory-only key. The companion to `put_mem` that `remove` would be wrong for: that
+    /// one also unlinks a file, which for a key nothing ever wrote to disk is a syscall to delete
+    /// something that was never there.
+    pub fn remove_mem(&self, key: &str) {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(e) = g.map.remove(key) {
+            g.bytes -= e.size;
+        }
+    }
+
     /// Read from memory only. The companion to `put_mem`: going through `get` would fall through to
     /// a disk probe that, for a key only ever written by `put_mem`, cannot hit — a blocking `open`
     /// per lookup, ~150 of them per resumed film, all of them ENOENT.
