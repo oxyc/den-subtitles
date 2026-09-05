@@ -153,7 +153,15 @@ impl Cache {
         if total <= budget {
             return;
         }
-        live.sort_by_key(|(mtime, _, _)| *mtime);
+        // Cheapest-to-rebuild first, and only then oldest-first.
+        //
+        // Age alone is the wrong question here. `disk_get` never touches mtime, so the disk tier
+        // evicts in WRITE order, not use order: a translation served every evening for two months
+        // looks exactly as old as one watched once and abandoned, and gets deleted just as readily.
+        // And the entries are nowhere near equal in what losing them costs — a search is a free
+        // round trip to rebuild, a downloaded subtitle is one metered credit, a translation is a
+        // whole film's LLM bill against the viewer's own provider account.
+        live.sort_by_key(|(mtime, _, path)| (Self::evict_rank(path), *mtime));
         for (_, size, path) in live {
             if total <= budget {
                 break;
@@ -161,6 +169,30 @@ impl Cache {
             if std::fs::remove_file(&path).is_ok() {
                 total -= size;
             }
+        }
+    }
+
+    /// Eviction order for one stored file: what it costs to lose, cheapest first.
+    ///
+    /// Read back off the filename, which is the key base64'd — and for an over-long key, the base64
+    /// of its first 32 characters plus a hash. Either way the leading namespace survives, which is
+    /// all this needs. Anything unreadable sorts first: a file this cache cannot name is a file it
+    /// cannot serve.
+    fn evict_rank(path: &std::path::Path) -> u8 {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return 0 };
+        let head = name.split('~').next().unwrap_or(name);
+        let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(head) else { return 0 };
+        let key = String::from_utf8_lossy(&bytes);
+        if key.starts_with("search:") {
+            0 // a free round trip to rebuild
+        } else if key.starts_with("os:") {
+            1 // one metered download credit
+        } else if key.starts_with("translate:") {
+            2 // a whole film's LLM bill
+        } else {
+            // Pins, allowance counters, failure markers. All tiny, so evicting them frees nothing —
+            // and a lost pin can cost a re-translation of every language of a film.
+            3
         }
     }
 
@@ -488,6 +520,29 @@ mod tests {
         assert_eq!(fresh.get("new"), Some("x".repeat(40)), "the newest entry must survive");
         let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
         assert!(bytes <= 60, "the sweep left {bytes} bytes on disk, over the 60 budget");
+    }
+
+    /// Under pressure the sweep spends the cheap entries first. Age alone made it evict in WRITE
+    /// order — `disk_get` never touches mtime — so a translation served every evening looked exactly
+    /// as old as one watched once, and a free-to-refetch search entry written a minute later
+    /// outlived it. What the entries cost to lose is nowhere near equal: a search is a round trip, a
+    /// downloaded subtitle is one metered credit, a translation is a whole film's LLM bill.
+    #[test]
+    fn the_sweep_spends_the_cheap_entries_first() {
+        let dir = tmpdir("sweep-rank");
+        // The expensive entry is written FIRST, so age alone would take it.
+        let c = Cache::new(120, Some(dir.clone()));
+        c.put("translate:500:SV:openai:m".into(), "x".repeat(40), HOUR);
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime has 1s resolution
+        c.put("os:777".into(), "x".repeat(40), HOUR);
+        c.put("search:tt0111161:0:0:".into(), "x".repeat(40), HOUR);
+
+        let translation = c.disk_path("translate:500:SV:openai:m").unwrap();
+        let search = c.disk_path("search:tt0111161:0:0:").unwrap();
+        c.sweep();
+
+        assert!(!search.exists(), "the free-to-rebuild entry survived");
+        assert!(translation.exists(), "a film's LLM bill was evicted before a search round trip");
     }
 
     /// A sweep must never remove a live entry while it is still under budget — evicting eagerly

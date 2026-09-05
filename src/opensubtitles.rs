@@ -139,7 +139,11 @@ impl<'a> Client<'a> {
         // silently shows nothing forever.
         if !resp.status().is_success() {
             let code = resp.status();
-            return Err(DownloadError::from_status(code, format!("subtitle link {code}")));
+            // Unavailable whatever the status, unlike the API call above. This is a one-shot
+            // capability URL, and the comment above says what a 404 here usually means: the link
+            // expired, or it was rate-limited. That is the service, not the file — and `Gone`
+            // mutates state shared by every install, so it is reserved for the API's own verdict.
+            return Err(DownloadError::Unavailable(format!("subtitle link {code}")));
         }
         let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY)
             .await
@@ -147,10 +151,12 @@ impl<'a> Client<'a> {
         // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
         // enough. Anything with no cue in it cannot be one.
         //
-        // `Gone`, not `Unavailable`: this body arrived intact and is not a subtitle, which is a fact
-        // about the file and not about the service.
+        // `Unavailable`, deliberately, despite this looking like a fact about the file: the comment
+        // above is the reason. An interstitial or an error page served as a 200 is the far more
+        // common cause than a genuinely cue-less upload, and `Gone` drops a pin shared by every
+        // install and every language. The API's 404 is the signal for a file that is really gone.
         if !crate::srt::has_a_cue(&body) {
-            return Err(DownloadError::Gone("subtitle link returned no cues".to_string()));
+            return Err(DownloadError::Unavailable("subtitle link returned no cues".to_string()));
         }
         Ok(body)
     }
@@ -171,8 +177,11 @@ pub enum DownloadError {
 }
 
 impl DownloadError {
-    /// 404 and 410 name the file. Everything else — 401/403 (key), 406/429 (quota), 5xx — is the
-    /// service, and a file id must survive all of them.
+    /// 404 and 410 from the API name the file. Everything else — 401/403 (key), 406/429 (quota),
+    /// 5xx — is the service, and a file id must survive all of them.
+    ///
+    /// Used at the API call only. The CDN link that follows it classifies everything as
+    /// `Unavailable`: a 404 there means an expired one-shot URL, not a missing file.
     fn from_status(status: reqwest::StatusCode, message: String) -> DownloadError {
         match status.as_u16() {
             404 | 410 => DownloadError::Gone(message),
@@ -446,13 +455,17 @@ mod download_tests {
     /// downloads for the day.
     #[tokio::test]
     async fn a_download_error_says_whose_fault_it_is() {
-        // The upload is gone: whatever named this file should stop naming it.
+        // Only one signal names the file: the API's own 404/410 for that id. Everything the CDN
+        // says is about the service — `Gone` drops state shared by every install and language, so it
+        // is deliberately the narrow, authoritative case.
         let err = download_from("404 Not Found", "gone").await.expect_err("404 must fail");
-        assert!(matches!(err, DownloadError::Gone(_)), "a 404 is the file's fault: {err:?}");
+        assert!(matches!(err, DownloadError::Unavailable(_)),
+            "the CDN's 404 means an expired link, not a missing file: {err:?}");
 
-        // A body that arrives intact and is not a subtitle is also the file's fault.
+        // A body that arrives as a 200 and is not a subtitle is an interstitial far more often than
+        // a genuinely cue-less upload.
         let err = download_from("200 OK", "<html>not a subtitle</html>").await.expect_err("must fail");
-        assert!(matches!(err, DownloadError::Gone(_)), "a cue-less body is the file's fault: {err:?}");
+        assert!(matches!(err, DownloadError::Unavailable(_)), "a cue-less 200 dropped the pin: {err:?}");
 
         // Quota, rate limit and server trouble are the service's, and a file id must survive them.
         for status in ["406 Not Acceptable", "429 Too Many Requests", "503 Service Unavailable", "403 Forbidden"] {
@@ -462,6 +475,16 @@ mod download_tests {
                 "{status} was blamed on the file: {err:?}"
             );
         }
+
+        // And the API's verdict on the id itself is the one thing that does name the file.
+        assert!(matches!(
+            DownloadError::from_status(reqwest::StatusCode::NOT_FOUND, "opensubtitles download 404".into()),
+            DownloadError::Gone(_)
+        ));
+        assert!(matches!(
+            DownloadError::from_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "opensubtitles download 429".into()),
+            DownloadError::Unavailable(_)
+        ));
     }
 
     /// The API call was status-checked and the CDN fetch that follows it was not, so an expired or

@@ -48,6 +48,10 @@ const SEARCH_TTL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
 /// long enough that the queue behind a single-flighted miss does not run one live search each,
 /// serially, at up to the client timeout apiece.
 const SEARCH_FAIL_TTL: Duration = Duration::from_secs(30);
+/// How long a file the API says does not exist is remembered as not existing. A day: long enough
+/// that a dead track in a picker list stops costing a download credit per playback, short enough
+/// that an upload restored tomorrow is picked up.
+const DEAD_FILE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 /// Lifetime of a pinned translation source. Deliberately longer than `CACHE_TTL`, so the translation
 /// it protects always expires FIRST: losing the pin while the body survives means a re-pick, a
 /// different body key, and paying for a film that is still sitting in the cache. Once the body is
@@ -274,7 +278,14 @@ async fn cached_search(
     // pick differently from each, and the two runs land under different body keys where the
     // single-flight guard on that key cannot collapse them. Two full-price translations of one film,
     // which is the cost the source pin exists to prevent.
-    let _flight = state.inflight.acquire(&search_key).await;
+    //
+    // Scoped to the install, matching the failure marker below rather than the shared result. With a
+    // shared flight and an install-scoped marker the scopes disagreed: during an outage every
+    // install queued behind ONE guard and then each missed its own marker on release, so they ran
+    // their searches strictly one after another — the serialization the marker exists to prevent,
+    // reintroduced across installs. Two installs racing a cold title now do two searches, which
+    // cost nothing metered and settle into the shared entry either way.
+    let _flight = state.inflight.acquire(&format!("{:016x}:{search_key}", short_hash(config))).await;
     if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
         return Ok(hit);
     }
@@ -395,7 +406,10 @@ pub async fn handle_subtitle_file(
         }
     };
 
-    sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &format!("subtitle {file_id}")).await
+    // Settled: this handler is told which reference to use, so "no ref" here means none was asked
+    // for, never that we failed to find out.
+    let what = format!("subtitle {file_id}");
+    sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &what, true).await
 }
 
 /// Run the sync ladder over an SRT we already hold, and apply the caching rules that go with it.
@@ -416,6 +430,7 @@ async fn sync_and_cache(
     ref_id: Option<i64>,
     resync_url: Option<String>,
     what: &str,
+    settled: bool,
 ) -> Response<Body> {
     // A sync that just failed is not retried on every request — the binary spawn, or a 90s alass
     // timeout, would be paid again per request. The marker is separate from `cache_key` so that key
@@ -519,8 +534,11 @@ async fn sync_and_cache(
             state.cache.put(retry_marker, "1".into(), SYNC_RETRY_TTL);
             httputil::srt_provisional(target)
         }
-        // No sync was asked for, so the body we have is the answer, and it is already cached.
-        None => httputil::srt(target),
+        // No sync was asked for, so the body we have is the answer, and it is already cached —
+        // unless the caller could not determine whether an alignment was owed at all, in which case
+        // this is a stand-in and must revalidate rather than being pinned for a year.
+        None if settled => httputil::srt(target),
+        None => httputil::srt_provisional(target),
     }
 }
 
@@ -538,11 +556,41 @@ async fn subtitle_srt(
     // charges the viewer's daily download allowance on the API call itself, and the anonymous
     // allowance is a handful per day. Two devices opening the same title, or the twenty picker URLs
     // that all carry the same `?ref=`, would each buy the same file.
+    // A download that just failed is not retried on every request, because every attempt SPENDS.
+    // OpenSubtitles charges the daily allowance on the API call, and for a dead upload the 404
+    // arrives on the CDN fetch afterwards — so a request for a file that will never resolve cost a
+    // credit and made no progress, for as long as anything kept asking. The picker hands back a URL
+    // per subtitle and re-ranks the same dead track every playback, so a handful of clicks emptied
+    // the day's allowance and then broke every other download with it.
+    // Its own namespace inside `syncfail:`. `sync_and_cache`'s retry marker is
+    // `syncfail:{cache_key}`, and for a request that asked for no sync that key IS `os:{id}` — so a
+    // bare `syncfail:os:5` would be two different facts under one name. Only the gating on
+    // `wanted_sync` keeps them apart today, which is not a property worth relying on.
+    let fail_key = format!("{SYNCFAIL}dl:{key}");
+    if let Some(remembered) = state.cache.get(&fail_key) {
+        return Err(match remembered.as_str() {
+            "gone" => opensubtitles::DownloadError::Gone(format!("file {file_id} is gone (remembered)")),
+            _ => opensubtitles::DownloadError::Unavailable(format!("file {file_id} unavailable (remembered)")),
+        });
+    }
     let _flight = state.inflight.acquire(&key).await;
     if let Some(hit) = state.cache.get(&key) {
         return Ok(hit);
     }
-    let body = client.download(file_id).await?;
+    let body = match client.download(file_id).await {
+        Ok(body) => body,
+        Err(e) => {
+            // How long depends on whose fault it is. `Gone` is the API saying this id does not
+            // exist, which will not change today; `Unavailable` is quota or a blip, and the ten
+            // minutes the sync path already uses is the right patience for that.
+            let (tag, ttl) = match &e {
+                opensubtitles::DownloadError::Gone(_) => ("gone", DEAD_FILE_TTL),
+                opensubtitles::DownloadError::Unavailable(_) => ("unavailable", SYNC_RETRY_TTL),
+            };
+            state.cache.put(fail_key, tag.into(), ttl);
+            return Err(e);
+        }
+    };
     state.cache.put(key, body.clone(), CACHE_TTL);
     Ok(body)
 }
@@ -895,10 +943,20 @@ pub async fn handle_translate(
     // already bought and cached; returning early with whatever happened to be cached could not
     // translate a cold title at all during a blip. Neither wrote a backoff, so every client retry
     // was another live search.
+    // `anchor_unknown` is the difference between "there is no anchor" and "we could not find out
+    // whether there is one". Both produce `ref_id = None` and both key on `body_key`, which is the
+    // honest identity of an unaligned body — but only the first is SETTLED. Serving the second as
+    // `immutable` pins the client to a mis-timed track for a year at a deterministic URL, which is
+    // the failure `srt_provisional` exists for, moved from the server cache to the client's.
+    let mut anchor_unknown = false;
     let anchored = match hash.as_deref().filter(|_| cfg.auto_sync) {
-        Some(h) => cached_search(state, &client, config, &imdb, season, episode, Some(h))
-            .await
-            .unwrap_or_default(),
+        Some(h) => match cached_search(state, &client, config, &imdb, season, episode, Some(h)).await {
+            Ok(subs) => subs,
+            Err(_) => {
+                anchor_unknown = true;
+                Vec::new()
+            }
+        },
         None => Vec::new(),
     };
     // Whether the SOURCE is hash-matched to this encode is a fact about the hashed list, and the
@@ -932,7 +990,13 @@ pub async fn handle_translate(
     // translation that exists and had just been confirmed.
     if let Some(settled) = state.cache.get(&cache_key) {
         if !want_json {
-            return httputil::srt(settled);
+            // `immutable` only when this really is the answer. With the anchor merely unknown the
+            // body may well be superseded within the thirty seconds the search marker lasts, and a
+            // client told `immutable` will not come back for a year.
+            return match anchor_unknown {
+                true => httputil::srt_provisional(settled),
+                false => httputil::srt(settled),
+            };
         }
     } else {
         // The expensive half: the translated text, cached against the source file so every encode of
@@ -1012,6 +1076,10 @@ pub async fn handle_translate(
             ref_id,
             resync_url,
             &format!("translation of {imdb} → {lang_key}"),
+            // Settled only if we actually know whether an anchor exists. If the hashed search failed
+            // we are serving an unaligned body that a working search might have aligned, so the
+            // client has to come back rather than caching it for a year.
+            !anchor_unknown,
         )
         .await;
         if !want_json {
