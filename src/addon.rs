@@ -1045,43 +1045,13 @@ pub async fn handle_translate(
     // It is no longer load-bearing for the LLM bill: the body is keyed by title, so losing the pin
     // costs a re-pick and a download, never a re-translation.
     //
-    // Read before any search, and that ordering is the point: from the second request onward there is
-    // nothing to choose, so there is nothing to ask OpenSubtitles. It saves a live search per title
-    // per six hours, and it means a search outage cannot refuse a translation that is already bought
-    // and cached — there is no longer a search on that path to fail.
+    // READ here, but RESOLVED only if a translation actually has to be produced. Since the body is
+    // keyed by title, nothing on the serving path needs a source id except the decision of whether to
+    // align — so a pin miss no longer drags a live search, fifty dead-file probes and a blocking pin
+    // write onto a request whose translation is already bought and cached, and can no longer refuse
+    // one with a 502 when that search fails or a 404 when every candidate is filtered out.
     let pin_key = source_pin_key(&imdb, season, episode);
-    let source_id = match state.cache.get(&pin_key).and_then(|v| v.parse::<i64>().ok()) {
-        Some(id) => id,
-        None => {
-            // Unhashed deliberately. OpenSubtitles floats hash matches up and returns one page, so a
-            // hashed list is ordered and truncated differently per encode — choosing from it resolves
-            // two encodes of one film to two sources and buys the dialogue twice.
-            //
-            // A failed search does NOT set the failure marker. That marker means "a film's LLM bill
-            // was just spent and lost"; a search costs nothing, and marking it made a blip outlive
-            // itself by ten minutes across every language the viewer tried, reporting `.status`
-            // failed for a run never attempted.
-            let Ok(candidates) = cached_search(state, &client, config, &imdb, season, episode, None).await else {
-                return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
-            };
-            // Skip what is already known not to download. Without this the loop had no exit: a dead
-            // source was unpinned, the deterministic re-pick chose the same dead file, pinned it
-            // again, and refused again — a blocking pin write and a pin delete per request, forever,
-            // on the thread that serves every connection.
-            let usable: Vec<opensubtitles::Subtitle> = candidates
-                .into_iter()
-                .filter(|s| state.cache.get(&dead_file_key(s.file_id)).is_none())
-                .collect();
-            let Some(source) = translation_source(&usable) else {
-                return httputil::text(StatusCode::NOT_FOUND, "no source subtitle to translate");
-            };
-            // Written once, here, where a choice was actually made — not on every request. `put`
-            // writes through to disk, so rewriting it per request was a blocking write on the path
-            // the engine takes for every playback.
-            state.cache.put(pin_key.clone(), source.file_id.to_string(), SOURCE_PIN_TTL);
-            source.file_id
-        }
-    };
+    let pinned = state.cache.get(&pin_key).and_then(|v| v.parse::<i64>().ok());
     let body_key = translate_body_key(&imdb, season, episode, &lang_key, llm);
 
     // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
@@ -1114,7 +1084,12 @@ pub async fn handle_translate(
     // Whether the SOURCE is hash-matched to this encode is a fact about the hashed list, and the
     // source was deliberately chosen from the other one — so it is looked up rather than read off
     // the candidate, whose `hash_match` is false by construction.
-    let source_in_sync = anchored.iter().any(|s| s.file_id == source_id && s.hash_match);
+    //
+    // With no pin yet there is nothing to look up, and the honest answer is "assume not": that costs
+    // an alignment which may turn out to be a no-op, where resolving the source to find out would
+    // cost a live search on a request that may not need one at all.
+    let source_in_sync = pinned
+        .is_some_and(|id| anchored.iter().any(|s| s.file_id == id && s.hash_match));
 
     // Tier 2 is a user action against the track itself, so it is only read on the `.srt` form — the
     // `.json` form's job is to warm and hand back a URL. Vetted before it can reach a cache key, for
@@ -1133,7 +1108,7 @@ pub async fn handle_translate(
     // this encode, and otherwise the anchor.
     let ref_id = match source_in_sync {
         true => None,
-        false => tier1_reference(&anchored).filter(|&r| r != source_id),
+        false => tier1_reference(&anchored).filter(|&r| Some(r) != pinned),
     };
     let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
 
@@ -1171,42 +1146,65 @@ pub async fn handle_translate(
                 match state.cache.get(&body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
                     Some(body) => body,
-                    // A source already known to be failing must not cost an allowance slot to
-                    // rediscover that, and one confirmed dead must not stay pinned — otherwise the
-                    // ten-minute marker lapses, the same source is tried again, and the title burns
-                    // one of the fifty daily translations per attempt for the pin's 180-day life.
-                    //
-                    // Every cache read comes first, including the post-flight one just above.
-                    // Checked any earlier, this refused translations that were already bought and
-                    // sitting in the cache — serving one never touches the source file, only the
-                    // anchor — and dropped the pin protecting that body while it stayed cached,
-                    // which is the expensive direction.
-                    None if remembered_failure(state, &client, source_id).is_some() => {
-                        // `Gone` here means the API named the id, or a repeat confirmed it. A single
-                        // `Suspect` never reaches this arm as `Gone`, so a transient cannot unpin.
-                        if let Some(opensubtitles::DownloadError::Gone(_)) =
-                            remembered_failure(state, &client, source_id)
-                        {
-                            eprintln!("translate: unpinning {imdb} — source {source_id} will not download");
-                            state.cache.remove(&pin_key);
+                    // Only here, with every cache read behind us, is a source actually needed — so
+                    // only here is one resolved. A pin miss costs a live search, a probe per
+                    // candidate and a blocking pin write, and none of that belongs on a request whose
+                    // translation already exists.
+                    None => {
+                        let source_id = match pinned {
+                            Some(id) => id,
+                            None => {
+                                // Unhashed deliberately. OpenSubtitles floats hash matches up and
+                                // returns one page, so a hashed list is ordered and truncated
+                                // differently per encode — choosing from it resolves two encodes of
+                                // one film to two sources and buys the dialogue twice.
+                                //
+                                // A failed search does NOT set the failure marker: a search costs
+                                // nothing, and marking it made a blip outlive itself by ten minutes
+                                // across every language the viewer tried.
+                                let Ok(candidates) =
+                                    cached_search(state, &client, config, &imdb, season, episode, None).await
+                                else {
+                                    return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+                                };
+                                // Skip what is already known not to download, or the loop has no
+                                // exit: a dead source is unpinned, the deterministic re-pick chooses
+                                // the same file, pins it again, and refuses again.
+                                let usable: Vec<opensubtitles::Subtitle> = candidates
+                                    .into_iter()
+                                    .filter(|s| state.cache.get(&dead_file_key(s.file_id)).is_none())
+                                    .collect();
+                                let Some(source) = translation_source(&usable) else {
+                                    return httputil::text(
+                                        StatusCode::NOT_FOUND,
+                                        "no source subtitle to translate",
+                                    );
+                                };
+                                state.cache.put(
+                                    pin_key.clone(),
+                                    source.file_id.to_string(),
+                                    SOURCE_PIN_TTL,
+                                );
+                                source.file_id
+                            }
+                        };
+                        // A source already known to be failing must not cost an allowance slot to
+                        // rediscover that, and one confirmed dead must not stay pinned — otherwise
+                        // the ten-minute marker lapses, the same source is tried again, and the title
+                        // burns one of the fifty daily translations per attempt.
+                        if let Some(e) = remembered_failure(state, &client, source_id) {
+                            // `Gone` means the API named the id, or two separate occasions confirmed
+                            // it. A single `Suspect` is not `Gone`, so a transient cannot unpin.
+                            if matches!(e, opensubtitles::DownloadError::Gone(_)) {
+                                eprintln!("translate: unpinning {imdb} — source {source_id} will not download");
+                                state.cache.remove(&pin_key);
+                            }
+                            // Backed off like any other failure, or the refusal is free to repeat and
+                            // each repeat re-runs the search and the pin write.
+                            state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
+                            return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
                         }
-                        // Backed off like any other failure. Without this the refusal was free to
-                        // repeat, and each repeat re-ran the pin miss, the search, and a blocking
-                        // pin write — on the path the engine takes for every playback.
-                        state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-                        return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
-                    }
-                    // Charged here and nowhere else: this is the one path that starts a run, and it
-                    // is already behind the cache check and the single-flight guard, so nothing that
-                    // merely waited for someone else's work is counted against the allowance.
-                    None if !charge_translation(state, config) => {
-                        eprintln!("translate: {imdb} → {lang} refused, install is over its daily allowance");
-                        return httputil::text(
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "translation allowance for today is used up",
-                        );
-                    }
-                    None => match produce_translation(state, &client, llm, source_id, &lang, &body_key, &job_key).await {
+                        match produce_translation(state, &client, llm, config, source_id, &lang, &body_key, &job_key).await {
                         Ok(body) => {
                             // Refresh the pin on the path that actually produced a translation, so
                             // its lifetime and mtime do not stay frozen at the first one. Losing it
@@ -1217,6 +1215,15 @@ pub async fn handle_translate(
                             // request, which is what the per-request version cost.
                             state.cache.put(pin_key.clone(), source_id.to_string(), SOURCE_PIN_TTL);
                             body
+                        }
+                        // Nothing was spent — the allowance was checked at the last moment before
+                        // the first token, so this costs neither a slot nor a backoff marker.
+                        Err(TranslationFailure::Allowance) => {
+                            eprintln!("translate: {imdb} → {lang} refused, install is over its daily allowance");
+                            return httputil::text(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "translation allowance for today is used up",
+                            );
                         }
                         Err(e) => {
                             // Log the detail (no key in these strings); hand the client a generic
@@ -1237,7 +1244,8 @@ pub async fn handle_translate(
                             }
                             return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
                         }
-                    },
+                        }
+                    }
                 }
             }
         };
@@ -1350,6 +1358,9 @@ pub async fn handle_translate_status(
 enum TranslationFailure {
     Source(String),
     Model(String),
+    /// The install has used up today's translations. Distinct because it is the one failure the
+    /// client should see as "not now" rather than "something broke".
+    Allowance,
 }
 
 /// Carry a download failure's own verdict through to the pin.
@@ -1376,6 +1387,7 @@ impl TranslationFailure {
     fn message(&self) -> &str {
         match self {
             TranslationFailure::Source(m) | TranslationFailure::Model(m) => m,
+            TranslationFailure::Allowance => "daily translation allowance used up",
         }
     }
 }
@@ -1387,6 +1399,7 @@ async fn produce_translation(
     state: &Arc<AppState>,
     client: &opensubtitles::Client<'_>,
     llm: &LlmConfig,
+    config: &str,
     source_file_id: i64,
     lang: &str,
     body_key: &str,
@@ -1412,6 +1425,18 @@ async fn produce_translation(
         // is a statement about the file either way, and the classification should not depend on
         // which of two agreeing checks happened to run first.
         return Err(TranslationFailure::Source("source subtitle was empty".into()));
+    }
+    // Charged HERE — the last point before the first token is spent, and after everything that can
+    // fail without spending one.
+    //
+    // Charged before the download, it took a slot for every attempt whose source would not fetch,
+    // having sent nothing. And the guards around it are per file and per title-language, so distinct
+    // titles are not gated against each other: an evening browsing ten episodes in two languages
+    // burned twenty slots in under a minute, and about twenty-five titles emptied the day — turning
+    // an OpenSubtitles quota that resets at midnight into a self-inflicted day-long lockout of the
+    // paid feature.
+    if !charge_translation(state, config) {
+        return Err(TranslationFailure::Allowance);
     }
     // The cache doubles as the batch store: a run that dies at cue 1100 of 1200 leaves the 1100
     // behind, so the retry the viewer is about to make re-buys only what actually failed.
