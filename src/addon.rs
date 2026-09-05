@@ -935,6 +935,19 @@ fn quota_key(config: &str, now: std::time::SystemTime) -> String {
 /// Take one from today's allowance, or refuse. Charged only where a run actually BEGINS: a cache
 /// hit, a resumed batch, and the `.srt` half of the app's own two-request flow are all free, because
 /// none of them spends anything.
+/// Is today's allowance already gone? A read, not a charge.
+///
+/// Consulted before the source download so a refusal is free. Charging only after the download —
+/// which is right, since a source that will not fetch must not cost a slot — meant every request
+/// past the fiftieth bought a metered OpenSubtitles credit and then returned 429. Nothing caps the
+/// number of distinct titles a viewer browses, so that was unbounded in the dimension that matters,
+/// and it emptied the download quota that the plain subtitle picker also depends on.
+fn allowance_used_up(state: &Arc<AppState>, config: &str) -> bool {
+    let key = quota_key(config, std::time::SystemTime::now());
+    let used: u64 = state.cache.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
+    used >= DAILY_TRANSLATIONS
+}
+
 fn charge_translation(state: &Arc<AppState>, config: &str) -> bool {
     let key = quota_key(config, std::time::SystemTime::now());
     let used: u64 = state.cache.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1081,15 +1094,24 @@ pub async fn handle_translate(
         },
         None => Vec::new(),
     };
-    // Whether the SOURCE is hash-matched to this encode is a fact about the hashed list, and the
-    // source was deliberately chosen from the other one — so it is looked up rather than read off
-    // the candidate, whose `hash_match` is false by construction.
+    // Which alignment a given source needs. A source that is itself hash-matched to this encode is
+    // already correctly timed, so the translated body carrying its timings is too.
     //
-    // With no pin yet there is nothing to look up, and the honest answer is "assume not": that costs
-    // an alignment which may turn out to be a no-op, where resolving the source to find out would
-    // cost a live search on a request that may not need one at all.
-    let source_in_sync = pinned
-        .is_some_and(|id| anchored.iter().any(|s| s.file_id == id && s.hash_match));
+    // Taken as a function because it has to be answered twice. Before a source is known — a pin
+    // miss — the honest answer is "assume not aligned", which is what lets the cached-body probe
+    // below happen without resolving a source at all. But answering it that way and then STOPPING
+    // there bought real work for nothing: `ref_id` became `Some(R)`, and `sync_and_cache` fetches
+    // that reference through the one call in the program that spends a metered download credit,
+    // then runs a tier binary. When the source turned out to be hash-matched after all, both were
+    // no-ops, and the entry they produced was filed under a key the very next request — now pinned,
+    // now answering `true` — never asks for again.
+    let align_for = |source: Option<i64>| -> Option<i64> {
+        let in_sync = source.is_some_and(|id| anchored.iter().any(|s| s.file_id == id && s.hash_match));
+        match in_sync {
+            true => None,
+            false => tier1_reference(&anchored).filter(|&r| Some(r) != source),
+        }
+    };
 
     // Tier 2 is a user action against the track itself, so it is only read on the `.srt` form — the
     // `.json` form's job is to warm and hand back a URL. Vetted before it can reach a cache key, for
@@ -1104,12 +1126,8 @@ pub async fn handle_translate(
         None => None,
     };
     // The translated body inherits its source's timing, so it needs the same Tier-1 correction the
-    // source itself would get from the picker: nothing when the source is already hash-matched to
-    // this encode, and otherwise the anchor.
-    let ref_id = match source_in_sync {
-        true => None,
-        false => tier1_reference(&anchored).filter(|&r| Some(r) != pinned),
-    };
+    // source itself would get from the picker.
+    let ref_id = align_for(pinned);
     let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
 
     // Read once, not twice. Asking again on the settled path could miss what the first read saw —
@@ -1126,8 +1144,9 @@ pub async fn handle_translate(
             };
         }
     } else {
-        // The expensive half: the translated text, cached against the source file so every encode of
-        // this film reuses it.
+        // The expensive half: the translated text. `used_source` carries back which file it came
+        // from, so the alignment decision can be re-answered from a source that is actually known.
+        let mut used_source = pinned;
         let translated = match state.cache.get(&body_key) {
             Some(body) => body,
             None => {
@@ -1188,6 +1207,7 @@ pub async fn handle_translate(
                                 source.file_id
                             }
                         };
+                        used_source = Some(source_id);
                         // A source already known to be failing must not cost an allowance slot to
                         // rediscover that, and one confirmed dead must not stay pinned — otherwise
                         // the ten-minute marker lapses, the same source is tried again, and the title
@@ -1249,6 +1269,13 @@ pub async fn handle_translate(
                 }
             }
         };
+        // Re-answered from the source we actually used. The version above was computed before a
+        // source was known, so it assumed one was needed; if the source turns out to be hash-matched
+        // to this encode, that assumption would spend a metered download on the reference and a tier
+        // binary on an alignment that is a no-op by construction — and file the result under a key
+        // the next request, now pinned, never asks for.
+        let ref_id = align_for(used_source);
+        let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
         // The cheap half. Run here even for the `.json` form so the engine's follow-up fetch is a
         // cache hit rather than an ffsubsync spawn with the viewer waiting on it.
         let resp = sync_and_cache(
@@ -1411,6 +1438,14 @@ async fn produce_translation(
     // sitting under `os:{file_id}`: once per retry after the ten-minute backoff, and once more for
     // every additional target language of the same film.
     //
+    // Refuse for free BEFORE spending a credit on the source. The charge itself is further down, on
+    // purpose — a source that will not fetch must not cost a slot — but with only that check, every
+    // request past the fiftieth bought a metered download and then returned 429. Nothing caps how
+    // many distinct titles a viewer browses, so that was unbounded, and it drained the same quota
+    // the plain subtitle picker spends.
+    if allowance_used_up(state, config) {
+        return Err(TranslationFailure::Allowance);
+    }
     // A download failure is NOT charged to the source. An exhausted daily credit and a dead upload
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
     // on it would re-pick the source, and re-buy every language of the film, because the viewer ran
@@ -1869,9 +1904,9 @@ mod translate_retry_tests {
             let decoded = httputil::percent_decode_path(lang);
             translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)
         };
-        // The body key is keyed by source file rather than by title, but it carries the same
-        // canonicalized language, so the collapsing has to hold there too — that is the key the
-        // film's text actually lives under.
+        // The body key carries the same canonicalized language, so the collapsing has to hold there
+        // too — that is the key the film's text actually lives under, and the one whose duplicates
+        // are paid for in full.
         let body_key = |lang: &str| {
             let decoded = httputil::percent_decode_path(lang);
             translate_body_key("tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)

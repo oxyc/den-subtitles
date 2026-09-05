@@ -230,8 +230,16 @@ async fn run(cfg: Config) -> std::io::Result<()> {
                 // runtime has ONE thread, which is also the one serving every connection. Fast on a
                 // local SSD; on a container bind-mount at a millisecond an open it is seconds of
                 // total stall, every hour.
-                let cache = state.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || cache.cache.sweep()).await {
+                let swept = state.clone();
+                let done = tokio::task::spawn_blocking(move || {
+                    swept.cache.sweep();
+                    // The sync work dir too. `finish` is the only cleanup there and it is skipped
+                    // when a request is cancelled mid-alignment, so without this each one leaks its
+                    // scratch files permanently.
+                    swept.sync.sweep_scratch();
+                })
+                .await;
+                if let Err(e) = done {
                     eprintln!("cache sweep did not run: {e}");
                 }
             }

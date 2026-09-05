@@ -98,6 +98,32 @@ impl SyncTools {
         self.finish(run_result, &out, [&target]).await
     }
 
+    /// Reclaim scratch files no run could still be using.
+    ///
+    /// `finish` is the only cleanup and it is skipped entirely when the future is dropped — a client
+    /// disconnecting inside the Tier-1 or Tier-2 budget, a deploy, an OOM. Nothing else walks this
+    /// directory: the cache sweep covers `store` only. So each cancelled alignment left its inputs
+    /// behind for good, on a volume that is meant to be bounded.
+    ///
+    /// Age, not ownership: a file older than the longest a run may take cannot belong to a live one.
+    pub fn sweep_scratch(&self) {
+        /// Comfortably past `TIER2_BUDGET`, the longest any run is allowed to hold a scratch file.
+        const ABANDONED: Duration = Duration::from_secs(30 * 60);
+
+        let Ok(entries) = std::fs::read_dir(&self.work_dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            // An undatable file is left alone rather than guessed at — the same call `Cache::sweep`
+            // makes, and for the same reason: deleting on that signal kills live work.
+            if meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age > ABANDONED) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     async fn run(&self, bin: &str, args: &[&str], budget: Duration) -> Result<std::process::ExitStatus, String> {
         let child = Command::new(bin)
             .args(args)
@@ -290,6 +316,30 @@ mod tests {
         assert!(!dir.join("tag-nobin-target.srt").exists());
         assert!(!dir.join("tag-nobin-reference.srt").exists());
         tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    /// A cancelled alignment skips `finish`, the only cleanup, and nothing else walks this
+    /// directory — the cache sweep covers `store` only. Each one leaked its inputs permanently.
+    #[test]
+    fn the_scratch_sweep_reclaims_what_a_cancelled_run_left() {
+        let dir = work_dir("scratch-sweep");
+        std::fs::create_dir_all(&dir).unwrap();
+        let tools = SyncTools { ffsubsync: "x".into(), alass: "y".into(), work_dir: dir.clone() };
+
+        let abandoned = dir.join("old-tag-target.srt");
+        let in_flight = dir.join("live-tag-target.srt");
+        std::fs::write(&abandoned, "x").unwrap();
+        std::fs::write(&in_flight, "x").unwrap();
+        // Backdate one past the longest a run may hold a file.
+        let long_ago = std::time::SystemTime::now() - Duration::from_secs(60 * 60);
+        let f = std::fs::File::options().write(true).open(&abandoned).unwrap();
+        f.set_modified(long_ago).unwrap();
+        drop(f);
+
+        tools.sweep_scratch();
+        assert!(!abandoned.exists(), "an abandoned scratch file was left behind");
+        assert!(in_flight.exists(), "the sweep deleted a file a live run could still be using");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
