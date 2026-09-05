@@ -44,6 +44,15 @@ const BODY_PREFIXES: [&str; 3] = ["os:", "search:", "translate:"];
 // Search results turn over as new subs are uploaded, so a short TTL — enough to spare repeated
 // round-trips when the app reopens a title, not so long that fresh uploads stay hidden.
 const SEARCH_TTL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
+/// How long a failed search is remembered as failed. Short — this is a blip, not a verdict — but
+/// long enough that the queue behind a single-flighted miss does not run one live search each,
+/// serially, at up to the client timeout apiece.
+const SEARCH_FAIL_TTL: Duration = Duration::from_secs(30);
+/// Lifetime of a pinned translation source. Deliberately longer than `CACHE_TTL`, so the translation
+/// it protects always expires FIRST: losing the pin while the body survives means a re-pick, a
+/// different body key, and paying for a film that is still sitting in the cache. Once the body is
+/// gone the pin costs nothing to have kept — it is fifty bytes.
+const SOURCE_PIN_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 180);
 
 /// Monotonic counter making sync scratch-file names unique per invocation.
 static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -267,6 +276,13 @@ async fn cached_search(
     if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
         return Ok(hit);
     }
+    // The flight ahead of us may have failed. Nothing caches a failed search, so without this the
+    // queue behind one miss ran a live search EACH, one after another, at up to the client timeout
+    // apiece — the tenth caller waiting ten times as long as it used to for the same failure.
+    let fail_key = format!("{SYNCFAIL}{search_key}");
+    if state.cache.get(&fail_key).is_some() {
+        return Err("search failed recently".to_string());
+    }
     match client.search(imdb, season, episode, "all", hash).await {
         Ok(s) => {
             state.os_fails.store(0, Ordering::Relaxed);
@@ -281,6 +297,7 @@ async fn cached_search(
         Err(e) => {
             eprintln!("search: opensubtitles failed for {imdb}: {e}");
             state.os_fails.fetch_add(1, Ordering::Relaxed);
+            state.cache.put_mem(fail_key, "1".into(), SEARCH_FAIL_TTL);
             Err(e)
         }
     }
@@ -418,12 +435,6 @@ async fn sync_and_cache(
         None
     };
 
-    // Bound the tier binaries themselves, not just duplicates of one alignment. The single-flight
-    // guard above collapses two requests for the SAME key; twenty different keys — the picker hands
-    // back a URL per subtitle — are twenty separate spawns, each an ffmpeg decode with a 90-second
-    // budget, on a one-thread runtime in a homelab container.
-    let _slot = state.sync_slots.acquire().await;
-
     // Per-invocation unique temp tag: two concurrent requests for the same file must not share
     // scratch paths (one would read the other's half-written output and cache it for 60 days).
     // Bounded, for the reason `Cache::disk_path` is: this becomes `{tag}-reference.srt` in the work
@@ -435,7 +446,15 @@ async fn sync_and_cache(
         cache_key.replace(':', "-").chars().take(80).collect::<String>(),
         SYNC_SEQ.fetch_add(1, Ordering::Relaxed)
     );
+    // A permit, held only around work that actually spawns a binary.
+    //
+    // The single-flight guard above collapses two requests for the SAME alignment; twenty different
+    // ones — the picker hands back a URL per subtitle — are twenty keys and were twenty concurrent
+    // subprocesses on a one-thread runtime. Acquired inside these branches rather than above the
+    // dispatch: the semaphore is FIFO with two permits, so taking it on the no-sync path made a
+    // plain cache-miss fetch queue behind every pending alignment for work it was never going to do.
     let synced: Option<String> = if let Some(url) = resync_url {
+        let _slot = state.sync_slots.acquire().await;
         // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
         match state.sync.sync_to_audio(&target, &url, &tag).await {
             Ok(s) => Some(s),
@@ -445,15 +464,23 @@ async fn sync_and_cache(
             }
         }
     } else if let Some(r) = ref_id {
-        // Tier 1 — reference-align against the hash-matched sub (no audio needed).
+        // Tier 1 — reference-align against the hash-matched sub (no audio needed). The reference is
+        // fetched BEFORE taking a permit: that is a network download, and a permit meant to bound
+        // subprocesses should not be spent waiting on OpenSubtitles.
         match subtitle_srt(state, client, r).await {
-            Ok(reference) => match state.sync.sync_to_reference(&target, &reference, &tag).await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("sync: aligning {what} to {r} failed: {e}");
-                    None
+            Ok(reference) => {
+                let aligned = {
+                    let _slot = state.sync_slots.acquire().await;
+                    state.sync.sync_to_reference(&target, &reference, &tag).await
+                };
+                match aligned {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!("sync: aligning {what} to {r} failed: {e}");
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 eprintln!("sync: reference {r} for {what} unavailable: {e}");
                 None
@@ -801,60 +828,46 @@ pub async fn handle_translate(
     };
     let client = os_client(state, http, &cfg);
 
-    // TWO searches, and the difference between them is the whole cost model of this endpoint.
-    //
-    // The hashed one exists to make `moviehash_match` flags appear, which is what makes a Tier-1
-    // anchor findable. The UNHASHED one is what the source is chosen from, and it has to be unhashed:
-    // OpenSubtitles floats hash matches to the top and returns one page, so the same title yields a
-    // differently-ordered and differently-truncated list per encode. Choosing from that resolves two
-    // encodes of one film to two sources, which is two `translate_body_key`s and two full-price
-    // translations of the same dialogue — the exact cost keying by source file was meant to avoid.
-    //
-    // Both are cached under `search:`, keyed per hash — so they are two different entries and a cold
-    // title pays two searches, not one. Neither spends a download credit, and the alternative is
-    // choosing the source from an encode-dependent list, which spends a whole second translation.
     let hash = search_hash(extra);
-    // A failed search does NOT set the marker. The marker means "a whole film's LLM bill was just
-    // spent and lost, do not spend it again for ten minutes" — a search that failed cost nothing,
-    // spent no tokens, and is usually a blip. Marking it made a moment's upstream trouble outlive
-    // itself by ten minutes across every language the viewer tried, and made `.status` report
-    // `failed` for a run that was never attempted.
-    let Ok(candidates) = cached_search(state, &client, &imdb, season, episode, None).await else {
-        return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
-    };
-    // Which file this title translates FROM is pinned once and reused.
+
+    // Which file this title translates FROM is decided once and then pinned.
     //
     // `translation_source` reads download counts, ratings and the trusted flag, and all three drift —
-    // one new trusted upload is +400 and flips the pick outright. The search behind it is cached for
-    // six hours, so a run the next day re-picks from a refreshed list, lands on a different file, and
-    // that is a different `translate_body_key`: a second full-price translation of dialogue already
-    // bought, with the first left orphaned under a key nothing will ask for again.
+    // one new trusted upload is +400 and flips the pick outright — while the search behind it is only
+    // cached for six hours. Re-picking the next day lands on a different file, which is a different
+    // `translate_body_key`: a second full-price translation of dialogue already bought, with the
+    // first orphaned under a key nothing will ask for again. And because the pin is per title, not
+    // per language, that re-pick re-buys EVERY language of the film, not just the one being asked for.
     //
-    // The pin is per title rather than per language, so every language of a film translates from the
-    // same source.
-    //
-    // It is honoured by id alone, without checking that the file is still in the candidate list. The
-    // list is one page of results ordered by a download metric, so a perfectly good pinned upload
-    // slips off it as newer ones arrive — and that is the very drift the pin exists to survive.
-    // Requiring membership dropped the pin exactly when it was needed and re-bought the film.
-    // `subtitle_srt` fetches by id, not from the list, so membership was never needed to USE it; a
-    // pin that is genuinely dead is cleared when the download fails, below.
+    // Read before any search, and that ordering is the point: from the second request onward there is
+    // nothing to choose, so there is nothing to ask OpenSubtitles. It saves a live search per title
+    // per six hours, and it means a search outage cannot refuse a translation that is already bought
+    // and cached — there is no longer a search on that path to fail.
     let pin_key = source_pin_key(&imdb, season, episode);
-    let pinned = state.cache.get(&pin_key).and_then(|v| v.parse::<i64>().ok());
-    let source_id = match pinned {
+    let source_id = match state.cache.get(&pin_key).and_then(|v| v.parse::<i64>().ok()) {
         Some(id) => id,
-        None => match translation_source(&candidates) {
-            Some(s) => s.file_id,
-            None => return httputil::text(StatusCode::NOT_FOUND, "no source subtitle to translate"),
-        },
+        None => {
+            // Unhashed deliberately. OpenSubtitles floats hash matches up and returns one page, so a
+            // hashed list is ordered and truncated differently per encode — choosing from it resolves
+            // two encodes of one film to two sources and buys the dialogue twice.
+            //
+            // A failed search does NOT set the failure marker. That marker means "a film's LLM bill
+            // was just spent and lost"; a search costs nothing, and marking it made a blip outlive
+            // itself by ten minutes across every language the viewer tried, reporting `.status`
+            // failed for a run never attempted.
+            let Ok(candidates) = cached_search(state, &client, &imdb, season, episode, None).await else {
+                return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+            };
+            let Some(source) = translation_source(&candidates) else {
+                return httputil::text(StatusCode::NOT_FOUND, "no source subtitle to translate");
+            };
+            // Written once, here, where a choice was actually made — not on every request. `put`
+            // writes through to disk, so rewriting it per request was a blocking write on the path
+            // the engine takes for every playback.
+            state.cache.put(pin_key.clone(), source.file_id.to_string(), SOURCE_PIN_TTL);
+            source.file_id
+        }
     };
-    // Only when it changes. `put` writes through to disk, and rewriting the same value on every
-    // request meant a blocking write per `.srt` fetch — and kept the 50-byte pin permanently young
-    // while the 80 KB translation it names aged, so the disk sweep's oldest-first eviction would
-    // drop the expensive artifact and keep the pointer to it.
-    if pinned != Some(source_id) {
-        state.cache.put(pin_key.clone(), source_id.to_string(), CACHE_TTL);
-    }
     let body_key = translate_body_key(source_id, &lang_key, llm);
 
     // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
@@ -872,10 +885,17 @@ pub async fn handle_translate(
             // retry was another live search against the metered upstream. Serve what we already
             // have, unaligned and revalidating, and start nothing.
             Err(_) => {
+                // `.json` asked for a URL and must get one whatever happens here, or the app — which
+                // calls that form FIRST — is handed an SRT body where it expects JSON, fails to
+                // parse, and retries; and since this path writes no backoff marker, every retry is
+                // another live search.
+                if want_json {
+                    return translate_url_response(state, headers, config, season, id, extra, lang_seg);
+                }
                 return match state.cache.get(&body_key) {
                     Some(body) => httputil::srt_provisional(body),
                     None => httputil::text(StatusCode::BAD_GATEWAY, "translation failed"),
-                }
+                };
             }
         },
         None => Vec::new(),
@@ -949,15 +969,20 @@ pub async fn handle_translate(
                         Err(e) => {
                             // Log the detail (no key in these strings); hand the client a generic
                             // message rather than echoing a raw upstream error body.
-                            eprintln!("translate: {imdb} → {lang} failed: {e}");
+                            eprintln!("translate: {imdb} → {lang} failed: {}", e.message());
                             state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-                            // Unpin. A pin that names a file which will not download, or parses to
-                            // no cues, would otherwise be honoured forever: the marker expires after
-                            // ten minutes, the next request re-reads the same pin, fails the same
-                            // way, and the title is stuck for every install and every language,
-                            // since the pin is scoped to neither. Dropping it lets the next request
-                            // choose again.
-                            state.cache.remove(&pin_key);
+                            // Unpin ONLY when the source is what failed. A pin naming a file that
+                            // holds no cues would otherwise be honoured forever — the marker expires
+                            // after ten minutes, the same pin is read, the same failure follows, and
+                            // the title is stuck for every install and language, since the pin is
+                            // scoped to neither.
+                            //
+                            // For everything else the pin is innocent, and dropping it is what costs
+                            // money: a provider timeout or a rate limit would re-pick the source and
+                            // re-buy every language of the film already bought.
+                            if matches!(e, TranslationFailure::Source(_)) {
+                                state.cache.remove(&pin_key);
+                            }
                             return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
                         }
                     },
@@ -981,6 +1006,24 @@ pub async fn handle_translate(
         }
     }
 
+    translate_url_response(state, headers, config, season, id, extra, lang_seg)
+}
+
+/// The `.json` form's answer: the `.srt` URL the engine should fetch.
+///
+/// Factored out because every exit from the `.json` path has to produce this shape. One of them
+/// didn't — the failed-anchor branch returned an SRT body regardless of which form had been asked
+/// for, and the app calls `.json` first.
+#[allow(clippy::too_many_arguments)]
+fn translate_url_response(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    config: &str,
+    season: Option<i64>,
+    id: &str,
+    extra: &str,
+    lang_seg: &str,
+) -> Response<Body> {
     let base = self_base(state, headers, config);
     // The segment as it arrived, not the decoded name: this is a URL, and handing back a decoded
     // "Brazilian Portuguese" would put a raw space in it. The client fetching this lands on the same
@@ -1040,6 +1083,27 @@ pub async fn handle_translate_status(
     httputil::json(StatusCode::OK, &body, "no-store")
 }
 
+/// Why a translation did not happen, split by whether the SOURCE is to blame.
+///
+/// The distinction decides whether the pin survives. `Source` means this file cannot be translated
+/// from — it will not download, or it parses to nothing — so the pin naming it is wrong and has to
+/// go. `Model` means the provider timed out, refused, or produced junk: nothing to do with which
+/// file was chosen, and dropping the pin then is actively expensive. The pin is scoped to neither
+/// install nor language, so one install's rate limit would re-pick the source for everybody and
+/// re-buy every language of that title at full price.
+enum TranslationFailure {
+    Source(String),
+    Model(String),
+}
+
+impl TranslationFailure {
+    fn message(&self) -> &str {
+        match self {
+            TranslationFailure::Source(m) | TranslationFailure::Model(m) => m,
+        }
+    }
+}
+
 /// Translate one source subtitle into `lang` and cache the result under `body_key`. Returns the
 /// translated SRT — the caller then runs the sync ladder over it.
 #[allow(clippy::too_many_arguments)]
@@ -1051,16 +1115,24 @@ async fn produce_translation(
     lang: &str,
     body_key: &str,
     job_key: &str,
-) -> Result<String, String> {
+) -> Result<String, TranslationFailure> {
     // Through the cache, not straight at the API. A `/download` call spends one of the viewer's
     // daily OpenSubtitles credits on the CALL, not on the file fetch — and dodging that quota is the
     // reason the proxy-and-cache design exists at all. Going direct re-paid for a file already
     // sitting under `os:{file_id}`: once per retry after the ten-minute backoff, and once more for
     // every additional target language of the same film.
-    let raw = subtitle_srt(state, client, source_file_id).await?;
+    //
+    // A download failure is NOT charged to the source. An exhausted daily credit and a dead upload
+    // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
+    // on it would re-pick the source, and re-buy every language of the film, because the viewer ran
+    // out of downloads.
+    let raw = subtitle_srt(state, client, source_file_id)
+        .await
+        .map_err(TranslationFailure::Model)?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
-        return Err("source subtitle was empty".into());
+        // This one really is the file: it downloaded and holds no cues.
+        return Err(TranslationFailure::Source("source subtitle was empty".into()));
     }
     // The cache doubles as the batch store: a run that dies at cue 1100 of 1200 leaves the 1100
     // behind, so the retry the viewer is about to make re-buys only what actually failed.
@@ -1078,7 +1150,10 @@ async fn produce_translation(
     // that leaves `.status` insisting a dead run is still working.
     drop(reporter);
 
-    let body = srt::serialize(&translated?);
+    // The harness's failures are all about the model — a deadline, a refusal, output that is not a
+    // translation. None of them says anything about which file was chosen.
+    let translated = translated.map_err(TranslationFailure::Model)?;
+    let body = srt::serialize(&translated);
     state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
     Ok(body)
 }

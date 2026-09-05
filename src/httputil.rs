@@ -126,11 +126,20 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
     // re-serialize of the whole document, and `apply_conditional` runs after the router — so every
     // `If-None-Match` hit was paying for a body it then threw away, on the one runtime thread.
     // Derived, not invented: the SRT ETag already changes whenever the bytes do.
+    /// Bumped whenever `serialize_vtt` changes what it emits. The validator is derived from the SRT
+    /// ETag, which does not move when the CONVERTER moves — so without this, changing the rendering
+    /// (as escaping the payload did) leaves every revalidating client and proxy on the old output.
+    const RENDERING: u32 = 2;
+
     let vtt_etag = resp
         .headers()
         .get(ETAG)
         .and_then(|v| v.to_str().ok())
-        .map(|srt_etag| format!("\"{:016x}-vtt\"", stable_hash(srt_etag.as_bytes())));
+        .map(|srt_etag| {
+            let mut seed = srt_etag.as_bytes().to_vec();
+            seed.extend_from_slice(&RENDERING.to_le_bytes());
+            format!("\"{:016x}-vtt\"", stable_hash(&seed))
+        });
     if let Some(etag) = &vtt_etag {
         if req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, &HeaderValue::from_str(etag).unwrap())) {
             return Response::builder()
@@ -252,5 +261,76 @@ fn hex(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\n<i>Hello</i> & goodbye\n";
+
+    async fn body_of(resp: Response<Body>) -> String {
+        use http_body_util::BodyExt;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn vtt_conversion_rewrites_the_body_and_the_validator() {
+        let out = to_vtt(srt(SRT.to_string()), &HeaderMap::new()).await;
+        assert_eq!(out.status(), StatusCode::OK);
+        assert_eq!(out.headers().get(CONTENT_TYPE).unwrap(), "text/vtt; charset=utf-8");
+        // The caching directive carries over: re-rendering does not change whether the body is
+        // settled or provisional.
+        assert!(out.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap().contains("immutable"));
+        // A `.vtt` and a `.srt` of the same subtitle are different bytes and must not share a
+        // validator, or a client that fetched one gets a 304 for the other.
+        let srt_etag = srt(SRT.to_string()).headers().get(ETAG).unwrap().clone();
+        assert_ne!(out.headers().get(ETAG).unwrap(), &srt_etag);
+
+        let body = body_of(out).await;
+        assert!(body.starts_with("WEBVTT"));
+        assert!(body.contains("<i>Hello</i> &amp; goodbye"), "payload not rendered as VTT: {body:?}");
+    }
+
+    /// A provisional body stays provisional through the conversion — `immutable` on a stand-in would
+    /// pin a client to an unaligned subtitle for a year.
+    #[tokio::test]
+    async fn a_provisional_body_is_still_provisional_as_vtt() {
+        let out = to_vtt(srt_provisional(SRT.to_string()), &HeaderMap::new()).await;
+        let cc = out.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap().to_string();
+        assert!(!cc.contains("immutable"), "a stand-in became immutable: {cc}");
+        assert!(cc.contains("must-revalidate"));
+    }
+
+    /// A conditional request is answered WITHOUT converting. Conversion is a full parse and
+    /// re-serialize of the document, and `apply_conditional` runs after the router — so every 304
+    /// was paying for a body it then threw away.
+    #[tokio::test]
+    async fn a_conditional_vtt_request_is_answered_without_converting() {
+        let first = to_vtt(srt(SRT.to_string()), &HeaderMap::new()).await;
+        let etag = first.headers().get(ETAG).unwrap().clone();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.clone());
+        let second = to_vtt(srt(SRT.to_string()), &headers).await;
+
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(second.headers().get(ETAG).unwrap(), &etag);
+        assert!(second.headers().get(CACHE_CONTROL).is_some(), "a 304 keeps its caching directive");
+        assert!(body_of(second).await.is_empty(), "a 304 has no body");
+    }
+
+    /// Anything that is not a subtitle body passes through untouched — an error, or a body some
+    /// other part of the router already shaped.
+    #[tokio::test]
+    async fn a_non_subtitle_response_passes_through() {
+        let err = to_vtt(text(StatusCode::BAD_GATEWAY, "upstream said no"), &HeaderMap::new()).await;
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(body_of(err).await, "upstream said no");
+
+        let js = to_vtt(json(StatusCode::OK, &"x", "no-store"), &HeaderMap::new()).await;
+        assert_eq!(js.headers().get(CONTENT_TYPE).unwrap(), "application/json");
     }
 }

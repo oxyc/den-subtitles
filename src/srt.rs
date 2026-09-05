@@ -211,15 +211,27 @@ fn tag_end(s: &str) -> Option<usize> {
     /// `<` stays linear in the line.
     const MAX_TAG: usize = 64;
 
-    // `>` is ASCII, so a byte position is a char boundary and no slicing can split a character.
+    // `<`, `>` and `/` are ASCII, so every byte index below is a char boundary.
+    if !s.starts_with('<') {
+        return None;
+    }
     let end = s.bytes().take(MAX_TAG).position(|b| b == b'>')?;
     let inner = s.get(1..end)?;
     let name = inner.strip_prefix('/').unwrap_or(inner);
     if !name.chars().next()?.is_ascii_alphanumeric() {
         return None;
     }
-    if name.contains(' ') && !(name.starts_with("v ") || name.starts_with("lang ")) {
-        return None;
+    // A tag may carry attributes — `<font color="#00FF00">`, `<v Fred>`, `<lang en>`, `<v.loud Esme>`
+    // — and those all have an ALPHABETIC name before the first space or class dot. Prose does not:
+    // "5 <6 and 7> 8" has the name "6". Requiring the name to be alphabetic before allowing a space
+    // separates the two; listing the tags that may take attributes instead (`v`, `lang`) escaped
+    // every `<font …>` in the file, which is the same "renders as visible text" bug this function
+    // exists to avoid, on the single most common styling tag there is.
+    if name.contains(' ') {
+        let head = name.split([' ', '.']).next().unwrap_or("");
+        if head.is_empty() || !head.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
     }
     Some(end)
 }
@@ -311,9 +323,28 @@ mod tests {
         // and passed "<6 and 7>" through raw — the exact malformed payload the escaping is for.
         let prose = parse("1\n00:00:01,000 --> 00:00:02,000\n5 <6 and 7> 8\n");
         assert!(serialize_vtt(&prose).contains("5 &lt;6 and 7> 8"), "prose was read as a tag");
-        // The two tags that legitimately carry a space still pass.
-        let voice = parse("1\n00:00:01,000 --> 00:00:02,000\n<v Fred>Hi</v>\n");
-        assert!(serialize_vtt(&voice).contains("<v Fred>Hi</v>"), "a voice tag was escaped");
+        // Tags that carry attributes still pass. `<font …>` matters most: it is the single most
+        // common styling tag in real subtitle files, and an earlier version of this rule allowed a
+        // space only for `v ` and `lang ` — which escaped every one of them, showing the viewer a
+        // literal `<font color="#00FF00">` while the closing `</font>` passed through.
+        for styled in [
+            "<font color=\"#00FF00\">Hello</font>",
+            "<font face=\"Arial\" size=\"18\">Hi</font>",
+            "<v Fred>Hi</v>",
+            "<v.loud Esme>Hi</v>",
+            "<lang en>Hi</lang>",
+        ] {
+            let cues = parse(&format!("1\n00:00:01,000 --> 00:00:02,000\n{styled}\n"));
+            let vtt = serialize_vtt(&cues);
+            assert!(vtt.contains(styled), "legal markup was escaped into visible text: {vtt:?}");
+        }
+
+        // An `&` inside a tag is still an `&`.
+        let attr = parse("1\n00:00:01,000 --> 00:00:02,000\n<v Tom & Jerry>Hi</v>\n");
+        assert!(
+            serialize_vtt(&attr).contains("<v Tom &amp; Jerry>"),
+            "an ampersand inside a tag was left raw"
+        );
     }
 
     /// A cue is arbitrary downloaded text and `to_vtt` re-runs this per request, on the one runtime
@@ -322,14 +353,24 @@ mod tests {
     /// process. The bound is loose on purpose; it catches a return to quadratic, not milliseconds.
     #[test]
     fn escaping_a_hostile_line_stays_linear() {
-        let hostile = "<a".repeat(200_000);
-        let cues = vec![Cue { index: 1, start: 0, end: 1000, text: hostile }];
-        let started = std::time::Instant::now();
-        let out = serialize_vtt(&cues);
-        let took = started.elapsed();
-        assert!(took < std::time::Duration::from_secs(5), "escaping took {took:?} — quadratic again?");
-        // And it really did escape them rather than finding a shortcut.
-        assert!(out.contains("&lt;a"), "the hostile line was not escaped at all");
+        // A RATIO, not a wall-clock bound. The quadratic version did 400 KB of this in about 1.2s in
+        // the test profile, so an absolute bound loose enough to be stable across machines was also
+        // loose enough to pass on the bug — which is what a first attempt at this test did.
+        // Doubling the input doubles linear work and quadruples quadratic work; 8x leaves room for
+        // noise while still failing on n².
+        let time_for = |repeats: usize| {
+            let cues = vec![Cue { index: 1, start: 0, end: 1000, text: "<a".repeat(repeats) }];
+            let started = std::time::Instant::now();
+            let out = serialize_vtt(&cues);
+            // And it really did escape them, rather than finding a shortcut that skips the work.
+            assert!(out.contains("&lt;a"), "the hostile line was not escaped at all");
+            started.elapsed()
+        };
+
+        let small = time_for(100_000).max(std::time::Duration::from_micros(200));
+        let large = time_for(400_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(ratio < 8.0, "4x the input took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
     }
 
     #[test]
