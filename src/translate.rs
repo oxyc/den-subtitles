@@ -67,8 +67,14 @@ pub const MAX_CUES: usize = 6000;
 /// language subs, ASS conversions that kept their inline styling, and transcript-style uploads all
 /// run to megabytes.
 ///
-/// A normal film's dialogue is well under 100 KB, so this leaves an order of magnitude of headroom.
-pub const MAX_DIALOGUE_BYTES: usize = 1024 * 1024;
+/// The worst LEGITIMATE track is around 150 KB — a dual-language sub is about twice a normal film,
+/// and an ASS conversion that kept its inline font tags adds some forty bytes a cue. This leaves
+/// well over that and still cuts the worst case by four: a megabyte of dialogue is roughly 300k
+/// input tokens and as many out, which on the default model is a couple of dollars for one film and
+/// three figures across a day's allowance. And the measurement is of the source, once — the
+/// wrong-length split re-sends a batch's text at every level of its binary tree, so what actually
+/// reaches the key can be several times this before the quality gate stops the run.
+pub const MAX_DIALOGUE_BYTES: usize = 256 * 1024;
 /// Characters of dialogue the glossary pass is allowed to read. A film is well under this; the cue
 /// ceiling above allows something several times larger, and one call carrying all of it would cost
 /// more than the translation it is meant to improve.
@@ -512,24 +518,25 @@ fn is_credential_refusal(status: reqwest::StatusCode) -> bool {
 /// it is worth blocking the whole install for a few minutes rather than discovering it title by
 /// title, one metered subtitle download each.
 ///
-/// A 403 is ambiguous: OpenRouter answers it when a model's moderation trips, and this file already
-/// notes that film dialogue trips content filters routinely. Blocking the install on one of those
-/// lets a series whose dialogue upsets a filter take every other title down with it, ten minutes at
-/// a time, as the viewer works through the episodes.
+/// The ambiguity is a property of the PROVIDER, not of the status. The one behaviour that makes a
+/// refusal per-film rather than per-key is a moderation rejection, and only OpenRouter answers one
+/// on these paths — for everyone else a 403 is region or authorization, which the next film will
+/// meet identically. Treating 403 as ambiguous for all of them made a revoked DeepL key pay twice
+/// the metered downloads per window for an ambiguity that provider does not have.
 ///
-/// A 400 is ambiguous for everyone EXCEPT Anthropic, which reports an empty balance that way — and
-/// an empty balance is the commonest way a BYOK key dies. Treating it as ambiguous for them put the
-/// single most likely misconfiguration in the product back to costing a metered download per title
-/// browsed, which is the same quota the plain subtitle picker spends. So the question needs the
-/// provider, not just the status.
+/// A 400 is likewise the provider's own dialect: Anthropic reports an empty balance that way and
+/// Google an invalid API key (`INVALID_ARGUMENT` / `API_KEY_INVALID`) rather than with a 401 —
+/// between them the two commonest BYOK deaths there are. Elsewhere a 400 is a request the model
+/// would not take, which is about this film.
+///
+/// What stays ambiguous still escalates on evidence rather than assumption: see
+/// `addon::ambiguous_refusal_escalates`.
 fn is_certainly_the_key(provider: Provider, status: reqwest::StatusCode) -> bool {
+    let moderates = provider == Provider::OpenRouter;
     match status.as_u16() {
         401 | 402 | 456 => true,
-        // Anthropic reports an empty balance this way; Google reports an invalid API key this way
-        // (`INVALID_ARGUMENT` / `API_KEY_INVALID`) rather than with a 401. Between them that is the
-        // two commonest BYOK deaths there are. For the others a 400 is a request the model would not
-        // take, which is about this film.
         400 => matches!(provider, Provider::Anthropic | Provider::Google),
+        403 => !moderates,
         _ => false,
     }
 }
@@ -1537,10 +1544,15 @@ mod contract_tests {
             assert!(is_credential_refusal(s), "{code} was not read as a credential refusal");
             assert!(is_certainly_the_key(Provider::OpenAI, s), "{code} should block the install");
         }
-        // A 403 is the key or this film's dialogue — refused and refunded, but per-title.
+        // A 403 is ambiguous only where a moderation rejection can produce one. OpenRouter has that;
+        // for everyone else 403 is region or authorization, which the next film meets identically —
+        // DeepL in particular documents it as its single auth failure and has no moderation at all.
         let forbidden = StatusCode::from_u16(403).unwrap();
         assert!(is_credential_refusal(forbidden));
-        assert!(!is_certainly_the_key(Provider::OpenRouter, forbidden), "a 403 blocked the install");
+        assert!(!is_certainly_the_key(Provider::OpenRouter, forbidden), "a moderation 403 blocked the install");
+        for p in [Provider::DeepL, Provider::OpenAI, Provider::Anthropic, Provider::Google, Provider::Xai] {
+            assert!(is_certainly_the_key(p, forbidden), "{p:?}'s 403 was treated as ambiguous");
+        }
 
         // A 400 depends on who said it. Anthropic reports an empty balance that way, which is the
         // commonest failure there is and must block the install; for everyone else it is a request

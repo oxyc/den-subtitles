@@ -967,6 +967,30 @@ fn ambiguous_refusal_key(config: &str, llm: &LlmConfig) -> String {
     format!("{SYNCFAIL}llm-amb:{:016x}:{}:{}", short_hash(config), llm.provider.tag(), llm.model)
 }
 
+/// Should an ambiguous refusal block the whole install? Only once a SECOND, different title has
+/// refused the same way inside the window.
+///
+/// The title is the episode, not the series. Keyed on the series id, every episode of one show read
+/// as the same title and the escalation could never fire — while each episode still resolved its own
+/// source and spent its own metered download, so a dead key on a season was unbounded. That is the
+/// same browsing pattern the ambiguity itself is modelled on, and it needs to cut both ways: one
+/// film's dialogue must not block the library, and a key that fails across two episodes must.
+///
+/// The memory of the last refusal deliberately outlives the block it can arm. Sharing a lifetime
+/// with it meant that every time the block lapsed the evidence had lapsed too, so re-arming took two
+/// fresh titles and two more metered downloads, every window.
+fn ambiguous_refusal_escalates(
+    state: &Arc<AppState>,
+    config: &str,
+    llm: &LlmConfig,
+    title: &str,
+) -> bool {
+    let seen = ambiguous_refusal_key(config, llm);
+    let escalate = matches!(state.cache.get_mem(&seen), Some(other) if other != title);
+    state.cache.put_mem(seen, title.to_string(), 2 * SYNC_RETRY_TTL);
+    escalate
+}
+
 /// Is today's allowance already gone? A read, not a charge.
 ///
 /// Consulted before the source download so a refusal is free. Charging only after the download —
@@ -1317,16 +1341,10 @@ pub async fn handle_translate(
                             // Certain: block the install at once. Ambiguous: block it only once a
                             // SECOND title has refused the same way, which is what separates a dead
                             // key from one film's dialogue upsetting a content filter.
-                            let block = key_certain || {
-                                let seen = ambiguous_refusal_key(config, llm);
-                                match state.cache.get_mem(&seen) {
-                                    Some(other) if other != imdb => true,
-                                    _ => {
-                                        state.cache.put_mem(seen, imdb.clone(), SYNC_RETRY_TTL);
-                                        false
-                                    }
-                                }
-                            };
+                            let episode_id =
+                                format!("{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0));
+                            let block = key_certain
+                                || ambiguous_refusal_escalates(state, config, llm, &episode_id);
                             if block {
                                 state.cache.put_mem(
                                     credential_refused_key(config, llm),
@@ -2147,31 +2165,32 @@ mod translate_retry_tests {
     /// title browsed. Two different titles refusing the same way is what actually distinguishes them.
     #[test]
     fn an_ambiguous_refusal_needs_two_titles_to_block_the_install() {
-        let state = state("ambiguous");
+        let films = state("ambiguous");
         let llm = LlmConfig {
             provider: userconfig::Provider::OpenRouter,
             model: "m".into(),
             api_key: "k".into(),
         };
-        let seen = ambiguous_refusal_key("install-one", &llm);
+        // Through the real function the handler calls — a re-typed copy of the rule cannot catch the
+        // handler diverging from it, which is how the series case got in.
+        let refuse = |title: &str| ambiguous_refusal_escalates(&films, "install-one", &llm, title);
 
-        // What the handler does on an ambiguous refusal, for a given title.
-        let refuse = |imdb: &str| match state.cache.get_mem(&seen) {
-            Some(other) if other != imdb => true,
-            _ => {
-                state.cache.put_mem(seen.clone(), imdb.to_string(), SYNC_RETRY_TTL);
-                false
-            }
-        };
-
-        assert!(!refuse("tt0111161"), "one title blocked the whole install");
-        // The same title again is still one film — a filtered series must not escalate by repeating.
-        assert!(!refuse("tt0111161"), "the same title twice blocked the install");
+        assert!(!refuse("tt0111161:0:0"), "one title blocked the whole install");
+        // The same title again is still one film — a filtered film must not escalate by repeating.
+        assert!(!refuse("tt0111161:0:0"), "the same title twice blocked the install");
         // A different one is the signal that this is the key, not the dialogue.
-        assert!(refuse("tt0068646"), "two distinct titles did not escalate");
+        assert!(refuse("tt0068646:0:0"), "two distinct titles did not escalate");
+
+        // Episodes of one series are DIFFERENT titles here. Keyed on the series id they all read as
+        // one, so a dead key could walk a whole season spending a metered download an episode and
+        // never arm the block — while that is the very browsing pattern the ambiguity models.
+        let series = state("ambiguous-series");
+        let refuse = |title: &str| ambiguous_refusal_escalates(&series, "install-one", &llm, title);
+        assert!(!refuse("tt1234567:2:5"), "one episode blocked the whole install");
+        assert!(refuse("tt1234567:2:6"), "the next episode of the same series did not escalate");
 
         // And the two markers are distinct namespaces, so neither can be read as the other.
-        assert_ne!(seen, credential_refused_key("install-one", &llm));
+        assert_ne!(ambiguous_refusal_key("install-one", &llm), credential_refused_key("install-one", &llm));
     }
 
     /// A failure belongs to the install that had it. The translated BODY is the same bytes whoever
