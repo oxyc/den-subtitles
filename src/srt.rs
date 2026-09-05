@@ -367,8 +367,13 @@ mod tests {
             started.elapsed()
         };
 
-        let small = time_for(100_000).max(std::time::Duration::from_micros(200));
-        let large = time_for(400_000);
+        // Fastest of three, not one. The suite runs these in parallel, so a single sample can be
+        // scheduled against the rest of it — and a ratio of two noisy samples is twice as noisy.
+        // The minimum is the run that got the least interference, which is the one worth comparing.
+        let best_of_three = |repeats: usize| (0..3).map(|_| time_for(repeats)).min().unwrap();
+
+        let small = best_of_three(100_000).max(std::time::Duration::from_micros(200));
+        let large = best_of_three(400_000);
         let ratio = large.as_secs_f64() / small.as_secs_f64();
         assert!(ratio < 8.0, "4x the input took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
 
@@ -381,8 +386,9 @@ mod tests {
             assert!(serialize_vtt(&cues).contains("<i>x</i>"), "tags were not passed through");
             started.elapsed()
         };
-        let small = tagged(50_000).max(std::time::Duration::from_micros(200));
-        let large = tagged(200_000);
+        let best_tagged = |repeats: usize| (0..3).map(|_| tagged(repeats)).min().unwrap();
+        let small = best_tagged(50_000).max(std::time::Duration::from_micros(200));
+        let large = best_tagged(200_000);
         let ratio = large.as_secs_f64() / small.as_secs_f64();
         assert!(ratio < 8.0, "4x the tags took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
     }

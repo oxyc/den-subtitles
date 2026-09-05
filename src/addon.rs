@@ -967,6 +967,16 @@ fn ambiguous_refusal_key(config: &str, llm: &LlmConfig) -> String {
     format!("{SYNCFAIL}llm-amb:{:016x}:{}:{}", short_hash(config), llm.provider.tag(), llm.model)
 }
 
+/// One film or one episode, as anything counting distinct titles has to count them.
+///
+/// `parse_id` splits `tt123:2:5` into three values and the first is the SERIES, so building this
+/// from `imdb` alone makes every episode of a show one title — which is how the escalation below
+/// came to be unable to fire across a season at all. A named function because that mistake was
+/// invisible at the call site and, spelled inline, no test could catch its return.
+fn title_id(imdb: &str, season: Option<i64>, episode: Option<i64>) -> String {
+    format!("{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0))
+}
+
 /// Should an ambiguous refusal block the whole install? Only once a SECOND, different title has
 /// refused the same way inside the window.
 ///
@@ -1331,7 +1341,7 @@ pub async fn handle_translate(
                         // The provider refused the key itself. Remembered install-wide rather than
                         // per title, because that is the scope of the fact — and no per-title
                         // marker, since the title is innocent and will work once the key does.
-                        Err(TranslationFailure::Credential { message, key_certain }) => {
+                        Err(TranslationFailure::Credential { message, key_certain, spent }) => {
                             eprintln!("translate: provider refused this install's credential: {message}");
                             // The install-wide block only when the status can ONLY mean the key.
                             // A 400 or a 403 might be this film's dialogue tripping a content
@@ -1341,10 +1351,20 @@ pub async fn handle_translate(
                             // Certain: block the install at once. Ambiguous: block it only once a
                             // SECOND title has refused the same way, which is what separates a dead
                             // key from one film's dialogue upsetting a content filter.
-                            let episode_id =
-                                format!("{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0));
+                            // A refusal that arrives AFTER a billed batch cannot be about the key:
+                            // the provider accepted this credential minutes ago, in this run. That
+                            // is a measurement, where `key_certain` is a guess and the two-title
+                            // heuristic is a proxy — so it settles the ambiguous case outright, and
+                            // it is what stops a moderation-filtered series from re-arming the
+                            // install-wide block every time the previous one lapses.
                             let block = key_certain
-                                || ambiguous_refusal_escalates(state, config, llm, &episode_id);
+                                || (!spent
+                                    && ambiguous_refusal_escalates(
+                                        state,
+                                        config,
+                                        llm,
+                                        &title_id(&imdb, season, episode),
+                                    ));
                             if block {
                                 state.cache.put_mem(
                                     credential_refused_key(config, llm),
@@ -1515,7 +1535,11 @@ enum TranslationFailure {
     /// `key_certain` says whether it can only be about the credential. A 401 or an empty balance
     /// can; a 400 or a 403 might instead be this film's dialogue tripping a content filter, and
     /// blocking a whole install on one of those lets a series take every other title down with it.
-    Credential { message: String, key_certain: bool },
+    ///
+    /// `spent` is the strongest signal of the three and is a measurement rather than a guess: if a
+    /// batch was billed before the refusal, the provider accepted this credential in this very run,
+    /// so whatever it has now objected to is about the CONTENT, not the key.
+    Credential { message: String, key_certain: bool, spent: bool },
 }
 
 /// Carry a download failure's own verdict through to the pin.
@@ -1543,7 +1567,7 @@ impl TranslationFailure {
         match self {
             TranslationFailure::Source(m)
             | TranslationFailure::Model(m)
-            | TranslationFailure::Credential { message: m, .. } => m,
+            | TranslationFailure::Credential { message: m, .. } => m.as_str(),
             TranslationFailure::Allowance => "daily translation allowance used up",
         }
     }
@@ -1654,7 +1678,11 @@ async fn produce_translation(
             if !e.spent {
                 refund_translation(state, config);
             }
-            TranslationFailure::Credential { message: e.message, key_certain: e.key_certain }
+            TranslationFailure::Credential {
+                message: e.message,
+                key_certain: e.key_certain,
+                spent: e.spent,
+            }
         }
         false => TranslationFailure::Model(e.message),
     })?;
@@ -2181,13 +2209,40 @@ mod translate_retry_tests {
         // A different one is the signal that this is the key, not the dialogue.
         assert!(refuse("tt0068646:0:0"), "two distinct titles did not escalate");
 
-        // Episodes of one series are DIFFERENT titles here. Keyed on the series id they all read as
-        // one, so a dead key could walk a whole season spending a metered download an episode and
-        // never arm the block — while that is the very browsing pattern the ambiguity models.
+        // Episodes of one series are DIFFERENT titles here. `parse_id` returns the SERIES id, so
+        // building this from that alone made every episode read as one title and the escalation
+        // could never fire across a season. Asserted against the real builder: spelled inline in the
+        // handler, reverting it compiled and passed.
+        assert_ne!(
+            title_id("tt1234567", Some(2), Some(5)),
+            title_id("tt1234567", Some(2), Some(6)),
+            "two episodes of one series count as the same title"
+        );
+        assert_ne!(title_id("tt0111161", None, None), title_id("tt0068646", None, None));
+        // And a film is stable across requests, so repeating it never escalates on its own.
+        assert_eq!(title_id("tt0111161", None, None), title_id("tt0111161", None, None));
+
         let series = state("ambiguous-series");
         let refuse = |title: &str| ambiguous_refusal_escalates(&series, "install-one", &llm, title);
-        assert!(!refuse("tt1234567:2:5"), "one episode blocked the whole install");
-        assert!(refuse("tt1234567:2:6"), "the next episode of the same series did not escalate");
+        let ep = |s, e| title_id("tt1234567", Some(s), Some(e));
+        assert!(!refuse(&ep(2, 5)), "one episode blocked the whole install");
+        assert!(refuse(&ep(2, 6)), "the next episode of the same series did not escalate");
+
+        // But a refusal that arrives after a billed batch never reaches any of this. The provider
+        // accepted this key in this run, so what it has objected to is the content — and without
+        // that check a moderation-filtered series re-armed the install-wide block every time the
+        // previous one lapsed, for as long as the viewer kept watching.
+        let blocks = |key_certain: bool, spent: bool, title: &str| {
+            key_certain
+                || (!spent && ambiguous_refusal_escalates(&series, "install-two", &llm, title))
+        };
+        assert!(!blocks(false, true, &ep(3, 1)), "a refusal after billed work blocked the install");
+        assert!(!blocks(false, true, &ep(3, 2)), "a second billed refusal escalated");
+        // A dead key bills nothing, so it still escalates on the second title.
+        assert!(!blocks(false, false, &ep(4, 1)));
+        assert!(blocks(false, false, &ep(4, 2)), "a key that billed nothing did not escalate");
+        // And an unambiguous status blocks at once, billed or not — a key revoked mid-run is dead.
+        assert!(blocks(true, true, &ep(5, 1)));
 
         // And the two markers are distinct namespaces, so neither can be read as the other.
         assert_ne!(ambiguous_refusal_key("install-one", &llm), credential_refused_key("install-one", &llm));
