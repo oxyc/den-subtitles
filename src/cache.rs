@@ -201,6 +201,21 @@ impl Cache {
         self.mem_put(key, value, ttl);
     }
 
+    /// Forget a key in both tiers. For an entry that has been proven wrong rather than merely stale
+    /// — the alternative, writing it back with a zero TTL, means a blocking disk write to say
+    /// "delete this".
+    pub fn remove(&self, key: &str) {
+        {
+            let mut g = self.inner.lock().unwrap();
+            if let Some(e) = g.map.remove(key) {
+                g.bytes -= e.size;
+            }
+        }
+        if let Some(path) = self.disk_path(key) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Read from memory only. The companion to `put_mem`: going through `get` would fall through to
     /// a disk probe that, for a key only ever written by `put_mem`, cannot hit — a blocking `open`
     /// per lookup, ~150 of them per resumed film, all of them ENOENT.
@@ -271,9 +286,10 @@ impl Cache {
         let name = if key.len() <= MAX_PLAIN {
             encode(key.as_bytes())
         } else {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut h);
+            // A FIXED hash, not `DefaultHasher`: this names a file on disk that outlives the
+            // process, and std may change that algorithm between compiler releases — which would
+            // rename every hashed entry at once, orphaning them all.
+            let digest = crate::httputil::stable_hash(key.as_bytes());
             // On a char boundary — a key is UTF-8 and a byte slice through a multibyte char panics.
             let head: String = key.chars().take(32).collect();
             // `~` separates the two namespaces because it is not in the base64url alphabet, so a
@@ -281,7 +297,7 @@ impl Cache {
             // are all legal base64url output, so some short key could encode to exactly a long key's
             // hashed name and the two would share a file. Nor a `.`, which `disk_put`'s
             // `with_extension` would then treat as the extension and overwrite.
-            format!("{}~{:016x}", encode(head.as_bytes()), h.finish())
+            format!("{}~{digest:016x}", encode(head.as_bytes()))
         };
         Some(dir.join(name))
     }

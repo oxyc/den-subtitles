@@ -179,8 +179,9 @@ fn escape_vtt(line: &str) -> String {
             out.push_str("&amp;");
             rest = after;
         } else if let Some(end) = tag_end(tail) {
-            // Tag-shaped and closed: hand it through as the markup it is.
-            out.push_str(&tail[..=end]);
+            // Tag-shaped and closed: hand it through as the markup it is — but an `&` inside it is
+            // still an `&`, and `<v Tom & Jerry>` is as malformed as a bare one in the dialogue.
+            out.push_str(&tail[..=end].replace('&', "&amp;"));
             rest = &tail[end + 1..];
         } else {
             out.push_str("&lt;");
@@ -193,15 +194,34 @@ fn escape_vtt(line: &str) -> String {
 
 /// Byte index of the `>` closing a WebVTT tag at the start of `s`, or `None` if this `<` is just a
 /// less-than sign. Covers `<i>`, `</i>`, `<c.loud>`, `<v Fred>`, `<lang en>` and the timestamp form
-/// `<00:00:01.000>` — the common shape being "angle bracket, optional slash, then something
-/// alphanumeric, then a closing bracket on the same line".
+/// `<00:00:01.000>`.
+///
+/// The search for `>` is bounded, and that bound is load-bearing twice over.
+///
+/// Cost: scanning the whole remaining line for each `<` is quadratic, and a cue is arbitrary
+/// downloaded text — a line of `<a<a<a…` took 794 ms at 320 KB and would take about twenty minutes
+/// at the 12 MiB body cap, on the one thread that serves every connection, replayed on every
+/// request because `to_vtt` caches nothing.
+///
+/// Correctness: unbounded, `5 <6 and 7> 8` found a distant `>` and passed `<6 and 7>` through raw —
+/// which is the malformed-VTT case this whole function exists to prevent. A real tag is short, and
+/// only the voice and language tags contain a space.
 fn tag_end(s: &str) -> Option<usize> {
-    let body = s.strip_prefix('<')?;
-    let body = body.strip_prefix('/').unwrap_or(body);
-    if !body.chars().next()?.is_ascii_alphanumeric() {
+    /// Longer than `<00:00:01.000>` and any realistic `<v Name>`, short enough that scanning it per
+    /// `<` stays linear in the line.
+    const MAX_TAG: usize = 64;
+
+    // `>` is ASCII, so a byte position is a char boundary and no slicing can split a character.
+    let end = s.bytes().take(MAX_TAG).position(|b| b == b'>')?;
+    let inner = s.get(1..end)?;
+    let name = inner.strip_prefix('/').unwrap_or(inner);
+    if !name.chars().next()?.is_ascii_alphanumeric() {
         return None;
     }
-    s.find('>')
+    if name.contains(' ') && !(name.starts_with("v ") || name.starts_with("lang ")) {
+        return None;
+    }
+    Some(end)
 }
 
 /// `HH:MM:SS,mmm --> HH:MM:SS,mmm` → (start_ms, end_ms). Also accepts a `.` millisecond separator
@@ -286,6 +306,30 @@ mod tests {
         // A `<` that opens nothing is still escaped, even with a `>` later in the line.
         let tricky = parse("1\n00:00:01,000 --> 00:00:02,000\na < b > c\n");
         assert!(serialize_vtt(&tricky).contains("a &lt; b > c"), "a bare less-than was read as a tag");
+
+        // A distant `>` does not make a tag out of prose. Unbounded, this found the `>` after "7"
+        // and passed "<6 and 7>" through raw — the exact malformed payload the escaping is for.
+        let prose = parse("1\n00:00:01,000 --> 00:00:02,000\n5 <6 and 7> 8\n");
+        assert!(serialize_vtt(&prose).contains("5 &lt;6 and 7> 8"), "prose was read as a tag");
+        // The two tags that legitimately carry a space still pass.
+        let voice = parse("1\n00:00:01,000 --> 00:00:02,000\n<v Fred>Hi</v>\n");
+        assert!(serialize_vtt(&voice).contains("<v Fred>Hi</v>"), "a voice tag was escaped");
+    }
+
+    /// A cue is arbitrary downloaded text and `to_vtt` re-runs this per request, on the one runtime
+    /// thread, caching nothing. Scanning the rest of the line for a `>` at every `<` was quadratic:
+    /// 794 ms at 320 KB, and roughly twenty minutes at the body cap — one request stalling the
+    /// process. The bound is loose on purpose; it catches a return to quadratic, not milliseconds.
+    #[test]
+    fn escaping_a_hostile_line_stays_linear() {
+        let hostile = "<a".repeat(200_000);
+        let cues = vec![Cue { index: 1, start: 0, end: 1000, text: hostile }];
+        let started = std::time::Instant::now();
+        let out = serialize_vtt(&cues);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(5), "escaping took {took:?} — quadratic again?");
+        // And it really did escape them rather than finding a shortcut.
+        assert!(out.contains("&lt;a"), "the hostile line was not escaped at all");
     }
 
     #[test]

@@ -12,15 +12,22 @@ pub type Body = Full<Bytes>;
 /// `DefaultHasher`) is plenty — an ETag only needs to change when the bytes change, not resist an
 /// adversary. Length is folded in as a cheap extra guard against hash collisions.
 fn etag_of(bytes: &[u8]) -> String {
-    // FNV-1a-64: a FIXED, non-crypto hash — deterministic across restarts AND toolchain versions
-    // (unlike std's DefaultHasher, whose algorithm std may change between compiler releases, which
-    // would shift every ETag once). Length is folded in as a cheap extra guard against collisions.
+    format!("\"{:016x}-{:x}\"", stable_hash(bytes), bytes.len())
+}
+
+/// FNV-1a-64: a FIXED, non-crypto hash — deterministic across restarts AND toolchain versions.
+///
+/// Anything whose value outlives the process must use this rather than std's `DefaultHasher`, whose
+/// algorithm std may change between compiler releases. A toolchain bump would otherwise silently
+/// rename every hashed cache file, reset every install's daily allowance, and move every failure
+/// marker — all at once, and invisibly.
+pub fn stable_hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
     }
-    format!("\"{h:016x}-{:x}\"", bytes.len())
+    h
 }
 
 /// Whether a response is a cacheable success that should carry a validator (ETag): a 200 with a
@@ -96,7 +103,7 @@ fn srt_cached(body: String, cache_control: &str) -> Response<Body> {
 /// Anything that is not a subtitle body (an error, a 304) passes through untouched. The ETag is
 /// recomputed because the bytes are genuinely different, and the caching directive is carried over
 /// because whether the body is settled or provisional is not changed by re-rendering it.
-pub async fn to_vtt(resp: Response<Body>) -> Response<Body> {
+pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<Body> {
     use http_body_util::BodyExt;
 
     let is_subtitle = resp
@@ -113,6 +120,27 @@ pub async fn to_vtt(resp: Response<Body>) -> Response<Body> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("no-store")
         .to_string();
+
+    // The VTT ETag is derived from the SRT one rather than from the converted bytes, so a
+    // conditional request can be answered WITHOUT converting. Conversion is a full parse and
+    // re-serialize of the whole document, and `apply_conditional` runs after the router — so every
+    // `If-None-Match` hit was paying for a body it then threw away, on the one runtime thread.
+    // Derived, not invented: the SRT ETag already changes whenever the bytes do.
+    let vtt_etag = resp
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|srt_etag| format!("\"{:016x}-vtt\"", stable_hash(srt_etag.as_bytes())));
+    if let Some(etag) = &vtt_etag {
+        if req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, &HeaderValue::from_str(etag).unwrap())) {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header(CACHE_CONTROL, cache_control)
+                .header(ETAG, etag)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
+    }
     // `Full` is already in memory, so this await resolves immediately and cannot stall the thread.
     let bytes = match resp.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -126,7 +154,7 @@ pub async fn to_vtt(resp: Response<Body>) -> Response<Body> {
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "text/vtt; charset=utf-8")
         .header(CACHE_CONTROL, cache_control)
-        .header(ETAG, etag_of(vtt.as_bytes()))
+        .header(ETAG, vtt_etag.unwrap_or_else(|| etag_of(vtt.as_bytes())))
         .body(Full::new(Bytes::from(vtt)))
         .unwrap()
 }

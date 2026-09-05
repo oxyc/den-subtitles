@@ -129,7 +129,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                     let resync = query_get(query, "resync");
                     let resp = addon::handle_subtitle_file(state, config, file_id, ref_id, resync).await;
                     if want_vtt {
-                        httputil::to_vtt(resp).await
+                        httputil::to_vtt(resp, &parts.headers).await
                     } else {
                         resp
                     }
@@ -166,7 +166,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             let resp =
                 addon::handle_translate(state, &parts.headers, config, id, extra, lang, want_json, resync).await;
             if want_vtt {
-                httputil::to_vtt(resp).await
+                httputil::to_vtt(resp, &parts.headers).await
             } else {
                 resp
             }

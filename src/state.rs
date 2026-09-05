@@ -5,6 +5,12 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
+/// Tier binaries (`alass`/`ffsubsync`, each its own process, each up to 90s) allowed to run at once.
+/// Two keeps a burst of requests from turning into a burst of ffmpeg decodes on a homelab box.
+const MAX_CONCURRENT_SYNCS: usize = 2;
+
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::inflight::{InFlight, Progress};
@@ -25,6 +31,11 @@ pub struct AppState {
     pub inflight: InFlight,
     /// How far a running translation has got, for the `.status` endpoint.
     pub progress: Progress,
+    /// Tier binaries allowed to run at once. `alass` decodes audio through ffmpeg and gets up to 90
+    /// seconds; the runtime has one thread and the container is a homelab box. The single-flight map
+    /// collapses duplicates of the SAME alignment, but distinct ones — twenty picker URLs, or a
+    /// client naming twenty different `?ref=` values — are distinct keys and would all spawn.
+    pub sync_slots: Semaphore,
     pub sync: SyncTools,
     /// Consecutive OpenSubtitles search failures — surfaced as `degraded` on /health (ADDON-02).
     pub os_fails: AtomicU32,
@@ -69,6 +80,7 @@ impl AppState {
             cache,
             inflight: InFlight::default(),
             progress: Progress::default(),
+            sync_slots: Semaphore::new(MAX_CONCURRENT_SYNCS),
             sync,
             os_fails: AtomicU32::new(0),
         })
