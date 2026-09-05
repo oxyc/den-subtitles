@@ -177,7 +177,7 @@ pub async fn handle_subtitles(
     let hash = search_hash(extra);
     let filename = extra_field(extra, "filename");
     let client = os_client(state, http, &cfg);
-    let mut subs = match cached_search(state, &client, &imdb, season, episode, hash.as_deref()).await {
+    let mut subs = match cached_search(state, &client, config, &imdb, season, episode, hash.as_deref()).await {
         Ok(s) => s,
         // Empty-200 is the correct Stremio shape for "nothing"; `cached_search` has already logged
         // the cause and counted it for /health.
@@ -250,9 +250,11 @@ fn os_client<'a>(state: &'a AppState, http: &'a reqwest::Client, cfg: &'a UserCo
 ///
 /// Returned UNRANKED, and cached that way: ranking is filename-specific, so each caller ranks the
 /// list for its own request.
+#[allow(clippy::too_many_arguments)]
 async fn cached_search(
     state: &Arc<AppState>,
     client: &opensubtitles::Client<'_>,
+    config: &str,
     imdb: &str,
     season: Option<i64>,
     episode: Option<i64>,
@@ -279,9 +281,15 @@ async fn cached_search(
     // The flight ahead of us may have failed. Nothing caches a failed search, so without this the
     // queue behind one miss ran a live search EACH, one after another, at up to the client timeout
     // apiece — the tenth caller waiting ten times as long as it used to for the same failure.
+    // Scoped to the INSTALL, unlike the result. A successful search is install-independent — the
+    // same file ids for everyone — which is why the positive entry is shared. A FAILURE is not: it
+    // depends on the caller's key, token and rate limit, and a 401 from one revoked key would
+    // otherwise deny that title to every other install for the marker's lifetime, re-armed every
+    // time the bad install polled. `translate_fail_key` learned this already.
+    //
     // `get_mem` to match the `put_mem` below: going through `get` would fall through to a disk probe
     // for a key nothing ever writes to disk — a blocking ENOENT `open` per cache-miss search.
-    let fail_key = format!("{SYNCFAIL}{search_key}");
+    let fail_key = format!("{SYNCFAIL}{:016x}:{search_key}", short_hash(config));
     if state.cache.get_mem(&fail_key).is_some() {
         return Err("search failed recently".to_string());
     }
@@ -861,7 +869,7 @@ pub async fn handle_translate(
             // was just spent and lost"; a search costs nothing, and marking it made a blip outlive
             // itself by ten minutes across every language the viewer tried, reporting `.status`
             // failed for a run never attempted.
-            let Ok(candidates) = cached_search(state, &client, &imdb, season, episode, None).await else {
+            let Ok(candidates) = cached_search(state, &client, config, &imdb, season, episode, None).await else {
                 return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
             };
             let Some(source) = translation_source(&candidates) else {
@@ -888,7 +896,7 @@ pub async fn handle_translate(
     // translate a cold title at all during a blip. Neither wrote a backoff, so every client retry
     // was another live search.
     let anchored = match hash.as_deref().filter(|_| cfg.auto_sync) {
-        Some(h) => cached_search(state, &client, &imdb, season, episode, Some(h))
+        Some(h) => cached_search(state, &client, config, &imdb, season, episode, Some(h))
             .await
             .unwrap_or_default(),
         None => Vec::new(),
@@ -1101,6 +1109,24 @@ enum TranslationFailure {
     Model(String),
 }
 
+/// Carry a download failure's own verdict through to the pin.
+///
+/// The one judgement call: a body that arrives as a 200 with no cues in it is treated as the file's
+/// fault. It could be a CDN interstitial, which is the service's — but a pin that keeps resolving to
+/// something unparseable has to be droppable, or the title is stuck. The cost of being wrong is
+/// small and self-correcting: `translation_source` is deterministic, so unless the candidate list
+/// has drifted the re-pick lands on the same file and re-pins it, buying nothing.
+fn classify_download(e: opensubtitles::DownloadError) -> TranslationFailure {
+    match e {
+        // The upload is gone, or what came back is not a subtitle. The pin naming it is wrong.
+        opensubtitles::DownloadError::Gone(m) => TranslationFailure::Source(m),
+        // Quota, rate limit, transport. The pin is innocent and must survive: blaming it here would
+        // re-pick the source and re-buy every language of the film because the viewer ran out of
+        // downloads for the day.
+        opensubtitles::DownloadError::Unavailable(m) => TranslationFailure::Model(m),
+    }
+}
+
 impl TranslationFailure {
     fn message(&self) -> &str {
         match self {
@@ -1131,14 +1157,9 @@ async fn produce_translation(
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
     // on it would re-pick the source, and re-buy every language of the film, because the viewer ran
     // out of downloads.
-    let raw = subtitle_srt(state, client, source_file_id).await.map_err(|e| match e {
-        // The upload is gone, or what came back is not a subtitle. The pin naming it is wrong.
-        opensubtitles::DownloadError::Gone(m) => TranslationFailure::Source(m),
-        // Quota, rate limit, transport. The pin is innocent and must survive — classifying these as
-        // the source's fault would re-pick and re-buy every language of the film because the viewer
-        // ran out of downloads for the day.
-        opensubtitles::DownloadError::Unavailable(m) => TranslationFailure::Model(m),
-    })?;
+    let raw = subtitle_srt(state, client, source_file_id)
+        .await
+        .map_err(classify_download)?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
         // Unreachable in practice — `download` gates on `has_a_cue`, and a differential test pins
@@ -1650,6 +1671,31 @@ mod translate_retry_tests {
         // And neither key may leak the config segment itself: it is a bearer secret, and these
         // become filenames.
         assert!(!key("install-one").contains("install-one"), "the config segment reached the key");
+    }
+
+    /// Only a failure that indicts the SOURCE may drop the pin, and this is the mapping that decides
+    /// it. Blaming the source for a quota exhaustion or a rate limit re-picks and re-buys every
+    /// language of the film because the viewer ran out of downloads for the day; blaming the service
+    /// for a deleted upload leaves the pin resolving to nothing, and the ten-minute marker then
+    /// cycles the same failure for the pin's whole 180-day life, for every install and language.
+    #[test]
+    fn only_a_dead_source_unpins() {
+        use opensubtitles::DownloadError;
+
+        let dead = classify_download(DownloadError::Gone("opensubtitles download 404".into()));
+        assert!(matches!(dead, TranslationFailure::Source(_)), "a dead upload must drop the pin");
+
+        for service in [
+            DownloadError::Unavailable("opensubtitles download 429".into()),
+            DownloadError::Unavailable("opensubtitles download 406".into()),
+            DownloadError::Unavailable("download request failed: connection reset".into()),
+        ] {
+            let message = format!("{service:?}");
+            assert!(
+                matches!(classify_download(service), TranslationFailure::Model(_)),
+                "a service failure dropped the pin: {message}"
+            );
+        }
     }
 
     /// The pin is what stops a drifting source pick from re-buying a film. It has to be scoped to

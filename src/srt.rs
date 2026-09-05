@@ -371,6 +371,20 @@ mod tests {
         let large = time_for(400_000);
         let ratio = large.as_secs_f64() / small.as_secs_f64();
         assert!(ratio < 8.0, "4x the input took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
+
+        // The other branch: every `<` DOES close, so each one is accepted as a tag and copied through
+        // its own allocation. Linear too, and untested by the case above, which only ever takes the
+        // reject path.
+        let tagged = |repeats: usize| {
+            let cues = vec![Cue { index: 1, start: 0, end: 1000, text: "<i>x</i>".repeat(repeats) }];
+            let started = std::time::Instant::now();
+            assert!(serialize_vtt(&cues).contains("<i>x</i>"), "tags were not passed through");
+            started.elapsed()
+        };
+        let small = tagged(50_000).max(std::time::Duration::from_micros(200));
+        let large = tagged(200_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(ratio < 8.0, "4x the tags took {ratio:.1}x the time ({small:?} → {large:?}) — quadratic?");
     }
 
     #[test]

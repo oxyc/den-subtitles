@@ -287,7 +287,21 @@ mod tests {
         // A `.vtt` and a `.srt` of the same subtitle are different bytes and must not share a
         // validator, or a client that fetched one gets a 304 for the other.
         let srt_etag = srt(SRT.to_string()).headers().get(ETAG).unwrap().clone();
-        assert_ne!(out.headers().get(ETAG).unwrap(), &srt_etag);
+        let vtt_etag = out.headers().get(ETAG).unwrap().clone();
+        assert_ne!(&vtt_etag, &srt_etag);
+
+        // And the validator must depend on the RENDERING VERSION, not only on the SRT bytes. It is
+        // derived from the SRT ETag, which does not move when the converter moves — so without the
+        // version folded in, changing what `serialize_vtt` emits (as escaping the payload did) leaves
+        // every revalidating client on the old output. Asserting the derivation is not the bare hash
+        // of the SRT ETag is what pins the fold; a test comparing it to the SRT ETag alone passes
+        // with the fold deleted, since the `-vtt` suffix already differs.
+        let unversioned = format!("\"{:016x}-vtt\"", stable_hash(srt_etag.to_str().unwrap().as_bytes()));
+        assert_ne!(
+            vtt_etag.to_str().unwrap(),
+            unversioned.as_str(),
+            "the VTT validator ignores the rendering version"
+        );
 
         let body = body_of(out).await;
         assert!(body.starts_with("WEBVTT"));
