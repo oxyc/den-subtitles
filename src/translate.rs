@@ -80,6 +80,24 @@ const MAX_GLOSSARY_TERM: usize = 40;
 /// Spreads retries that would otherwise fire in the same instant. Only ever incremented.
 static RETRY_TICK: AtomicU64 = AtomicU64::new(0);
 
+/// Why a run did not finish, and whether the CREDENTIAL is why.
+///
+/// The distinction matters upstream of here: the caller charges a daily allowance before the first
+/// model call, so a key that refuses every call would otherwise spend the whole allowance — and a
+/// metered subtitle download per title — having produced nothing. A timeout, a rate limit or a
+/// quality verdict is about this film; a 401 is about the install.
+#[derive(Debug)]
+pub struct TranslateError {
+    pub message: String,
+    pub credential_refused: bool,
+}
+
+impl From<String> for TranslateError {
+    fn from(message: String) -> Self {
+        TranslateError { message, credential_refused: false }
+    }
+}
+
 /// Where a finished batch is remembered between runs, so a film that dies at cue 1100 of 1200 does
 /// not re-buy the 1100 that worked. A trait rather than the cache itself, so the harness tests can
 /// drive the resume path without a disk tier.
@@ -156,12 +174,12 @@ pub async fn translate(
     target_lang: &str,
     store: &dyn BatchStore,
     progress: &(dyn Fn(usize, usize) + Sync),
-) -> Result<Vec<Cue>, String> {
+) -> Result<Vec<Cue>, TranslateError> {
     if cues.is_empty() {
         return Ok(Vec::new());
     }
     if cues.len() > MAX_CUES {
-        return Err(format!("subtitle too large: {} cues (max {MAX_CUES})", cues.len()));
+        return Err(format!("subtitle too large: {} cues (max {MAX_CUES})", cues.len()).into());
     }
     let resume = Resume {
         store,
@@ -178,7 +196,7 @@ async fn run_translation(
     deadline: Duration,
     resume: Option<&Resume<'_>>,
     progress: &(dyn Fn(usize, usize) + Sync),
-) -> Result<Vec<Cue>, String> {
+) -> Result<Vec<Cue>, TranslateError> {
     let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
     // Rolling context: the tail of already-translated pairs, refreshed as batches land. Shared
     // rather than owned now that batches overlap — each one snapshots what has finished so far.
@@ -263,7 +281,7 @@ async fn run_translation(
         // been sent yet. That is the price of the window, and it is bounded by its size.
         let kept = budget.untranslated.load(Ordering::Relaxed);
         if unusable(kept, cues.len()) {
-            return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()));
+            return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()).into());
         }
     }
     // No verdict after the loop: the check above runs after the last batch too, against the same
@@ -284,7 +302,7 @@ async fn one_batch<'c>(
     context: &Mutex<Vec<(String, String)>>,
     budget: &Budget,
     resume: Option<&Resume<'_>>,
-) -> Result<(&'c [Cue], Vec<String>), String> {
+) -> Result<(&'c [Cue], Vec<String>), TranslateError> {
     let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
     // The glossary, then a snapshot of what has landed so far. Both render into the prompt as
     // established pairs, so the glossary needs no separate plumbing — it is simply context that
@@ -386,7 +404,11 @@ enum CallError {
     /// The provider refused. `retry` carries a minimum delay when the refusal is one that retrying
     /// can fix — a 429 or a 5xx — and is `None` when it cannot: a 401 or a 400 means the key or the
     /// request is wrong, and repeating it just spends the same wrong request again.
-    Upstream { message: String, retry: Option<Duration> },
+    ///
+    /// `fatal` narrows that further: the refusal is about the CREDENTIAL, not the moment, so it will
+    /// happen identically for the next film. Worth telling the caller apart from a timeout, which
+    /// looks the same from here and is genuinely per-title.
+    Upstream { message: String, retry: Option<Duration>, fatal: bool },
 }
 
 /// Everything that reaches here as a bare string came from the transport or a serialization step —
@@ -394,7 +416,7 @@ enum CallError {
 /// carries its own retryability.
 impl From<String> for CallError {
     fn from(m: String) -> Self {
-        CallError::Upstream { message: m, retry: None }
+        CallError::Upstream { message: m, retry: None, fatal: false }
     }
 }
 
@@ -403,7 +425,7 @@ impl CallError {
     /// serve this path at all. Statuses that MIGHT be worth another go are built at the call sites
     /// that have the response in hand, through `retry_after`.
     fn upstream(message: impl Into<String>) -> CallError {
-        CallError::Upstream { message: message.into(), retry: None }
+        CallError::Upstream { message: message.into(), retry: None, fatal: false }
     }
 
     fn into_message(self) -> String {
@@ -417,6 +439,16 @@ impl CallError {
 ///
 /// Only rate limiting and the provider being unwell are worth repeating. `Some(ZERO)` means "worth
 /// retrying, no delay stated" — the caller still applies its own backoff on top.
+/// Is this refusal about the CREDENTIAL rather than the moment?
+///
+/// A 401 or 403 is a key that will refuse the next film identically; a 400 is a request shape that
+/// will. Distinguished because the caller charges a daily allowance before the first call, and a
+/// dead key would otherwise spend all of it — and a metered download per title — having sent no
+/// tokens at all. A timeout or a content filter looks the same from here and is genuinely per-title.
+fn is_credential_refusal(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 401 | 403)
+}
+
 fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if status.as_u16() != 429 && !status.is_server_error() {
         return None;
@@ -595,7 +627,7 @@ async fn translate_batch(
     context: &[(String, String)],
     budget: &Budget,
     resume: Option<&Resume<'_>>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, TranslateError> {
     if sources.is_empty() {
         return Ok(Vec::new());
     }
@@ -627,7 +659,7 @@ async fn translate_batch(
     // Checked here rather than only between batches because one wrong-length batch splits into up
     // to 2n-1 calls without the outer loop regaining control.
     if budget.spent() {
-        return Err("translation ran out of time".to_string());
+        return Err("translation ran out of time".to_string().into());
     }
     let result = call_with_retries(upstream, sources, context, budget).await;
 
@@ -681,7 +713,12 @@ async fn translate_batch(
             budget.untranslated.fetch_add(sources.len(), Ordering::Relaxed);
             Ok(sources.to_vec())
         }
-        Err(e) => Err(e.into_message()),
+        // The provider's own verdict on the credential travels with the message. It is the one
+        // failure the caller must not charge a slot for, since nothing was spent to earn it.
+        Err(CallError::Upstream { message, fatal: true, .. }) => {
+            Err(TranslateError { message, credential_refused: true })
+        }
+        Err(e) => Err(e.into_message().into()),
     }
 }
 
@@ -827,7 +864,7 @@ async fn call_chat_typed(
         // The status only. This string is logged, and the body is the PROVIDER's text about a
         // request that carried the user's key — OpenAI's 401 quotes a masked form of it back, and a
         // self-hosted gateway is under no obligation to mask anything.
-        return Err(CallError::Upstream { message: format!("provider {code}"), retry });
+        return Err(CallError::Upstream { message: format!("provider {code}"), retry, fatal: is_credential_refusal(code) });
     }
     let v = provider_json(resp).await?;
     // Contract, not Upstream: a 200 with no usable text is a safety filter or an empty candidate
@@ -941,7 +978,7 @@ async fn deepl_translate(
     if !resp.status().is_success() {
         let code = resp.status();
         let retry = retry_after(code, resp.headers());
-        return Err(CallError::Upstream { message: format!("deepl {code}"), retry });
+        return Err(CallError::Upstream { message: format!("deepl {code}"), retry, fatal: is_credential_refusal(code) });
     }
     let v = provider_json(resp).await?;
     let arr = v["translations"]
@@ -1464,11 +1501,11 @@ mod contract_tests {
 
     /// The harness with a deadline long enough never to be the thing under test, and no batch store
     /// — these cases are about what the model does, so nothing may be answered from a previous run.
-    async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, String> {
+    async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, TranslateError> {
         run_translation(up, cues, Duration::from_secs(600), None, &no_progress).await
     }
 
-    async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, String> {
+    async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, TranslateError> {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
         let budget = Budget {
             untranslated: AtomicUsize::new(0),
@@ -1876,7 +1913,7 @@ mod contract_tests {
         ] {
             let echo = fake(move |s: &[String]| Ok(s.iter().map(|t| format!("{t}{decorate}")).collect()));
             let err = run_translation_t(&echo, &cues(200)).await.unwrap_err();
-            assert!(err.contains("unusable"), "an echo ({name}) was accepted: {err}");
+            assert!(err.message.contains("unusable"), "an echo ({name}) was accepted: {}", err.message);
         }
         // A leading space is the same trick from the other end.
         let echo = fake(|s: &[String]| Ok(s.iter().map(|t| format!(" {t}")).collect()));
@@ -1884,7 +1921,7 @@ mod contract_tests {
 
         let blanks = fake(|s: &[String]| Ok(vec![String::new(); s.len()]));
         let err = run_translation_t(&blanks, &cues(200)).await.unwrap_err();
-        assert!(err.contains("unusable"), "a reply of empty strings was accepted: {err}");
+        assert!(err.message.contains("unusable"), "a reply of empty strings was accepted: {}", err.message);
     }
 
     /// A blank source cue has nothing to translate, so whatever the model returns for it is a line
@@ -2064,7 +2101,7 @@ mod contract_tests {
             sizes.lock().unwrap().push(src.len());
             Err(CallError::Upstream {
                 message: "provider 429: rate limited".into(),
-                retry: Some(Duration::ZERO),
+                retry: Some(Duration::ZERO), fatal: false,
             })
         });
         assert!(run_translation_t(&up, &cues(40)).await.is_err());
@@ -2088,7 +2125,7 @@ mod contract_tests {
             if *n == 1 {
                 return Err(CallError::Upstream {
                     message: "provider 429".into(),
-                    retry: Some(Duration::from_secs(2)),
+                    retry: Some(Duration::from_secs(2)), fatal: false,
                 });
             }
             Ok(src.iter().map(|s| format!("T:{s}")).collect())
@@ -2113,10 +2150,11 @@ mod contract_tests {
     #[tokio::test(start_paused = true)]
     async fn retries_are_bounded() {
         let up = fake(|_: &[String]| {
-            Err(CallError::Upstream { message: "provider 503".into(), retry: Some(Duration::ZERO) })
+            Err(CallError::Upstream { message: "provider 503".into(), retry: Some(Duration::ZERO), fatal: false })
         });
         let err = run_translation_t(&up, &cues(40)).await.expect_err("a permanent 503 must fail");
-        assert!(err.contains("503"), "the refusal should surface, not a timeout: {err}");
+        assert!(err.message.contains("503"), "the refusal should surface, not a timeout: {}", err.message);
+        assert!(!err.credential_refused, "a 503 is the moment, not the key");
         assert_eq!(*up.calls.lock().unwrap(), 3, "attempts should be capped at three");
     }
 
@@ -2127,7 +2165,7 @@ mod contract_tests {
         let up = fake(|_: &[String]| {
             Err(CallError::Upstream {
                 message: "provider 429".into(),
-                retry: Some(Duration::from_secs(3600)),
+                retry: Some(Duration::from_secs(3600)), fatal: false,
             })
         });
         let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &no_progress).await;

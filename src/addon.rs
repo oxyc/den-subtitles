@@ -935,6 +935,27 @@ fn quota_key(config: &str, now: std::time::SystemTime) -> String {
 /// Take one from today's allowance, or refuse. Charged only where a run actually BEGINS: a cache
 /// hit, a resumed batch, and the `.srt` half of the app's own two-request flow are all free, because
 /// none of them spends anything.
+/// Give a slot back, for a run that was charged and then spent nothing.
+///
+/// Only the provider refusing the credential qualifies: that answer arrives on the first call, before
+/// a token is sent. A timeout or a rate limit may well have spent plenty.
+fn refund_translation(state: &Arc<AppState>, config: &str) {
+    let key = quota_key(config, std::time::SystemTime::now());
+    let used: u64 = state.cache.get(&key).and_then(|v| v.parse().ok()).unwrap_or(0);
+    state.cache.put(key, used.saturating_sub(1).to_string(), QUOTA_TTL);
+}
+
+/// "This install's provider credential was refused." Install-, provider- and model-scoped, because
+/// that is the scope of the fact: the same key will refuse the next title identically.
+///
+/// Without it, a wrong or expired LLM key — the likeliest misconfiguration in a BYOK product, since
+/// the key rides in the install URL — cost a metered subtitle download per title browsed and would
+/// have drained the whole daily allowance, all for runs that sent no tokens at all. The
+/// title-scoped marker cannot help: it is a different key for every film.
+fn credential_refused_key(config: &str, llm: &LlmConfig) -> String {
+    format!("{SYNCFAIL}llm:{:016x}:{}:{}", short_hash(config), llm.provider.tag(), llm.model)
+}
+
 /// Is today's allowance already gone? A read, not a charge.
 ///
 /// Consulted before the source download so a refusal is free. Charging only after the download —
@@ -1038,6 +1059,12 @@ pub async fn handle_translate(
     let failed_recently = format!("{SYNCFAIL}{job_key}");
     if state.cache.get(&failed_recently).is_some() {
         return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
+    }
+    // A refused credential is about the install, not this title, so the title-scoped marker above
+    // can never catch it — every film is a fresh key. Checked here, before any network call, because
+    // the cost it prevents is a metered subtitle download per title browsed.
+    if state.cache.get_mem(&credential_refused_key(config, llm)).is_some() {
+        return httputil::text(StatusCode::BAD_GATEWAY, "the AI provider refused this key");
     }
 
     let Some(http) = state.http.as_ref() else {
@@ -1170,6 +1197,19 @@ pub async fn handle_translate(
                     // candidate and a blocking pin write, and none of that belongs on a request whose
                     // translation already exists.
                     None => {
+                        // Refuse before resolving a source, not just before downloading one.
+                        // Resolution is two live searches, a blocking disk probe per candidate — the
+                        // list is a page of fifty — and a blocking pin write, all for a request that
+                        // is about to be refused, on the one thread serving every connection. The
+                        // charge itself still happens after the download, so a source that will not
+                        // fetch continues to cost no slot.
+                        if allowance_used_up(state, config) {
+                            eprintln!("translate: {imdb} → {lang} refused, install is over its daily allowance");
+                            return httputil::text(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "translation allowance for today is used up",
+                            );
+                        }
                         let source_id = match pinned {
                             Some(id) => id,
                             None => {
@@ -1243,6 +1283,21 @@ pub async fn handle_translate(
                             return httputil::text(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "translation allowance for today is used up",
+                            );
+                        }
+                        // The provider refused the key itself. Remembered install-wide rather than
+                        // per title, because that is the scope of the fact — and no per-title
+                        // marker, since the title is innocent and will work once the key does.
+                        Err(TranslationFailure::Credential(m)) => {
+                            eprintln!("translate: provider refused this install's credential: {m}");
+                            state.cache.put_mem(
+                                credential_refused_key(config, llm),
+                                "1".into(),
+                                SYNC_RETRY_TTL,
+                            );
+                            return httputil::text(
+                                StatusCode::BAD_GATEWAY,
+                                "the AI provider refused this key",
                             );
                         }
                         Err(e) => {
@@ -1388,6 +1443,10 @@ enum TranslationFailure {
     /// The install has used up today's translations. Distinct because it is the one failure the
     /// client should see as "not now" rather than "something broke".
     Allowance,
+    /// The provider refused the credential itself. Distinct because it will happen identically for
+    /// the next title, so it earns an install-wide backoff rather than a per-title one — and because
+    /// nothing was spent to learn it, so the allowance slot is given back.
+    Credential(String),
 }
 
 /// Carry a download failure's own verdict through to the pin.
@@ -1413,7 +1472,9 @@ fn classify_download(e: opensubtitles::DownloadError) -> TranslationFailure {
 impl TranslationFailure {
     fn message(&self) -> &str {
         match self {
-            TranslationFailure::Source(m) | TranslationFailure::Model(m) => m,
+            TranslationFailure::Source(m)
+            | TranslationFailure::Model(m)
+            | TranslationFailure::Credential(m) => m,
             TranslationFailure::Allowance => "daily translation allowance used up",
         }
     }
@@ -1489,9 +1550,17 @@ async fn produce_translation(
     // that leaves `.status` insisting a dead run is still working.
     drop(reporter);
 
-    // The harness's failures are all about the model — a deadline, a refusal, output that is not a
-    // translation. None of them says anything about which file was chosen.
-    let translated = translated.map_err(TranslationFailure::Model)?;
+    // None of the harness's failures says anything about which file was chosen, so none of them
+    // touches the pin. But one of them says something about the CREDENTIAL — a key the provider
+    // refuses outright will refuse the next film identically, and the slot charged just above bought
+    // nothing, so it is given back.
+    let translated = translated.map_err(|e| match e.credential_refused {
+        true => {
+            refund_translation(state, config);
+            TranslationFailure::Credential(e.message)
+        }
+        false => TranslationFailure::Model(e.message),
+    })?;
     let body = srt::serialize(&translated);
     state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
     Ok(body)
@@ -1953,6 +2022,42 @@ mod translate_retry_tests {
         assert_ne!(quota_key(&one, now), quota_key(&one, yesterday));
         // The hash is of the config, so the secret itself never lands in a filename.
         assert!(!quota_key(&one, now).contains(&one));
+    }
+
+    /// A refused credential is a fact about the install, and has to be remembered as one.
+    ///
+    /// The title-scoped marker can never catch it — every film is a different key — so a wrong or
+    /// expired provider key, the likeliest misconfiguration in a BYOK product since the key rides in
+    /// the install URL, cost a metered subtitle download per title browsed and would have drained the
+    /// whole daily allowance on runs that sent no tokens at all.
+    #[test]
+    fn a_refused_key_is_remembered_for_the_install_not_the_title() {
+        let llm = LlmConfig {
+            provider: userconfig::Provider::OpenAI,
+            model: "gpt-4o-mini".into(),
+            api_key: "k".into(),
+        };
+        let one = credential_refused_key("install-one", &llm);
+
+        // Not scoped to a title, so the next film is short-circuited too.
+        assert!(!one.contains("tt"), "the credential marker names a title: {one}");
+        // Another install is unaffected, and so is the same install on another provider or model —
+        // switching either is the fix, and it must take effect at once.
+        assert_ne!(one, credential_refused_key("install-two", &llm));
+        let elsewhere = LlmConfig { model: "gpt-4o".into(), ..llm.clone() };
+        assert_ne!(one, credential_refused_key("install-one", &elsewhere));
+        // And it never leaks the config segment itself, which is a bearer secret.
+        assert!(!one.contains("install-one"));
+
+        // A refund gives back exactly the slot the refused run took, and cannot run the counter
+        // below zero if it is somehow called twice.
+        let state = state("refund");
+        assert!(charge_translation(&state, "install-one"));
+        refund_translation(&state, "install-one");
+        refund_translation(&state, "install-one");
+        for i in 0..DAILY_TRANSLATIONS {
+            assert!(charge_translation(&state, "install-one"), "the refund lost a slot at {i}");
+        }
     }
 
     /// A failure belongs to the install that had it. The translated BODY is the same bytes whoever
