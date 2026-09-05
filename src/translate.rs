@@ -498,12 +498,24 @@ fn is_credential_refusal(status: reqwest::StatusCode) -> bool {
 ///
 /// A 401, a 402 and a 456 say the key is wrong or empty, and the next film will go the same way — so
 /// it is worth blocking the whole install for a few minutes rather than discovering it title by
-/// title. A 400 or a 403 is ambiguous: OpenRouter answers 403 when a model's moderation trips, and
-/// this file already notes that film dialogue trips content filters routinely. Blocking the install
-/// on one of those lets a series whose dialogue upsets a filter take every other title down with it,
-/// ten minutes at a time, as the viewer works through the episodes.
-fn is_certainly_the_key(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 401 | 402 | 456)
+/// title, one metered subtitle download each.
+///
+/// A 403 is ambiguous: OpenRouter answers it when a model's moderation trips, and this file already
+/// notes that film dialogue trips content filters routinely. Blocking the install on one of those
+/// lets a series whose dialogue upsets a filter take every other title down with it, ten minutes at
+/// a time, as the viewer works through the episodes.
+///
+/// A 400 is ambiguous for everyone EXCEPT Anthropic, which reports an empty balance that way — and
+/// an empty balance is the commonest way a BYOK key dies. Treating it as ambiguous for them put the
+/// single most likely misconfiguration in the product back to costing a metered download per title
+/// browsed, which is the same quota the plain subtitle picker spends. So the question needs the
+/// provider, not just the status.
+fn is_certainly_the_key(provider: Provider, status: reqwest::StatusCode) -> bool {
+    match status.as_u16() {
+        401 | 402 | 456 => true,
+        400 => provider == Provider::Anthropic,
+        _ => false,
+    }
 }
 
 // Knowingly NOT here: a 429 carrying OpenAI's `insufficient_quota` or Google's `RESOURCE_EXHAUSTED`,
@@ -932,7 +944,7 @@ async fn call_chat_typed(
         // The status only. This string is logged, and the body is the PROVIDER's text about a
         // request that carried the user's key — OpenAI's 401 quotes a masked form of it back, and a
         // self-hosted gateway is under no obligation to mask anything.
-        return Err(CallError::Upstream { message: format!("provider {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(code) });
+        return Err(CallError::Upstream { message: format!("provider {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(llm.provider, code) });
     }
     let v = provider_json(resp).await?;
     // Contract, not Upstream: a 200 with no usable text is a safety filter or an empty candidate
@@ -1046,7 +1058,7 @@ async fn deepl_translate(
     if !resp.status().is_success() {
         let code = resp.status();
         let retry = retry_after(code, resp.headers());
-        return Err(CallError::Upstream { message: format!("deepl {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(code) });
+        return Err(CallError::Upstream { message: format!("deepl {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(Provider::DeepL, code) });
     }
     let v = provider_json(resp).await?;
     let arr = v["translations"]
@@ -1502,23 +1514,33 @@ mod contract_tests {
     fn only_the_unambiguous_statuses_block_the_whole_install() {
         use reqwest::StatusCode;
 
-        // Out of credit is the commonest way a BYOK key dies, and it is unambiguous.
+        // Out of credit is the commonest way a BYOK key dies, and these say so unambiguously
+        // whoever the provider is.
         for code in [401u16, 402, 456] {
             let s = StatusCode::from_u16(code).unwrap();
             assert!(is_credential_refusal(s), "{code} was not read as a credential refusal");
-            assert!(is_certainly_the_key(s), "{code} should block the install");
+            assert!(is_certainly_the_key(Provider::OpenAI, s), "{code} should block the install");
         }
-        // Ambiguous: the key, or this film's dialogue. Refused and refunded, but per-title.
-        for code in [400u16, 403] {
-            let s = StatusCode::from_u16(code).unwrap();
-            assert!(is_credential_refusal(s), "{code} was not read as a credential refusal");
-            assert!(!is_certainly_the_key(s), "{code} must not block the whole install");
+        // A 403 is the key or this film's dialogue — refused and refunded, but per-title.
+        let forbidden = StatusCode::from_u16(403).unwrap();
+        assert!(is_credential_refusal(forbidden));
+        assert!(!is_certainly_the_key(Provider::OpenRouter, forbidden), "a 403 blocked the install");
+
+        // A 400 depends on who said it. Anthropic reports an empty balance that way, which is the
+        // commonest failure there is and must block the install; for everyone else it is a request
+        // the model would not take, which is about this film.
+        let bad_request = StatusCode::from_u16(400).unwrap();
+        assert!(is_credential_refusal(bad_request));
+        assert!(is_certainly_the_key(Provider::Anthropic, bad_request), "Anthropic's empty balance was read as per-title");
+        for p in [Provider::OpenAI, Provider::Google, Provider::Xai, Provider::OpenRouter, Provider::DeepL] {
+            assert!(!is_certainly_the_key(p, bad_request), "{p:?} 400 blocked the whole install");
         }
+
         // And the moment, not the key: these retry and stay per-title.
         for code in [429u16, 500, 503] {
             let s = StatusCode::from_u16(code).unwrap();
             assert!(!is_credential_refusal(s), "{code} was blamed on the credential");
-            assert!(!is_certainly_the_key(s));
+            assert!(!is_certainly_the_key(Provider::Anthropic, s));
         }
     }
 
