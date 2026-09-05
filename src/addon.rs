@@ -805,18 +805,38 @@ fn translate_fail_key(
     )
 }
 
-/// Cache key for the translated TEXT of one source subtitle.
+/// Cache key for one title's translated text.
 ///
-/// Keyed by the SOURCE FILE, not by the title. The translated text depends only on what was
-/// translated, so every encode of a film that resolves to the same source shares one translation —
-/// and one LLM bill, the only cost here charged to the viewer's own provider account. The timing
-/// differences between encodes are not this key's business: the aligned variants hang off it through
-/// `sync_cache_key`, exactly as they do off `os:{file_id}`.
+/// Keyed by the TITLE, not by the source file it was translated from — and that is a correction of
+/// the obvious design, so it is worth saying why.
+///
+/// Source-keying was there to stop two encodes of one film resolving to two sources and buying the
+/// dialogue twice. The source pin already guarantees that: one title translates from one file, and
+/// every encode and every language follows the pin. So source-keying bought nothing the pin was not
+/// already providing, and it cost something serious — the pin is the ONLY pointer to that source id,
+/// so if it ever moved, every language already paid for became unreachable. A source dying while
+/// adding a second language re-bought the first one at full price, from a cache that still held it.
+///
+/// With the title as the key, a re-pick changes which file a future untranslated language reads from
+/// and nothing else. Paid bodies stay reachable, whatever happens to the pin.
 ///
 /// Keyed by provider+model too: stepping up to a bigger model to re-translate a title that read badly
-/// is meant to overwrite, and it can only do that if the model is part of the identity.
-fn translate_body_key(source_file_id: i64, lang_key: &str, llm: &LlmConfig) -> String {
-    format!("translate:{source_file_id}:{lang_key}:{}:{}", llm.provider.tag(), llm.model)
+/// is meant to overwrite, and it can only do that if the model is part of the identity. NOT keyed by
+/// install: these are the same bytes whoever asked for them, and sharing them is deliberate.
+fn translate_body_key(
+    imdb: &str,
+    season: Option<i64>,
+    episode: Option<i64>,
+    lang_key: &str,
+    llm: &LlmConfig,
+) -> String {
+    format!(
+        "translate:{imdb}:{}:{}:{lang_key}:{}:{}",
+        season.unwrap_or(0),
+        episode.unwrap_or(0),
+        llm.provider.tag(),
+        llm.model,
+    )
 }
 
 /// The subtitle to translate FROM: English for preference, best-quality otherwise.
@@ -972,10 +992,12 @@ pub async fn handle_translate(
     //
     // `translation_source` reads download counts, ratings and the trusted flag, and all three drift —
     // one new trusted upload is +400 and flips the pick outright — while the search behind it is only
-    // cached for six hours. Re-picking the next day lands on a different file, which is a different
-    // `translate_body_key`: a second full-price translation of dialogue already bought, with the
-    // first orphaned under a key nothing will ask for again. And because the pin is per title, not
-    // per language, that re-pick re-buys EVERY language of the film, not just the one being asked for.
+    // cached for six hours. The pin keeps every language of a film reading from one file, which is
+    // one download rather than one per language, and keeps the choice stable rather than following
+    // whatever the list looked like that afternoon.
+    //
+    // It is no longer load-bearing for the LLM bill: the body is keyed by title, so losing the pin
+    // costs a re-pick and a download, never a re-translation.
     //
     // Read before any search, and that ordering is the point: from the second request onward there is
     // nothing to choose, so there is nothing to ask OpenSubtitles. It saves a live search per title
@@ -1014,7 +1036,7 @@ pub async fn handle_translate(
             source.file_id
         }
     };
-    let body_key = translate_body_key(source_id, &lang_key, llm);
+    let body_key = translate_body_key(&imdb, season, episode, &lang_key, llm);
 
     // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
     // either there is no anchor to find, and the answer would be the list we already have.
@@ -1140,14 +1162,12 @@ pub async fn handle_translate(
                     }
                     None => match produce_translation(state, &client, llm, source_id, &lang, &body_key, &job_key).await {
                         Ok(body) => {
-                            // Refresh the pin on the path that actually produced a translation. It is
-                            // written once when the choice is made and never on a plain request, so
-                            // without this its lifetime and its mtime both stay frozen at the first
-                            // translation — and then it expires, or the disk sweep's oldest-first
-                            // eviction takes it, while the body it points at is still valid. Losing
-                            // the pointer and keeping the body is the expensive direction: the next
-                            // request re-picks, gets a different body key, and re-buys a film that is
-                            // sitting in the cache. One blocking write per real translation, not per
+                            // Refresh the pin on the path that actually produced a translation, so
+                            // its lifetime and mtime do not stay frozen at the first one. Losing it
+                            // is no longer expensive — the body is keyed by title, so a re-pick
+                            // cannot orphan anything paid for — but a stable pin still keeps every
+                            // language of a film reading from one source, which is one download
+                            // rather than several. One blocking write per real translation, not per
                             // request, which is what the per-request version cost.
                             state.cache.put(pin_key.clone(), source_id.to_string(), SOURCE_PIN_TTL);
                             body
@@ -1479,7 +1499,7 @@ mod tests {
             model: "gpt-4o-mini".into(),
             api_key: "k".into(),
         };
-        let base = translate_body_key(42, "SV", &llm);
+        let base = translate_body_key("tt0111161", None, None, "SV", &llm);
         let raw = sync_cache_key(&base, &None, None);
         let aligned = sync_cache_key(&base, &None, Some(9));
         let resynced = sync_cache_key(&base, &Some("http://host/s.mkv".into()), None);
@@ -1493,17 +1513,19 @@ mod tests {
         }
 
         // Two encodes of one film: the same translated text, two different anchors. One LLM bill and
-        // two cheap alignments — which is the whole reason the text key names a source file rather
-        // than a title.
+        // two cheap alignments hanging off it.
         let encode_a = sync_cache_key(&base, &None, Some(11));
         let encode_b = sync_cache_key(&base, &None, Some(22));
         assert_ne!(encode_a, encode_b);
         assert!(encode_a.starts_with(&base) && encode_b.starts_with(&base));
 
-        // A different source, or a different model, is a different translation.
-        assert_ne!(translate_body_key(43, "SV", &llm), base);
+        // A different title, or a different model, is a different translation. A different SOURCE is
+        // not — the pin decides which file a title reads from, and a body already paid for must stay
+        // reachable when that decision changes, or one language's dead source re-buys the others.
+        assert_ne!(translate_body_key("tt0068646", None, None, "SV", &llm), base);
+        assert_ne!(translate_body_key("tt0111161", Some(1), Some(2), "SV", &llm), base);
         let bigger = LlmConfig { model: "gpt-4o".into(), ..llm.clone() };
-        assert_ne!(translate_body_key(42, "SV", &bigger), base);
+        assert_ne!(translate_body_key("tt0111161", None, None, "SV", &bigger), base);
     }
 
     /// A subtitle is never its own reference. `tier1_ref_for` refuses that when it builds a URL, but
@@ -1781,7 +1803,7 @@ mod translate_retry_tests {
         // film's text actually lives under.
         let body_key = |lang: &str| {
             let decoded = httputil::percent_decode_path(lang);
-            translate_body_key(77, &translate::canonical_lang(&decoded), &llm)
+            translate_body_key("tt0111161", None, None, &translate::canonical_lang(&decoded), &llm)
         };
         assert_eq!(body_key("sv"), body_key("Swedish"));
         assert_ne!(body_key("Swedish"), body_key("Finnish"));
@@ -1844,8 +1866,16 @@ mod translate_retry_tests {
         assert_ne!(key("install-one"), key("install-two"), "two installs shared a failure marker");
         assert_eq!(key("install-one"), key("install-one"), "the key is not stable for one install");
 
+        // A paid body must survive the source choice changing, and it does so structurally: the key
+        // is built from the title and names no file id at all. The pin is the only pointer to a
+        // source, so while the key named one, a source dying as a SECOND language was added
+        // re-bought the FIRST at full price out of a cache that still held it.
+        let body_of = translate_body_key("tt0111161", None, None, "SV", &llm);
+        assert!(body_of.contains("tt0111161"), "the body key does not identify the title: {body_of}");
+        assert_eq!(body_of.matches(':').count(), 6, "unexpected key shape: {body_of}");
+
         // The body key, by contrast, carries no install at all — that sharing is the point of it.
-        let body = translate_body_key(77, "SV", &llm);
+        let body = translate_body_key("tt0111161", None, None, "SV", &llm);
         assert!(!body.contains("install-one"));
         // And neither key may leak the config segment itself: it is a bearer secret, and these
         // become filenames.
