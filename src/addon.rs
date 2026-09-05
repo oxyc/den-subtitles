@@ -140,6 +140,22 @@ fn search_hash(extra: &str) -> Option<String> {
     extra_field(extra, "videoHash").filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The client's filename, bounded. A real release name is well under this; the bound is here because
+/// of where the value GOES, which is `rank`'s sort comparator.
+///
+/// `rank` calls `fit_score` twice per comparison and each call re-tokenizes the filename, so the
+/// work is (comparisons × filename length), and the comparison count is set by a 50-result page.
+/// Nothing else on this path bounded it — `videoHash`, the imdb id and the language all are, for the
+/// weaker reason that they become filenames — so a long enough `filename=` turned one cached search
+/// into seconds of tokenizing on the single runtime thread, per request, for every request after the
+/// first, including a 304 revalidation. That is the shape of defect this tree already fixed once in
+/// the VTT escaper, arriving through the one field that had no length of its own.
+fn search_filename(extra: &str) -> Option<String> {
+    /// Longer than any real release name, and short enough that the tokenizing above is noise.
+    const MAX_FILENAME: usize = 300;
+    extra_field(extra, "filename").filter(|f| f.len() <= MAX_FILENAME)
+}
+
 /// Pull a `key=value` field out of the Stremio extra-args blob (already `.json`-stripped). The
 /// client sends `videoHash`, `videoSize`, and `filename` here.
 fn extra_field(extra: &str, key: &str) -> Option<String> {
@@ -184,7 +200,7 @@ pub async fn handle_subtitles(
     // that becomes a filename — an over-long one fails the disk write and burns the process's
     // one-shot "persistence degraded" warning on a request that was never valid.
     let hash = search_hash(extra);
-    let filename = extra_field(extra, "filename");
+    let filename = search_filename(extra);
     let client = os_client(state, http, &cfg);
     let mut subs = match cached_search(state, &client, config, &imdb, season, episode, hash.as_deref()).await {
         Ok(s) => s,
@@ -485,9 +501,24 @@ async fn sync_and_cache(
     // A sync that just failed is not retried on every request — the binary spawn, or a 90s alass
     // timeout, would be paid again per request. The marker is separate from `cache_key` so that key
     // never holds anything but a settled answer.
+    //
+    // TWO markers, because there are two kinds of failure here and they have different scopes. A
+    // subprocess that failed or timed out is a fact about the work: the same alignment will fail for
+    // everyone, so that is remembered globally and one install's attempt spares the rest. A
+    // reference download refused as `Unavailable` is a fact about ONE credential — an exhausted
+    // daily quota, a revoked key, that install's own rate limit — and remembering it globally let
+    // an install that had run out of downloads serve every other install the unaligned body for ten
+    // minutes, re-armed each time it polled. `subtitle_srt` already files that failure under
+    // `unavailable_file_key`, keyed by the credential; this is the same fact one level up, and it
+    // is keyed the same way for the same reason: two installs sharing an OpenSubtitles key really
+    // do share the quota.
     let wanted_sync = resync_url.is_some() || ref_id.is_some();
-    let retry_marker = format!("{SYNCFAIL}{cache_key}");
-    if wanted_sync && state.cache.get(&retry_marker).is_some() {
+    let shared_marker = format!("{SYNCFAIL}{cache_key}");
+    let mine_marker = format!("{SYNCFAIL}{:016x}:{cache_key}", short_hash(client.api_key));
+    let backed_off = || {
+        state.cache.get(&shared_marker).is_some() || state.cache.get(&mine_marker).is_some()
+    };
+    if wanted_sync && backed_off() {
         return httputil::srt_provisional(target);
     }
 
@@ -502,7 +533,7 @@ async fn sync_and_cache(
         }
         // And it may have failed while we waited, in which case re-running it now is the retry the
         // marker exists to prevent.
-        if state.cache.get(&retry_marker).is_some() {
+        if backed_off() {
             return httputil::srt_provisional(target);
         }
         Some(guard)
@@ -518,6 +549,9 @@ async fn sync_and_cache(
     // subprocesses on a one-thread runtime. Acquired inside these branches rather than above the
     // dispatch: the semaphore is FIFO with two permits, so taking it on the no-sync path made a
     // plain cache-miss fetch queue behind every pending alignment for work it was never going to do.
+    // `mine_only` says the failure belongs to this credential rather than to the work — see the two
+    // markers above. Only the reference download can set it.
+    let mut mine_only = false;
     let synced: Option<String> = if let Some(url) = resync_url {
         let _slot = state.sync_slots.acquire().await;
         // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
@@ -547,6 +581,9 @@ async fn sync_and_cache(
                 }
             }
             Err(e) => {
+                // `Unavailable` is this credential's own trouble — quota gone, key revoked, its own
+                // rate limit. `Gone` and `Suspect` are about the file, so they stay shared.
+                mine_only = matches!(e, opensubtitles::DownloadError::Unavailable(_));
                 eprintln!("sync: reference {r} for {what} unavailable: {}", e.message());
                 None
             }
@@ -571,7 +608,11 @@ async fn sync_and_cache(
         // re-spawn for a moment" marker is remembered; the unaligned body is already cached under
         // its own base key.
         None if wanted_sync => {
-            state.cache.put(retry_marker, "1".into(), SYNC_RETRY_TTL);
+            let marker = match mine_only {
+                true => mine_marker,
+                false => shared_marker,
+            };
+            state.cache.put(marker, "1".into(), SYNC_RETRY_TTL);
             httputil::srt_provisional(target)
         }
         // No sync was asked for, so the body we have is the answer, and it is already cached —
@@ -2187,6 +2228,42 @@ mod sync_fallback_tests {
             Some("Movie.2013.2160p.HDR10+.WEB-DL.mkv")
         );
     }
+
+    /// The filename is bounded because of where it goes, not because it becomes a filename like the
+    /// other extras. `rank` re-tokenizes it twice per comparison over a 50-result page, so its
+    /// length multiplies into the sort — it was the one client value on this path with no bound, and
+    /// a long enough one spent seconds of the single runtime thread per request, on a cached search,
+    /// including on a 304 revalidation.
+    #[test]
+    fn the_filename_the_ranker_sees_is_bounded() {
+        // A real release name, however baroque, survives intact — the bound must not change ranking.
+        let real = "Movie.Title.2013.2160p.UHD.BluRay.REMUX.HDR10+.DV.HEVC.DTS-HD.MA.7.1-GROUP.mkv";
+        assert_eq!(search_filename(&format!("filename={real}")).as_deref(), Some(real));
+
+        // And an absurd one reaches the ranker as nothing rather than as work. Asserted through
+        // `rank` itself, since the bound exists for the ranker and a check on the extractor alone
+        // would keep passing if the call site went back to `extra_field`.
+        let absurd = "a.".repeat(100_000);
+        let seen = search_filename(&format!("filename={absurd}"));
+        assert_eq!(seen, None);
+        let mut subs = vec![
+            opensubtitles::Subtitle {
+                file_id: 2,
+                lang: "en".into(),
+                hash_match: false,
+                downloads: 0,
+                release: String::new(),
+                hd: false,
+                fps: 0.0,
+                from_trusted: false,
+                machine_translated: false,
+                ai_translated: false,
+                ratings: 0.0,
+            },
+        ];
+        opensubtitles::rank(&mut subs, seen.as_deref());
+        assert_eq!(subs.len(), 1, "ranking dropped a candidate");
+    }
 }
 
 #[cfg(test)]
@@ -2652,6 +2729,22 @@ mod translate_retry_tests {
         );
         // And the file-scoped ones are shared, because they are facts about the file.
         assert!(matches!(remembered_failure(&state, &other, 5), Some(DownloadError::Gone(_))));
+
+        // The SYNC retry marker has to make the same split one level up, and did not. A failed
+        // alignment is a fact about the work and is shared, so one install's attempt spares the
+        // rest — but a reference download refused for quota is this credential's own trouble, and
+        // remembering it globally served every other install the unaligned body for ten minutes,
+        // re-armed each time the exhausted install polled. That is the mis-timed track the ladder
+        // exists to fix, handed to installs that had done nothing.
+        let key = sync_cache_key(&os_base_key(42), &None, Some(43));
+        let shared = format!("{SYNCFAIL}{key}");
+        let mine = format!("{SYNCFAIL}{:016x}:{key}", short_hash(client.api_key));
+        let theirs = format!("{SYNCFAIL}{:016x}:{key}", short_hash(other.api_key));
+        assert_ne!(shared, mine, "the per-credential marker collided with the shared one");
+        assert_ne!(mine, theirs, "two credentials shared a backoff");
+        // And neither may be mistaken for the key that holds the settled alignment.
+        assert_ne!(shared, key);
+        assert_ne!(mine, key);
     }
 
     /// The pin is what keeps a drifting source pick from spending a metered credit each time it
