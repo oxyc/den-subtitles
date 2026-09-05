@@ -53,10 +53,14 @@ const SEARCH_FAIL_TTL: Duration = Duration::from_secs(30);
 /// that a dead track in a picker list stops costing a download credit per playback, short enough
 /// that an upload restored tomorrow is picked up.
 const DEAD_FILE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
-/// Lifetime of a pinned translation source. Deliberately longer than `CACHE_TTL`, so the translation
-/// it protects always expires FIRST: losing the pin while the body survives means a re-pick, a
-/// different body key, and paying for a film that is still sitting in the cache. Once the body is
-/// gone the pin costs nothing to have kept — it is fifty bytes.
+/// Lifetime of a pinned translation source. Long because the pin is what keeps every language of one
+/// film reading from ONE source file: that is a single metered download for the title rather than one
+/// per language, and it is the whole job now.
+///
+/// It used to be the bill that was at stake — the body key named the source, so a re-pick produced a
+/// different key and re-bought a film that was still in the cache. That is no longer true, and the
+/// value did not change: `translate_body_key` names the title, so a lost pin costs a download and
+/// nothing more. Kept long anyway; the pin is fifty bytes and the download is metered.
 const SOURCE_PIN_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 180);
 
 /// Monotonic counter making sync scratch-file names unique per invocation.
@@ -856,11 +860,12 @@ fn sync_cache_key(base: &str, resync_url: &Option<String>, ref_id: Option<i64>) 
 /// network call. That is the whole point of it — a whole film's LLM bill must not be re-paid on the
 /// app's next tap, and the app's own `.json`-then-`.srt` flow retries once by design.
 ///
-/// Deliberately NOT the key the translated body lives under (`translate_body_key`): that one names a
-/// source file, which is only knowable after a search, and a marker that can only be consulted after
-/// a search cannot do this job. Built here rather than inline so the handler and the tests cannot
-/// drift apart on it — the same reason `sync_cache_key` exists, and `lang` in particular is
-/// canonicalized rather than taken verbatim (see `translate::canonical_lang`).
+/// Deliberately NOT the key the translated body lives under (`translate_body_key`), for the scoping
+/// reason below rather than a structural one: both are answerable from the request alone now that the
+/// body is keyed by title, so either could be consulted this early — but they must not be the same
+/// key, because one is shared and the other cannot be. Built here rather than inline so the handler
+/// and the tests cannot drift apart on it — the same reason `sync_cache_key` exists, and `lang` in
+/// particular is canonicalized rather than taken verbatim (see `translate::canonical_lang`).
 ///
 /// Scoped to the INSTALL, unlike the body key. A translated body is the same bytes whoever asked for
 /// it and is deliberately shared; a failure is not. One install with a dead provider key would
