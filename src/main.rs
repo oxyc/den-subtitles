@@ -225,7 +225,15 @@ async fn run(cfg: Config) -> std::io::Result<()> {
             tick.tick().await; // fires immediately; the boot sweep already ran
             loop {
                 tick.tick().await;
-                state.cache.sweep();
+                // Off the runtime thread. The sweep stats every file in the store and header-reads
+                // most of them — thousands of blocking opens at the default budget — and this
+                // runtime has ONE thread, which is also the one serving every connection. Fast on a
+                // local SSD; on a container bind-mount at a millisecond an open it is seconds of
+                // total stall, every hour.
+                let cache = state.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || cache.cache.sweep()).await {
+                    eprintln!("cache sweep did not run: {e}");
+                }
             }
         });
     }
