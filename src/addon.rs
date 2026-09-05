@@ -416,6 +416,34 @@ pub async fn handle_subtitle_file(
     sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &what, true).await
 }
 
+/// A cache key turned into one safe filename component, plus a per-invocation sequence number.
+///
+/// Two concurrent requests for the same file must not share scratch paths — one would read the
+/// other's half-written output and cache it for sixty days — which is what the sequence number is
+/// for. The rest is making a filename out of something that was never one.
+///
+/// Every byte that is not `[A-Za-z0-9]` becomes `-`, rather than the `:` this replaced. `:` was the
+/// separator the keys are built from, so it looked like the whole story, and it is not: an
+/// OpenRouter model id is `openai/gpt-4o-mini`, and `translate_body_key` interpolates it verbatim.
+/// The slash landed in the middle of `{tag}-target.srt`, `write_temp` creates only `work_dir` and
+/// not the parent of the file, and every alignment for the install failed ENOENT — silently, since
+/// a failed alignment is a `syncfail:` marker and a provisional body. That is Tier 1 and Tier 2
+/// dead for one of the six providers, on its DEFAULT model, while the viewer still paid the whole
+/// LLM bill for a translation served with the source's uncorrected timings.
+///
+/// The bound is the other half, and it is why this counts bytes rather than chars: the result is
+/// `{tag}-reference.srt` in one directory, a translate key already runs to ~255 bytes with a long
+/// model name, and past NAME_MAX the write fails exactly the same silent way. Mapping to ASCII
+/// first makes the two agree — a multibyte model name counted 80 chars and wrote up to 320 bytes.
+fn scratch_tag(cache_key: &str, seq: u64) -> String {
+    let safe: String = cache_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(80)
+        .collect();
+    format!("{safe}-{seq}")
+}
+
 /// Run the sync ladder over an SRT we already hold, and apply the caching rules that go with it.
 ///
 /// Shared by the two things that produce a servable subtitle: the OpenSubtitles proxy and the
@@ -464,17 +492,7 @@ async fn sync_and_cache(
         None
     };
 
-    // Per-invocation unique temp tag: two concurrent requests for the same file must not share
-    // scratch paths (one would read the other's half-written output and cache it for 60 days).
-    // Bounded, for the reason `Cache::disk_path` is: this becomes `{tag}-reference.srt` in the work
-    // dir, and a translate cache key already runs to ~255 bytes with a long model name and language.
-    // Past NAME_MAX the temp write fails, so the alignment fails, so the key earns a `syncfail:`
-    // marker — a long model name silently disabling Tier-1 for that install.
-    let tag = format!(
-        "{}-{}",
-        cache_key.replace(':', "-").chars().take(80).collect::<String>(),
-        SYNC_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let tag = scratch_tag(&cache_key, SYNC_SEQ.fetch_add(1, Ordering::Relaxed));
     // A permit, held only around work that actually spawns a binary.
     //
     // The single-flight guard above collapses two requests for the SAME alignment; twenty different
@@ -2413,6 +2431,46 @@ mod translate_retry_tests {
             series_refused_key("install-one", &llm, "tt1234567"),
             credential_refused_key("install-one", &llm)
         );
+    }
+
+    /// A scratch tag has to be a FILENAME, and a cache key is not one. The ladder's temp writer
+    /// creates `work_dir` and nothing below it, so a single separator anywhere in the key put the
+    /// file in a directory that does not exist and every alignment failed ENOENT — as a `syncfail:`
+    /// marker and a provisional body, which is to say silently.
+    #[test]
+    fn a_scratch_tag_is_a_single_filename_component() {
+        // The real default model of a real provider, not a hand-written string: this was live for
+        // every OpenRouter install, and asserting a literal would not have noticed.
+        let model = userconfig::Provider::OpenRouter.default_model();
+        assert!(model.contains('/'), "the case this guards is gone; find what replaced it");
+        let key = translate_body_key("tt0111161", None, None, "SV", &LlmConfig {
+            provider: userconfig::Provider::OpenRouter,
+            model: model.into(),
+            api_key: "k".into(),
+        });
+        let tag = scratch_tag(&key, 0);
+        assert!(!tag.contains('/'), "the tag names a subdirectory: {tag}");
+        assert_eq!(std::path::Path::new(&tag).components().count(), 1, "{tag}");
+
+        // Nothing else can escape either — a `lang` arrives percent-decoded, so it can carry any
+        // byte the length bound allows.
+        for hostile in ["..", "../../etc/passwd", "a\\b", "a\0b", "a.b", "sv-SE"] {
+            let tag = scratch_tag(hostile, 1);
+            assert!(
+                tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "{hostile:?} survived as {tag:?}"
+            );
+            assert_eq!(std::path::Path::new(&tag).components().count(), 1, "{tag}");
+        }
+
+        // Bounded in BYTES, which is what NAME_MAX counts. Mapping to ASCII first is what makes the
+        // char-wise take agree with it; a multibyte model name wrote up to four times the bound.
+        let wide = format!("translate:tt1:0:0:SV:openai:{}", "é".repeat(200));
+        assert!(scratch_tag(&wide, 999).len() <= 96, "{}", scratch_tag(&wide, 999).len());
+
+        // And it is still unique per invocation, which is what stops one alignment reading another's
+        // half-written scratch file and caching it for sixty days.
+        assert_ne!(scratch_tag(&key, 0), scratch_tag(&key, 1));
     }
 
     /// A failure belongs to the install that had it. The translated BODY is the same bytes whoever
