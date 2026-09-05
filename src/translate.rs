@@ -199,22 +199,68 @@ fn dead_count(translated: &[String], sources: &[String]) -> usize {
         .count()
 }
 
+/// What a run has cost so far, in the two different senses its two readers need.
+///
+/// They are different questions and the difference is the whole point of the type.
+///
+/// `billed` answers "was the viewer charged?", and only an ANSWERED call proves that — a 401 or an
+/// empty balance costs nothing, which is what makes the dead-key refund honest. That is the question
+/// a finished run asks, because a finished run has seen every answer.
+///
+/// `dispatched` answers "did we put a request on the wire we can no longer account for?", and it is
+/// set BEFORE the await. That is the question a CANCELLED run has to ask, because it never sees the
+/// answer: a request in flight when the client hangs up may be billed in full, and we will never
+/// learn either way. Asking `billed` there reads as "nothing was spent" for every cancellation
+/// before the first response — and a real call can take up to `LLM_TIMEOUT`, so hanging up inside
+/// 100ms wins that race every time. The allowance slot came back on each attempt while every attempt
+/// still sent a glossary call carrying the film's dialogue, so the daily ceiling never moved.
+#[derive(Default)]
+pub struct Spend {
+    dispatched: AtomicBool,
+    billed: AtomicBool,
+}
+
+impl Spend {
+    /// A request is about to go on the wire. Called before the await, deliberately.
+    fn dispatch(&self) {
+        self.dispatched.store(true, Ordering::Relaxed);
+    }
+
+    /// A request came back, so the viewer was charged for it whatever we think of the contents.
+    fn bill(&self) {
+        self.billed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the viewer was charged. The question a finished run asks.
+    pub fn was_billed(&self) -> bool {
+        self.billed.load(Ordering::Relaxed)
+    }
+
+    /// Whether anything at all was sent. The question a cancelled run asks.
+    pub fn was_dispatched(&self) -> bool {
+        self.dispatched.load(Ordering::Relaxed)
+    }
+
+    /// Stand in for a request that has gone out and not come back — the state a cancelled run is
+    /// caught in, which no fake upstream can produce, since a fake always answers.
+    #[cfg(test)]
+    pub fn dispatch_for_test(&self) {
+        self.dispatch();
+    }
+}
+
 /// Translate every cue's text into `target_lang` (a display name like "English"), preserving each
 /// cue's index/timing. Returns the same cues with translated `text`, or an error string.
-/// `billed` is the caller's copy of the one measurement it cannot get from the return value: whether
-/// this run has had a provider call answered. It is written as the run goes, so it is still readable
-/// after the future is DROPPED — which is the case it exists for. A client that hangs up mid-run
-/// returns no `Err`, so the caller's error handling never runs, and the allowance slot it charged was
-/// neither refunded nor spent on anything the retry can use. Reading this on drop lets the caller
-/// apply the same rule it applies to a failure — give the slot back only if nothing was paid for —
-/// instead of guessing in one direction or the other.
+/// `spend` is the caller's, written as the run goes so it survives this future being DROPPED. That
+/// is the case it exists for: a client that hangs up mid-run returns no `Err`, so the caller's error
+/// handling never runs on a slot it has already charged.
 pub async fn translate(
     client: &reqwest::Client,
     llm: &LlmConfig,
     cues: &[Cue],
     target_lang: &str,
     store: &dyn BatchStore,
-    billed: &AtomicBool,
+    spend: &Spend,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<Cue>, TranslateError> {
     if cues.is_empty() {
@@ -232,7 +278,7 @@ pub async fn translate(
         cues,
         RUN_DEADLINE,
         Some(&resume),
-        billed,
+        spend,
         progress,
     )
     .await
@@ -245,7 +291,7 @@ async fn run_translation(
     cues: &[Cue],
     deadline: Duration,
     resume: Option<&Resume<'_>>,
-    billed: &AtomicBool,
+    spend: &Spend,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<Cue>, TranslateError> {
     // Rolling context: the tail of already-translated pairs, refreshed as batches land. Shared
@@ -256,10 +302,10 @@ async fn run_translation(
     // A wrong-length reply degrades to keeping the source text, which is right for one stray cue and
     // wrong for a film: a consistently misbehaving model hits that leaf for every cue and returns the
     // untranslated original, which then caches for 60 days as a successful translation.
-    // `billed` is the caller's, not ours, so it survives this future being dropped mid-run — see
+    // `spend` is the caller's, not ours, so it survives this future being dropped mid-run — see
     // `translate`. Everything else here dies with the run and is owned.
     let budget = Budget {
-        billed,
+        spend,
         untranslated: AtomicUsize::new(0),
         started: tokio::time::Instant::now(),
         deadline,
@@ -282,13 +328,15 @@ async fn run_translation(
         (Some(r), Some(k)) => match r.store.get(&k).and_then(|s| serde_json::from_str(&s).ok()) {
             Some(hit) => hit,
             None => {
-                // Billed where the CALL WAS ANSWERED, which is what `Some` means, and neither of the
-                // two things this has been asks that. "A call was made" charges the dead key for a
-                // refusal it was never billed for and loses its refund; "the result is non-empty"
-                // treats a 200 whose JSON will not parse as free, and that one is paid for in full.
-                let built = upstream.glossary(&sample).await;
+                // Billed where the call was ANSWERED, which is what `Some` means: "a call was made"
+                // would charge a dead key for a refusal it was never billed for and lose its
+                // refund, and "the result is non-empty" treats a 200 whose JSON will not parse as
+                // free, when that one is paid for in full. DISPATCH is marked inside the impl,
+                // which is the only place that knows whether a request actually goes out — several
+                // of them answer without calling anything.
+                let built = upstream.glossary(&sample, budget.spend).await;
                 if built.is_some() {
-                    budget.billed.store(true, Ordering::Relaxed);
+                    budget.spend.bill();
                 }
                 let built = built.unwrap_or_default();
                 // Only a glossary that exists is worth remembering. "No glossary" is also what a
@@ -304,9 +352,9 @@ async fn run_translation(
             }
         },
         _ => {
-            let built = upstream.glossary(&sample).await;
+            let built = upstream.glossary(&sample, budget.spend).await;
             if built.is_some() {
-                budget.billed.store(true, Ordering::Relaxed);
+                budget.spend.bill();
             }
             built.unwrap_or_default()
         }
@@ -370,7 +418,7 @@ async fn run_translation(
     // `!spent` for every failure kind, so a wrong answer here is a slot given back for a film that
     // was paid for.
     outcome.map_err(|mut e| {
-        e.spent = budget.billed.load(Ordering::Relaxed);
+        e.spent = budget.spend.was_billed();
         e
     })
 }
@@ -456,16 +504,16 @@ fn unusable(kept: usize, seen: usize) -> bool {
 /// sized below it, it becomes a stricter quality gate than the quality gate. Time is the bound that
 /// is actually reachable, so time is the bound that is kept.
 struct Budget<'b> {
-    /// Has any call come back — i.e. has the viewer's key actually been billed?
+    /// What this run has sent and been charged for — see `Spend` for why those are two questions.
     ///
-    /// Not inferable from the assembled output: batches run CONCURRENCY-wide and surface in order, so
-    /// a refusal on the first one leaves the output empty while three others were sent and paid for.
-    /// The glossary is billed before any batch and never appears there at all.
+    /// Neither is inferable from the assembled output: batches run CONCURRENCY-wide and surface in
+    /// order, so a refusal on the first leaves the output empty while three others were sent and
+    /// paid for, and the glossary is billed before any batch and never appears there at all.
     ///
-    /// BORROWED from the caller rather than owned here, so the answer outlives the run. A cancelled
+    /// BORROWED from the caller rather than owned here, so the answers outlive the run. A cancelled
     /// request drops this whole future without producing an `Err`, and the caller still has an
-    /// allowance slot charged that it must decide about — see `translate`.
-    billed: &'b AtomicBool,
+    /// allowance slot charged that it must decide about.
+    spend: &'b Spend,
     untranslated: AtomicUsize,
     /// Tokio's clock rather than `std`'s. Unpaused the two are the same thing, but the deadline is
     /// now the only bound on a run that concurrency made faster than the wall clock it was tuned
@@ -642,9 +690,16 @@ trait BatchCall: Sync {
     ///
     /// Best-effort by construction. The default is no glossary at all, which is what a provider with
     /// no chat path uses and what keeps this out of the way of the contract tests.
+    ///
+    /// `spend.dispatch()` is the implementation's job, not the caller's, because only the
+    /// implementation knows whether a request actually leaves: this default answers `None` without
+    /// calling anything, and so does the real one for DeepL or an empty sample. Marked at the call
+    /// site instead, a resumed run whose glossary came from the store reported having sent a request
+    /// it never sent, and would have lost its refund for it.
     fn glossary<'a>(
         &'a self,
         _sample: &'a [String],
+        _spend: &'a Spend,
     ) -> GlossaryFuture<'a> {
         Box::pin(async { None })
     }
@@ -737,9 +792,12 @@ impl BatchCall for Upstream<'_> {
     fn glossary<'a>(
         &'a self,
         sample: &'a [String],
+        spend: &'a Spend,
     ) -> GlossaryFuture<'a> {
         Box::pin(async move {
             // DeepL has no chat path and ignores context entirely, so there is nothing to give it.
+            // Both of these return without sending anything, which is why dispatch is marked below
+            // rather than on the way in.
             if self.llm.provider == Provider::DeepL || sample.is_empty() {
                 return None;
             }
@@ -757,6 +815,9 @@ impl BatchCall for Upstream<'_> {
                 Ok(json) => json,
                 Err(_) => return None,
             };
+            // Past every early return, so a request is now genuinely going out. Marked before the
+            // await: if the client hangs up during it, this call is charged for and we never learn.
+            spend.dispatch();
             match call_chat_typed(self.client, self.llm, &system, &user).await {
                 // Accepted, so billed — even when `parse_glossary` keeps nothing out of it.
                 Ok(text) => Some(parse_glossary(&text)),
@@ -822,6 +883,9 @@ async fn translate_batch(
     if budget.spent() {
         return Err("translation ran out of time".to_string().into());
     }
+    // Sent, whatever comes of it. Recorded before the await because a client that hangs up now takes
+    // the answer with it, and a request already on the wire is charged for regardless.
+    budget.spend.dispatch();
     let result = call_with_retries(upstream, sources, context, budget).await;
     // A call that came back is a call that was billed, whatever we go on to think of its contents —
     // and `Contract` is exactly that: a 200 the provider charged for, whose body then turned out to
@@ -833,7 +897,7 @@ async fn translate_batch(
     // stays unbilled: a refusal is charged for nothing, and so is a transport failure, which arrives
     // here as one.
     if matches!(result, Ok(_) | Err(CallError::Contract(_))) {
-        budget.billed.store(true, Ordering::Relaxed);
+        budget.spend.bill();
     }
 
     match result {
@@ -1517,8 +1581,12 @@ mod contract_tests {
             fn glossary<'a>(
                 &'a self,
                 _sample: &'a [String],
+                spend: &'a Spend,
             ) -> GlossaryFuture<'a> {
-                Box::pin(async { Some(vec![("Westeros".to_string(), "Västeros".to_string())]) })
+                Box::pin(async move {
+                    spend.dispatch();
+                    Some(vec![("Westeros".to_string(), "Västeros".to_string())])
+                })
             }
         }
 
@@ -1784,14 +1852,14 @@ mod contract_tests {
             }
             Ok(src.iter().map(|s| format!("SV {s}")).collect())
         });
-        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume), &AtomicBool::new(false), &no_progress).await;
+        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume), &Spend::default(), &no_progress).await;
         assert!(first.is_err(), "the run should have failed on the third batch");
         assert_eq!(*up.calls.lock().unwrap(), 3, "two good batches and the refusal");
         assert_eq!(store.len(), 2, "the two paid batches should have been remembered");
 
         // Second attempt, provider healthy. Only the batch that failed may reach it.
         let up2 = fake(|src: &[String]| Ok(src.iter().map(|s| format!("SV {s}")).collect()));
-        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume), &AtomicBool::new(false), &no_progress)
+        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume), &Spend::default(), &no_progress)
             .await
             .expect("the retry should finish");
         assert_eq!(*up2.calls.lock().unwrap(), 1, "the retry re-bought batches it already had");
@@ -1815,7 +1883,7 @@ mod contract_tests {
         // a single cue still gets three back — so every leaf is a wrong-length reply and keeps its
         // source. (One line back would have MATCHED a split-to-one batch and translated it.)
         let up = fake(|_: &[String]| Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
-        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume), &AtomicBool::new(false), &no_progress).await;
+        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume), &Spend::default(), &no_progress).await;
         assert!(out.is_err(), "a film that translated nothing is not a translation");
         assert_eq!(store.len(), 0, "a kept-source leaf was remembered as if it were a translation");
     }
@@ -1830,44 +1898,47 @@ mod contract_tests {
         // Echoes the source back: right length, no translation. Trips the ratio gate.
         let echo = |src: &[String]| Ok(src.to_vec());
 
-        let billed = AtomicBool::new(false);
+        let spend = Spend::default();
         let fresh =
-            run_translation(&fake(echo), &film, Duration::from_secs(600), None, &billed, &no_progress).await;
+            run_translation(&fake(echo), &film, Duration::from_secs(600), None, &spend, &no_progress).await;
         assert!(fresh.is_err(), "an echo is not a translation");
 
         // Same film, same echo, but with everything served from the store the second time.
         let store = MemStore::default();
         let resume = Resume { store: &store, prefix: "p".into() };
-        let first = AtomicBool::new(false);
+        let first = Spend::default();
         let _ = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume), &first, &no_progress)
             .await;
-        // A run served entirely from the store bills nothing, which is what makes the caller's
-        // refund honest — and is the case that used to be the only one answering `spent` correctly.
-        let replay_billed = AtomicBool::new(false);
+        // A run served entirely from the store sends nothing and is charged for nothing. BOTH
+        // answers matter and they are different questions: the caller refunds a finished run on
+        // `was_billed` and a cancelled one on `was_dispatched`, so a resumed run has to come back
+        // false on each or one of those refunds is dishonest.
+        let replay = Spend::default();
         let replayed = run_translation(
             &fake(echo),
             &film,
             Duration::from_secs(600),
             Some(&resume),
-            &replay_billed,
+            &replay,
             &no_progress,
         )
         .await;
         assert!(replayed.is_err(), "a replayed echo passed the gate a fresh one failed");
-        assert!(!replay_billed.load(Ordering::Relaxed), "a fully resumed run reported spend");
+        assert!(!replay.was_billed(), "a fully resumed run reported being charged");
+        assert!(!replay.was_dispatched(), "a fully resumed run reported sending a request");
     }
 
     /// The harness with a deadline long enough never to be the thing under test, and no batch store
     /// — these cases are about what the model does, so nothing may be answered from a previous run.
     async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, TranslateError> {
-        run_translation(up, cues, Duration::from_secs(600), None, &AtomicBool::new(false), &no_progress).await
+        run_translation(up, cues, Duration::from_secs(600), None, &Spend::default(), &no_progress).await
     }
 
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, TranslateError> {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
-        let billed = AtomicBool::new(false);
+        let spend = Spend::default();
         let budget = Budget {
-            billed: &billed,
+            spend: &spend,
             untranslated: AtomicUsize::new(0),
             started: tokio::time::Instant::now(),
             deadline: Duration::from_secs(600),
@@ -2026,7 +2097,7 @@ mod contract_tests {
         }
         // 400 cues is 10 batches at 20ms each; the deadline expires partway, far under the budget.
         let up = Slow(Mutex::new(0));
-        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None, &AtomicBool::new(false), &no_progress).await;
+        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None, &Spend::default(), &no_progress).await;
         // It stops CALLING — that is the deadline's whole job. One 40-cue batch splits into up to
         // 79 calls, so a deadline checked only between batches would let all of them run first.
         assert!(*up.0.lock().unwrap() < 20, "it kept calling past the deadline");
@@ -2166,7 +2237,7 @@ mod contract_tests {
         // was never sent is not evidence about translation quality.
         let groups = 5;
         let deadline = Duration::from_millis(20 * groups);
-        let out = run_translation(&up, &cues(2000), deadline, None, &AtomicBool::new(false), &no_progress).await;
+        let out = run_translation(&up, &cues(2000), deadline, None, &Spend::default(), &no_progress).await;
 
         let called = *up.0.lock().unwrap();
         // Groups that fit inside the deadline, plus one: `spent()` is strictly-greater, so the group
@@ -2549,7 +2620,7 @@ mod contract_tests {
                 retry: Some(Duration::from_secs(3600)), fatal: false, key_certain: false,
             })
         });
-        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &AtomicBool::new(false), &no_progress).await;
+        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &Spend::default(), &no_progress).await;
         assert!(out.is_err());
         assert_eq!(*up.calls.lock().unwrap(), 1, "an hour-long backoff was taken inside a ten-minute run");
     }

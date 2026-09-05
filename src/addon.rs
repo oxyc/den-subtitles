@@ -1028,17 +1028,24 @@ fn quota_key(config: &str, now: std::time::SystemTime) -> String {
 struct ChargeGuard<'a> {
     state: &'a Arc<AppState>,
     config: &'a str,
-    billed: &'a std::sync::atomic::AtomicBool,
+    spend: &'a translate::Spend,
     source_was_cached: bool,
     armed: bool,
 }
 
 impl Drop for ChargeGuard<'_> {
     fn drop(&mut self) {
-        // The same two conditions the failure path applies — no tokens, no metered credit — because
-        // the question is the same one and it has a measured answer even here.
-        let billed = self.billed.load(Ordering::Relaxed);
-        if self.armed && !billed && self.source_was_cached {
+        // DISPATCHED, not billed — the failure path's question is the wrong one here.
+        //
+        // A finished run has seen every answer, so it can ask whether the viewer was charged, and a
+        // refusal that charged nothing honestly earns its slot back. A cancelled run has seen
+        // nothing: the request it left on the wire is charged for whether or not we are still
+        // listening. Asking `billed` read as "nothing was spent" for every cancellation before the
+        // first response — and a real call may take LLM_TIMEOUT, so hanging up inside 100ms wins
+        // that race every time. The slot came back on each attempt while each attempt still sent a
+        // glossary call carrying the film's dialogue, so the daily ceiling never moved and the whole
+        // guard was a way to spend without being counted.
+        if self.armed && !self.spend.was_dispatched() && self.source_was_cached {
             refund_translation(self.state, self.config);
         }
     }
@@ -1879,9 +1886,9 @@ async fn produce_translation(
     if !charge_translation(state, config) {
         return Err(TranslationFailure::Allowance);
     }
-    // Declared BEFORE the guard below, so it is still alive when the guard's `drop` reads it: locals
-    // drop in reverse declaration order.
-    let billed = std::sync::atomic::AtomicBool::new(false);
+    // Declared BEFORE the guard below, so it is still alive when the guard's `drop` reads it. The
+    // borrow makes that ordering a compile error to get wrong, not a convention.
+    let spend = translate::Spend::default();
     // The charge, made refundable however this frame ends — including the way that produces no
     // `Err` at all. A client that hangs up mid-run drops this future, so `map_err` below never runs
     // and the slot it charged was neither refunded nor spent on anything a retry can use. The retry
@@ -1889,11 +1896,10 @@ async fn produce_translation(
     // a handful of films emptied the day — the same self-inflicted lockout the comment above
     // describes, reached by a different road.
     //
-    // The guard applies the same rule as the failure path rather than a guess in either direction:
-    // give the slot back only if nothing was paid for. Refunding unconditionally would let a client
-    // that cancels just before the first batch lands bill the glossary and four batches per attempt
-    // forever without ever consuming allowance.
-    let mut slot = ChargeGuard { state, config, billed: &billed, source_was_cached, armed: true };
+    // The guard gives the slot back only when this run put NOTHING on the wire — see its `Drop`,
+    // which explains why that is a different question from the one the failure path asks, and why
+    // asking the failure path's question here handed a cancelling client free runs.
+    let mut slot = ChargeGuard { state, config, spend: &spend, source_was_cached, armed: true };
     // The cache doubles as the batch store: a run that dies at cue 1100 of 1200 leaves the 1100
     // behind, so the retry the viewer is about to make re-buys only what actually failed.
     //
@@ -1901,7 +1907,7 @@ async fn produce_translation(
     // poll from the request alone — deriving the body key needs a search, and a poll happens every
     // second while the expensive thing runs.
     let reporter = state.progress.start(job_key, cues.len());
-    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache, &billed, &|done, total| {
+    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache, &spend, &|done, total| {
         reporter.set(done, total);
     })
     .await;
@@ -2452,16 +2458,22 @@ mod translate_retry_tests {
         assert!(!quota_key(&one, now).contains(&one));
     }
 
-    /// A run the client hangs up on must not keep the slot it charged.
+    /// A run the client hangs up on must not keep the slot it charged — and must not get it back
+    /// once it has put a request on the wire.
     ///
-    /// It is the one ending that produces no `Err` to inspect — the future is simply dropped — so
-    /// the explicit refund at the call site never runs. The retry then charged a second slot, and a
-    /// client timeout shorter than a run (up to RUN_DEADLINE, ten minutes) turned a handful of films
-    /// into an empty day. But only when nothing was billed: a cancelled run that had already paid
-    /// for batches keeps the slot, or a client cancelling just before the first batch lands could
-    /// bill the glossary and four batches per attempt forever without ever consuming allowance.
+    /// Cancellation is the one ending that produces no `Err` to inspect, so the explicit refund
+    /// never runs and the retry charged a second slot. A client timeout shorter than a run (up to
+    /// RUN_DEADLINE, ten minutes) turned a handful of films into an empty day.
+    ///
+    /// The condition is DISPATCH, not billing, and the difference is the whole test. A finished run
+    /// has seen every answer and can honestly ask whether it was charged. A cancelled run has seen
+    /// none: a request in flight is charged for whether or not we are still listening, and a real
+    /// call may take LLM_TIMEOUT, so hanging up inside 100ms beats every response. Asking `billed`
+    /// here refunded the slot on every such attempt while each attempt still sent a glossary call
+    /// carrying the film's dialogue — the ceiling never moved, and the guard meant to bound spend
+    /// became the way to spend unbounded.
     #[test]
-    fn a_cancelled_run_gives_its_slot_back_only_if_it_bought_nothing() {
+    fn a_cancelled_run_keeps_its_slot_once_it_has_sent_anything() {
         let state = state("cancel");
         let config = config_segment();
         let used = |s: &Arc<AppState>| -> u64 {
@@ -2470,61 +2482,43 @@ mod translate_retry_tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         };
+        let guard = |spend: &'static translate::Spend, source_was_cached: bool, armed: bool| {
+            ChargeGuard { state: &state, config: &config, spend, source_was_cached, armed }
+        };
 
-        // Cancelled having called nothing: the slot comes back.
+        // Cancelled having sent nothing: the slot comes back.
         assert!(charge_translation(&state, &config));
         assert_eq!(used(&state), 1);
         {
-            let billed = std::sync::atomic::AtomicBool::new(false);
-            let _slot = ChargeGuard {
-                state: &state,
-                config: &config,
-                billed: &billed,
-                source_was_cached: true,
-                armed: true,
-            };
+            let untouched: &'static translate::Spend = Box::leak(Box::default());
+            let _slot = guard(untouched, true, true);
         }
-        assert_eq!(used(&state), 0, "a run that bought nothing kept its slot");
+        assert_eq!(used(&state), 0, "a run that sent nothing kept its slot");
 
-        // Cancelled after a batch was billed: it keeps it, exactly as the failure path would.
+        // Cancelled with a request ON THE WIRE and no answer yet — `billed` is still false here, and
+        // this is the case that made the guard a bypass rather than a bound.
         assert!(charge_translation(&state, &config));
         {
-            let billed = std::sync::atomic::AtomicBool::new(true);
-            let _slot = ChargeGuard {
-                state: &state,
-                config: &config,
-                billed: &billed,
-                source_was_cached: true,
-                armed: true,
-            };
+            let in_flight: &'static translate::Spend = Box::leak(Box::default());
+            in_flight.dispatch_for_test();
+            assert!(!in_flight.was_billed(), "precondition: no answer has arrived");
+            let _slot = guard(in_flight, true, true);
         }
-        assert_eq!(used(&state), 1, "a cancelled run refunded work it had paid for");
+        assert_eq!(used(&state), 1, "a run with a request in flight refunded its slot");
 
         // And a request that spent a metered download keeps it too — the second condition, which is
         // what stops an unbounded number of distinct titles each burning a credit for free.
         assert!(charge_translation(&state, &config));
         {
-            let billed = std::sync::atomic::AtomicBool::new(false);
-            let _slot = ChargeGuard {
-                state: &state,
-                config: &config,
-                billed: &billed,
-                source_was_cached: false,
-                armed: true,
-            };
+            let untouched: &'static translate::Spend = Box::leak(Box::default());
+            let _slot = guard(untouched, false, true);
         }
         assert_eq!(used(&state), 2, "a cancelled run refunded a metered download");
 
         // Disarmed, the guard does nothing: every ordinary ending decides for itself.
         {
-            let billed = std::sync::atomic::AtomicBool::new(false);
-            let _slot = ChargeGuard {
-                state: &state,
-                config: &config,
-                billed: &billed,
-                source_was_cached: true,
-                armed: false,
-            };
+            let untouched: &'static translate::Spend = Box::leak(Box::default());
+            let _slot = guard(untouched, true, false);
         }
         assert_eq!(used(&state), 2, "a disarmed guard refunded anyway");
     }
