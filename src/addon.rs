@@ -254,8 +254,9 @@ fn os_client<'a>(state: &'a AppState, http: &'a reqwest::Client, cfg: &'a UserCo
 /// Entries are per hash, so the picker (which sends one) and the translate path's source lookup
 /// (which deliberately does not — see `handle_translate`) do NOT share an entry. A translate on a
 /// cold title therefore pays a second search. Searches spend no download credit, and the alternative
-/// is choosing the source from a list whose contents depend on the encode, which costs a second
-/// full-price translation.
+/// is choosing the source from a list whose contents depend on the encode, which resolves two
+/// encodes of one film to two sources: a second metered download, and a pin that moves under the
+/// other encode every time the viewer switches between them.
 ///
 /// Returned UNRANKED, and cached that way: ranking is filename-specific, so each caller ranks the
 /// list for its own request.
@@ -280,21 +281,25 @@ async fn cached_search(
         return Ok(hit);
     }
     // Single-flighted. Two requests arriving on a cold entry would each run a live search, and
-    // OpenSubtitles returns one ordered page — so the two lists can differ, `translation_source` can
-    // pick differently from each, and the two runs land under different body keys where the
-    // single-flight guard on that key cannot collapse them. Two full-price translations of one film,
-    // which is the cost the source pin exists to prevent.
+    // OpenSubtitles returns one ordered page — so the two lists can differ and `translation_source`
+    // can pick differently from each. One flight means one list, so both pick the same source.
     //
-    // SHARED, deliberately — not scoped to the install like the failure marker below.
+    // SHARED, deliberately — not scoped to the install like the failure marker below. Scoping it
+    // seemed tidier and was the same bug at install granularity: two installs on a cold title each
+    // ran their own live search and could each land on a different source.
     //
-    // Scoping it seemed tidier and was a money bug: two installs on a cold title would each run
-    // their own live search, and the reason above is exactly why that matters — the two lists can
-    // differ, `translation_source` picks differently from each, and the two runs land under
-    // different body keys that no later guard can collapse. Two full-price films.
+    // What that costs is now a DOWNLOAD, not a film. It used to cost the film: the body key named
+    // the source, so two picks meant two keys and no later guard could collapse them. Since the
+    // body is keyed by title, the guard on `body_key` is taken before any source is resolved and
+    // collapses the two runs whatever they pick — so the exposure is one extra metered credit and a
+    // pin that flips between two sources, which on a free tier of a handful a day is still worth a
+    // flight, and one the plain picker's own downloads are drawn from.
     //
     // The cost of keeping it shared is that during an outage installs queue behind one guard and
     // then each miss their own marker, so they fail one after another rather than together. That is
-    // latency, during an outage, bounded by install count. Money outranks it.
+    // latency, during an outage, bounded by install count. A metered quota still outranks it — but
+    // it is a closer call than it was, so anyone widening this should re-weigh it rather than cite
+    // a film's LLM bill, which is no longer what is at stake.
     let _flight = state.inflight.acquire(&search_key).await;
     if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
         return Ok(hit);
@@ -946,8 +951,9 @@ fn translation_source(subs: &[opensubtitles::Subtitle]) -> Option<&opensubtitles
         }
         // Highest score wins, and `file_id` breaks a tie. Taking "the first of equal scores" was not
         // good enough: first means first IN THE LIST, and the list arrives in an order OpenSubtitles
-        // chooses. The chosen source is part of the translation's cache key, so a pick that depends
-        // on the order buys the same film twice.
+        // chooses. An order-dependent pick moves the pin between two sources of one title, so each
+        // move is another metered download — and the two encodes of a film a viewer switches
+        // between would keep taking it off each other.
         (std::cmp::Reverse(score), s.file_id)
     })
 }
@@ -1394,7 +1400,8 @@ pub async fn handle_translate(
                                 // Unhashed deliberately. OpenSubtitles floats hash matches up and
                                 // returns one page, so a hashed list is ordered and truncated
                                 // differently per encode — choosing from it resolves two encodes of
-                                // one film to two sources and buys the dialogue twice.
+                                // one film to two sources, so the pin flips whenever the viewer
+                                // switches encode and each flip is another metered download.
                                 //
                                 // A failed search does NOT set the failure marker: a search costs
                                 // nothing, and marking it made a blip outlive itself by ten minutes
@@ -1935,8 +1942,9 @@ mod tests {
     }
 
     /// The translation source is chosen as TEXT, not as a fit to this encode. If the hash match got
-    /// a vote here, two encodes of one film would resolve to two different sources and each would buy
-    /// a separate full-price translation of the same dialogue — against the viewer's own key.
+    /// a vote here, two encodes of one film would resolve to two different sources, so the pin would
+    /// flip every time the viewer switched between them and each flip is another metered download
+    /// out of a free tier of a handful a day.
     #[test]
     fn the_translation_source_does_not_depend_on_the_encode() {
         let good = Subtitle { downloads: 50_000, from_trusted: true, ..sub(1, false) };

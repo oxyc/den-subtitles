@@ -416,7 +416,8 @@ const RUN_DEADLINE: Duration = Duration::from_secs(600);
 /// a lot of harm: a floor of eight let seven dead cues out of eight through — 87% untranslated,
 /// served and cached for sixty days. Ratios do not need a size exemption; the old threshold did.
 ///
-/// "Nothing translated at all" needs no clause of its own either: 3n > 2n holds for every n > 0.
+/// "Nothing translated at all" needs no clause of its own: 3n > 2n holds for every n > 0. The one
+/// carve-out is a single-cue track, and it is in the code rather than in the ratio — see below.
 fn unusable(kept: usize, seen: usize) -> bool {
     // A one-cue track is 0% or 100% dead by construction, so the ratio can only ever refuse it —
     // and if that cue is a sign reading MOSCOW, coming back unchanged is the correct translation.
@@ -1142,15 +1143,20 @@ async fn deepl_translate(
         .ok_or_else(|| CallError::Contract("deepl returned a non-string translation".to_string()))
 }
 
-/// DeepL wants an upper-case language code. Map the display names Den sends; fall back to the first
-/// two letters upper-cased (covers the common `sv`/`no`/`da`/`en` → `SV`/`NB`/`DA`/`EN` cases).
+/// An upper-case language code for the display names Den sends, or `None`. Every accepted language
+/// is named in full and there is NO fallback — that is the point of the function, not an omission.
+///
+/// Do not add one. The old fallback took the first two letters and uppercased them, which is not a
+/// language code but a coincidence: Estonian became ES, which is DeepL's code for SPANISH, so a
+/// request for Estonian came back as fluent Spanish — right shape, right length, not an echo, so
+/// nothing downstream could tell — then cached for sixty days and served `immutable`. Slovak became
+/// SL, which is Slovenian. Portuguese and Polish both became PO, which is nothing at all.
+///
+/// And the stakes are now wider than DeepL. `canonical_lang` uses this as the cache-key normalizer
+/// for EVERY provider, so a fallback that maps two languages onto one code makes `translate_body_key`
+/// collide: an Estonian request on OpenAI would be served the cached Spanish film. `None` here means
+/// "not a language we can key" and the caller refuses before spending anything.
 fn deepl_code(lang: &str) -> Option<&'static str> {
-    // Named in full, because guessing is worse than refusing here. The old fallback took the first
-    // two letters and uppercased them, which is not a language code — it is a coincidence. Estonian
-    // became ES, which is DeepL's code for SPANISH, so a request for Estonian came back as fluent
-    // Spanish: right shape, right length, not an echo, so nothing downstream could tell. Cached
-    // sixty days and served immutable. Slovak became SL, which is Slovenian. Portuguese and Polish
-    // both became PO, which is nothing at all.
     Some(match lang.to_ascii_lowercase().as_str() {
         "english" | "en" => "EN-US",
         "swedish" | "sv" => "SV",
@@ -1357,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn deepl_code_maps_names_and_falls_back() {
+    fn deepl_code_names_every_language_and_guesses_at_none() {
         assert_eq!(deepl_code("English"), Some("EN-US"));
         assert_eq!(deepl_code("sv"), Some("SV"));
         assert_eq!(deepl_code("pt"), Some("PT-PT"));
@@ -1373,6 +1379,38 @@ mod tests {
         // An unknown language is refused rather than guessed at.
         assert_eq!(deepl_code("Klingon"), None);
         assert_eq!(deepl_code("xx"), None);
+    }
+
+    /// No two languages may share a key. This is a DeepL code table by origin, but `canonical_lang`
+    /// made it the cache-key normalizer for every provider — so a collision here is not a bad DeepL
+    /// request, it is `translate_body_key` serving one language's paid film for another's, on any
+    /// provider, cached sixty days and `immutable`. Asserted over the whole table rather than the
+    /// two pairs that bit, because the failure is silent and the next collision added would be too.
+    #[test]
+    fn no_two_languages_canonicalize_to_one_key() {
+        // Names, not codes: two spellings of ONE language are meant to agree, and do.
+        let languages = [
+            "English", "Swedish", "Norwegian", "Danish", "Finnish", "German", "Spanish",
+            "Portuguese", "French", "Italian", "Dutch", "Polish", "Russian", "Turkish", "Czech",
+            "Greek", "Japanese", "Korean", "Estonian", "Slovak", "Slovenian", "Chinese",
+            "Indonesian",
+        ];
+        let mut seen: Vec<(&str, String)> = Vec::new();
+        for lang in languages {
+            let key = canonical_lang(lang);
+            assert!(!key.is_empty(), "{lang} has no key, so it cannot be cached");
+            if let Some((other, _)) = seen.iter().find(|(_, k)| *k == key) {
+                panic!("{lang} and {other} both canonicalize to {key}");
+            }
+            seen.push((lang, key));
+        }
+        // The two that actually collided under the old fallback, named so a revert fails loudly.
+        assert_ne!(canonical_lang("Estonian"), canonical_lang("Spanish"));
+        assert_ne!(canonical_lang("Slovak"), canonical_lang("Slovenian"));
+        // And the spellings of one language still share a key — that is what stops a film being
+        // bought once per spelling.
+        assert_eq!(canonical_lang("Swedish"), canonical_lang("sv"));
+        assert_eq!(canonical_lang("swedish"), canonical_lang("SV"));
     }
 }
 

@@ -8,9 +8,11 @@ use serde::Serialize;
 
 pub type Body = Full<Bytes>;
 
-/// A strong, quoted ETag derived from the response body. A fast non-crypto hash (std
-/// `DefaultHasher`) is plenty — an ETag only needs to change when the bytes change, not resist an
-/// adversary. Length is folded in as a cheap extra guard against hash collisions.
+/// A strong, quoted ETag derived from the response body. Non-crypto is plenty — an ETag only needs
+/// to change when the bytes change, not resist an adversary — but it must be `stable_hash` and not
+/// std's `DefaultHasher`, for the reason spelled out below: an ETag outlives the process, in client
+/// and proxy caches, so a toolchain bump would invalidate every one of them at once. Length is
+/// folded in as a cheap extra guard against collisions.
 fn etag_of(bytes: &[u8]) -> String {
     format!("\"{:016x}-{:x}\"", stable_hash(bytes), bytes.len())
 }

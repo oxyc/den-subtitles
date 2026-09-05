@@ -248,8 +248,9 @@ pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
 ///
 /// This is what you want when choosing something to TRANSLATE. The translated text is the same text
 /// whatever the encode, and the timing is corrected afterwards by the sync ladder, so letting the
-/// hash steer the pick would mint a separate full-price translation for every encode of the same
-/// film — the one cost here that is charged to the viewer's own provider account.
+/// hash steer the pick would resolve every encode of one film to its own source — and the source
+/// pin, which is what keeps a title's languages reading from one file, would be taken off each
+/// encode by the next. Every flip is another metered download.
 pub fn text_score(s: &Subtitle) -> i64 {
     const JUNK: i64 = 2_000_000; // demote machine/AI below even a no-info sub
     let mut score = 0i64;
