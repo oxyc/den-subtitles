@@ -68,13 +68,22 @@ pub const MAX_CUES: usize = 6000;
 /// run to megabytes.
 ///
 /// The worst LEGITIMATE track is around 150 KB — a dual-language sub is about twice a normal film,
-/// and an ASS conversion that kept its inline font tags adds some forty bytes a cue. This leaves
-/// well over that and still cuts the worst case by four: a megabyte of dialogue is roughly 300k
-/// input tokens and as many out, which on the default model is a couple of dollars for one film and
-/// three figures across a day's allowance. And the measurement is of the source, once — the
-/// wrong-length split re-sends a batch's text at every level of its binary tree, so what actually
-/// reaches the key can be several times this before the quality gate stops the run.
-pub const MAX_DIALOGUE_BYTES: usize = 256 * 1024;
+/// and an ASS conversion that kept its inline font tags adds some forty bytes a cue. A megabyte of
+/// dialogue is roughly 300k input tokens and as many out, which on the default model is a couple of
+/// dollars for one film and three figures across a day's allowance. And the measurement is of the
+/// source, once — the wrong-length split re-sends a batch's text at every level of its binary tree,
+/// so what actually reaches the key can be several times this before the quality gate stops the run.
+///
+/// Read against `MAX_CUES`, which is the other half of the same question: this must not be the
+/// tighter of the two for a film that is merely dense, or it convicts the file rather than the
+/// pathology. At 256 KB it bound below 43.7 bytes a cue, and CJK is three bytes a character — a
+/// fifteen-character line is 45, so a full-length Chinese or Japanese track tripped it while sitting
+/// inside the cue ceiling, and a dual-language CJK-and-Latin sub with font tags bound at about 1,900
+/// cues. Doubled, the two gates agree about what a normal film is: 87 bytes a cue at the ceiling,
+/// clear of every legitimate shape above, and still four times under the megabyte that costs real
+/// money. What bounds the bill for an ordinary film is `MAX_CUES`; this is the backstop for the
+/// transcript-style upload and the ASS dump, which miss by an order of magnitude, not by a hair.
+pub const MAX_DIALOGUE_BYTES: usize = 512 * 1024;
 /// Characters of dialogue the glossary pass is allowed to read. A film is well under this; the cue
 /// ceiling above allows something several times larger, and one call carrying all of it would cost
 /// more than the translation it is meant to improve.
@@ -2203,6 +2212,27 @@ mod contract_tests {
         assert_eq!(out[10].text, "line 10", "a blanked cue was shipped empty");
         assert_eq!(out[11].text, "T:line 11");
         assert!(out.iter().all(|c| !c.text.trim().is_empty()), "a cue would render as nothing");
+    }
+
+    /// The two size gates have to agree about what a normal film is. They bound the same thing from
+    /// different sides, and whichever binds first decides what gets refused — so if the byte ceiling
+    /// binds at a cue count a real film reaches, it stops being a backstop against transcript dumps
+    /// and starts convicting dense tracks. CJK is the case that finds it: three bytes a character,
+    /// so a full-length Chinese track was refused at the old ceiling while sitting inside `MAX_CUES`.
+    ///
+    /// The floor here is a legitimate shape, not a restatement of the constant — a dual-language sub
+    /// with CJK on one line, Latin on the other, and the inline font tags an ASS conversion leaves
+    /// behind. Roughly 45 + 30 + 12 bytes a cue. If a change to either constant makes that film
+    /// unrepresentable, the pair has drifted.
+    #[test]
+    fn a_dense_film_is_not_refused_for_being_dense() {
+        let worst_legitimate_cue = 87;
+        assert!(
+            MAX_DIALOGUE_BYTES / MAX_CUES >= worst_legitimate_cue,
+            "the byte ceiling binds at {} bytes a cue, under the {worst_legitimate_cue} a \
+             dual-language CJK track needs — a real film is refused before it hits MAX_CUES",
+            MAX_DIALOGUE_BYTES / MAX_CUES
+        );
     }
 
     /// The gate is a ratio at every size above one. An absolute floor exempted short tracks from it

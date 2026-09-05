@@ -677,6 +677,13 @@ fn dead_file_key(file_id: i64) -> String {
     format!("{SYNCFAIL}dl:gone:{}", os_base_key(file_id))
 }
 
+/// "This file is too big to translate." Also a fact about the file and shared, but distinct from
+/// `dead_file_key`: this one downloads perfectly well, so it stays a fine subtitle for the plain
+/// picker to hand over. It is only unusable as a translation SOURCE, and only the re-pick reads it.
+fn oversized_file_key(file_id: i64) -> String {
+    format!("{SYNCFAIL}dl:oversized:{}", os_base_key(file_id))
+}
+
 /// "Stop asking about this file for a moment." Short, shared, and it DOES gate — which is what keeps
 /// a burst of requests for one failing file to a single spent credit.
 fn suspect_backoff_key(file_id: i64) -> String {
@@ -977,6 +984,46 @@ fn title_id(imdb: &str, season: Option<i64>, episode: Option<i64>) -> String {
     format!("{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0))
 }
 
+/// "This series keeps being refused." Between the per-episode marker and the install-wide one.
+fn series_refused_key(config: &str, llm: &LlmConfig, imdb: &str) -> String {
+    format!("{SYNCFAIL}llm-series:{:016x}:{}:{}:{imdb}", short_hash(config), llm.provider.tag(), llm.model)
+}
+
+/// How widely a credential-class refusal should be remembered.
+///
+/// Three scopes because there are three situations, and the middle one had no home. A dead key is
+/// the install. A content filter is the SERIES — that is where it recurs, since the thing it objects
+/// to is the show's dialogue — and giving it the install was collateral while giving it only the
+/// episode was no throttle at all: every next episode paid a metered download, an allowance slot and
+/// half a film in tokens before being refused, which is worse than the block it replaced.
+enum RefusalScope {
+    Install,
+    Series,
+    TitleOnly,
+}
+
+fn refusal_scope(
+    state: &Arc<AppState>,
+    config: &str,
+    llm: &LlmConfig,
+    title: &str,
+    key_certain: bool,
+    spent: bool,
+) -> RefusalScope {
+    if key_certain {
+        return RefusalScope::Install;
+    }
+    // Billed work in this same run is proof the provider accepted this credential, so whatever it
+    // has now objected to is the content. Never the install; the series is where it will recur.
+    if spent {
+        return RefusalScope::Series;
+    }
+    match ambiguous_refusal_escalates(state, config, llm, title) {
+        true => RefusalScope::Install,
+        false => RefusalScope::TitleOnly,
+    }
+}
+
 /// Should an ambiguous refusal block the whole install? Only once a SECOND, different title has
 /// refused the same way inside the window.
 ///
@@ -1263,6 +1310,15 @@ pub async fn handle_translate(
                                 "the AI provider refused this key",
                             );
                         }
+                        // And the series-scoped one, for the refusal that billed work before it
+                        // arrived — a content filter, not a credential. Same placement and the same
+                        // reason: behind the cache reads, so episodes already bought still serve.
+                        if state.cache.get_mem(&series_refused_key(config, llm, &imdb)).is_some() {
+                            return httputil::text(
+                                StatusCode::BAD_GATEWAY,
+                                "the AI provider refused to translate this title",
+                            );
+                        }
                         let source_id = match pinned {
                             Some(id) => id,
                             None => {
@@ -1281,10 +1337,13 @@ pub async fn handle_translate(
                                 };
                                 // Skip what is already known not to download, or the loop has no
                                 // exit: a dead source is unpinned, the deterministic re-pick chooses
-                                // the same file, pins it again, and refuses again.
+                                // the same file, pins it again, and refuses again. Same for one too
+                                // big to translate — it downloads, so it is a fine subtitle to serve
+                                // as-is, but as a source it fails identically every time.
                                 let usable: Vec<opensubtitles::Subtitle> = candidates
                                     .into_iter()
                                     .filter(|s| state.cache.get(&dead_file_key(s.file_id)).is_none())
+                                    .filter(|s| state.cache.get(&oversized_file_key(s.file_id)).is_none())
                                     .collect();
                                 let Some(source) = translation_source(&usable) else {
                                     return httputil::text(
@@ -1354,23 +1413,32 @@ pub async fn handle_translate(
                             // A refusal that arrives AFTER a billed batch cannot be about the key:
                             // the provider accepted this credential minutes ago, in this run. That
                             // is a measurement, where `key_certain` is a guess and the two-title
-                            // heuristic is a proxy — so it settles the ambiguous case outright, and
-                            // it is what stops a moderation-filtered series from re-arming the
-                            // install-wide block every time the previous one lapses.
-                            let block = key_certain
-                                || (!spent
-                                    && ambiguous_refusal_escalates(
-                                        state,
-                                        config,
-                                        llm,
-                                        &title_id(&imdb, season, episode),
-                                    ));
-                            if block {
-                                state.cache.put_mem(
+                            // heuristic is a proxy — so it settles the ambiguous case outright.
+                            //
+                            // It settles it as the SERIES, not as nothing. Demoting it to the
+                            // per-title marker alone left a moderation-filtered show with no
+                            // throttle at all: every next episode paid a metered download, an
+                            // allowance slot and half a film in tokens to rediscover the same
+                            // refusal — dearer than the install-wide block it was meant to spare.
+                            match refusal_scope(
+                                state,
+                                config,
+                                llm,
+                                &title_id(&imdb, season, episode),
+                                key_certain,
+                                spent,
+                            ) {
+                                RefusalScope::Install => state.cache.put_mem(
                                     credential_refused_key(config, llm),
                                     "1".into(),
                                     SYNC_RETRY_TTL,
-                                );
+                                ),
+                                RefusalScope::Series => state.cache.put_mem(
+                                    series_refused_key(config, llm, &imdb),
+                                    "1".into(),
+                                    SYNC_RETRY_TTL,
+                                ),
+                                RefusalScope::TitleOnly => {}
                             }
                             // The per-title marker too, even though this is meant to be a fact about
                             // the install. `is_credential_refusal` reads a 400/403 as one, and those
@@ -1620,22 +1688,32 @@ async fn produce_translation(
     // film that sent nothing — and the per-title marker throttles that to six an hour rather than
     // stopping it, so anything that kept asking ate the day's allowance. The cue count is known
     // three lines above; this is the same argument the download already gets.
-    if cues.len() > translate::MAX_CUES {
-        return Err(TranslationFailure::Model(format!(
+    //
+    // `Source`, not `Model`, and both halves of it. Size is a fact about the file that no retry and
+    // no other install will change, and `Model` keeps the pin — so an oversized source pinned itself
+    // in front of a title for the pin's full 180 days, for every install and every language, while
+    // the perfectly good smaller candidates behind it were never reachable. `Source` drops the pin.
+    //
+    // Dropping the pin is only half an answer, because the re-pick is deterministic and would choose
+    // this same file again. So the file is marked as well, which is what actually retires it, and the
+    // marker is separate from `dead_file_key`: this file downloads fine and remains a good subtitle
+    // to hand over as-is. It is unusable only as something to translate.
+    let dialogue: usize = cues.iter().map(|c| c.text.len()).sum();
+    let too_big = match (cues.len() > translate::MAX_CUES, dialogue > translate::MAX_DIALOGUE_BYTES) {
+        (true, _) => Some(format!(
             "subtitle too large: {} cues (max {})",
             cues.len(),
             translate::MAX_CUES
-        )));
-    }
-    // And the same question asked of the bytes, which is what the bill is made of. A cue count says
-    // nothing about how much text goes through the model, and everything else on this path bounds
-    // the download rather than the dialogue.
-    let dialogue: usize = cues.iter().map(|c| c.text.len()).sum();
-    if dialogue > translate::MAX_DIALOGUE_BYTES {
-        return Err(TranslationFailure::Model(format!(
+        )),
+        (_, true) => Some(format!(
             "subtitle too large: {dialogue} bytes of dialogue (max {})",
             translate::MAX_DIALOGUE_BYTES
-        )));
+        )),
+        _ => None,
+    };
+    if let Some(why) = too_big {
+        state.cache.put(oversized_file_key(source_file_id), "1".into(), SOURCE_PIN_TTL);
+        return Err(TranslationFailure::Source(why));
     }
     // Charged HERE — the last point before the first token is spent, and after everything that can
     // fail without spending one.
@@ -1666,25 +1744,28 @@ async fn produce_translation(
     drop(reporter);
 
     // None of the harness's failures says anything about which file was chosen, so none of them
-    // touches the pin. But one of them says something about the CREDENTIAL — a key the provider
-    // refuses outright will refuse the next film identically, and the slot charged just above bought
-    // nothing, so it is given back.
-    let translated = translated.map_err(|e| match e.credential_refused {
-        true => {
-            // Refunded only when nothing was spent. A refusal that arrives on the first call — the
-            // dead-key case, and the one this exists for — bought nothing; one that arrives after
-            // some batches landed was paid for in real tokens, and giving the slot back for it would
-            // be the same accounting mistake in the other direction.
-            if !e.spent {
-                refund_translation(state, config);
-            }
-            TranslationFailure::Credential {
+    // touches the pin.
+    let translated = translated.map_err(|e| {
+        // The slot exists to meter what the viewer's key is billed, so what it answers to is
+        // `spent`, not the shape of the failure. A run that made no upstream call bought nothing
+        // and gives the slot back; one refused after some batches landed was paid for in real
+        // tokens and keeps it, since refunding that is the same accounting mistake reversed.
+        //
+        // This was once asked only of credential refusals, and the gap showed on a resumed run: its
+        // batches all came back from the store, the assembled result tripped the `unusable` ratio
+        // gate, and a slot went on a run that had not called the provider once.
+        if !e.spent {
+            refund_translation(state, config);
+        }
+        match e.credential_refused {
+            // A key the provider refuses outright will refuse the next film identically.
+            true => TranslationFailure::Credential {
                 message: e.message,
                 key_certain: e.key_certain,
                 spent: e.spent,
-            }
+            },
+            false => TranslationFailure::Model(e.message),
         }
-        false => TranslationFailure::Model(e.message),
     })?;
     let body = srt::serialize(&translated);
     state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
@@ -2228,24 +2309,42 @@ mod translate_retry_tests {
         assert!(!refuse(&ep(2, 5)), "one episode blocked the whole install");
         assert!(refuse(&ep(2, 6)), "the next episode of the same series did not escalate");
 
-        // But a refusal that arrives after a billed batch never reaches any of this. The provider
-        // accepted this key in this run, so what it has objected to is the content — and without
-        // that check a moderation-filtered series re-armed the install-wide block every time the
-        // previous one lapsed, for as long as the viewer kept watching.
-        let blocks = |key_certain: bool, spent: bool, title: &str| {
-            key_certain
-                || (!spent && ambiguous_refusal_escalates(&series, "install-two", &llm, title))
+        // The real decision, not a copy of it spelled inline — the previous version of this test
+        // re-typed the rule as a closure, which passes just as happily when the handler stops
+        // agreeing with it.
+        let scope = |key_certain: bool, spent: bool, title: &str| {
+            refusal_scope(&series, "install-two", &llm, title, key_certain, spent)
         };
-        assert!(!blocks(false, true, &ep(3, 1)), "a refusal after billed work blocked the install");
-        assert!(!blocks(false, true, &ep(3, 2)), "a second billed refusal escalated");
-        // A dead key bills nothing, so it still escalates on the second title.
-        assert!(!blocks(false, false, &ep(4, 1)));
-        assert!(blocks(false, false, &ep(4, 2)), "a key that billed nothing did not escalate");
+        // A refusal that arrives after a billed batch is the content, so it is the SERIES. The
+        // provider accepted this key in this run; blocking the install on that let one filtered show
+        // re-arm the install-wide marker every time the previous one lapsed.
+        assert!(matches!(scope(false, true, &ep(3, 1)), RefusalScope::Series));
+        // Every time, not only the first: this is a measurement, so it does not need corroborating.
+        assert!(matches!(scope(false, true, &ep(3, 2)), RefusalScope::Series));
+        // And it is a real throttle — leaving it at the per-title marker alone was the regression
+        // this replaced, where each next episode re-bought a download, a slot and half a bill.
+        assert_ne!(
+            series_refused_key("install-two", &llm, "tt1234567"),
+            series_refused_key("install-two", &llm, "tt7654321"),
+            "one filtered series backed off an unrelated one"
+        );
+        assert_ne!(
+            series_refused_key("install-two", &llm, "tt1234567"),
+            series_refused_key("install-three", &llm, "tt1234567"),
+            "one install's filtered series backed off another install"
+        );
+        // A dead key bills nothing, so it still escalates to the install on the second title.
+        assert!(matches!(scope(false, false, &ep(4, 1)), RefusalScope::TitleOnly));
+        assert!(matches!(scope(false, false, &ep(4, 2)), RefusalScope::Install));
         // And an unambiguous status blocks at once, billed or not — a key revoked mid-run is dead.
-        assert!(blocks(true, true, &ep(5, 1)));
+        assert!(matches!(scope(true, true, &ep(5, 1)), RefusalScope::Install));
 
-        // And the two markers are distinct namespaces, so neither can be read as the other.
+        // And the markers are distinct namespaces, so none can be read as another.
         assert_ne!(ambiguous_refusal_key("install-one", &llm), credential_refused_key("install-one", &llm));
+        assert_ne!(
+            series_refused_key("install-one", &llm, "tt1234567"),
+            credential_refused_key("install-one", &llm)
+        );
     }
 
     /// A failure belongs to the install that had it. The translated BODY is the same bytes whoever
@@ -2352,6 +2451,17 @@ mod translate_retry_tests {
         assert!(
             matches!(remembered_failure(&state, &client, 6), Some(DownloadError::Gone(_))),
             "a second occasion did not confirm the file is dead"
+        );
+
+        // "Too big to translate" is a different verdict from "will not download", and must not be
+        // filed as one. This file fetches perfectly; the plain picker should keep handing it over,
+        // and only the choice of a translation SOURCE skips it.
+        assert_ne!(oversized_file_key(6), dead_file_key(6));
+        assert_ne!(oversized_file_key(6), suspect_backoff_key(6));
+        state.cache.put(oversized_file_key(9), "1".into(), SOURCE_PIN_TTL);
+        assert!(
+            remembered_failure(&state, &client, 9).is_none(),
+            "an oversized file was read back as one that will not download"
         );
 
         // And a clean download clears the record, so a file that works nine times in ten is never
