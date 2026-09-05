@@ -670,8 +670,8 @@ fn dead_file_key(file_id: i64) -> String {
     format!("{SYNCFAIL}dl:gone:{}", os_base_key(file_id))
 }
 
-/// "The link for this file failed once." One strike, shared, short-lived. A second strike inside its
-/// lifetime promotes to `dead_file_key`.
+/// "The link for this file failed once." One strike, shared, and it lasts as long as the verdict it
+/// can become: a second failure inside its lifetime promotes to `dead_file_key`.
 fn suspect_file_key(file_id: i64) -> String {
     format!("{SYNCFAIL}dl:suspect:{}", os_base_key(file_id))
 }
@@ -693,13 +693,15 @@ fn remembered_failure(
     if state.cache.get(&dead_file_key(file_id)).is_some() {
         return Some(opensubtitles::DownloadError::Gone(format!("file {file_id} is gone (remembered)")));
     }
-    // `get_mem` for the two short-lived ones, to match their `put_mem` — going through `get` would
-    // probe a disk tier nothing writes them to.
-    if state.cache.get_mem(&suspect_file_key(file_id)).is_some() {
-        return Some(opensubtitles::DownloadError::Suspect(format!(
-            "file {file_id} would not download (remembered)"
-        )));
-    }
+    // A live STRIKE is deliberately not consulted here.
+    //
+    // It was, and that made the promotion it exists for unreachable: this function is the last thing
+    // checked before the only download call in the program, so a strike refused the very attempt
+    // whose failure would have confirmed it. A junk upload then looped forever — one metered credit
+    // and one of the fifty daily translations per cycle — and never became `Gone`, so it never
+    // unpinned either. Letting the second attempt through costs one more credit and buys a verdict.
+    //
+    // `get_mem` to match `put_mem` — going through `get` would probe a disk tier nothing writes to.
     if state.cache.get_mem(&unavailable_file_key(client, file_id)).is_some() {
         return Some(opensubtitles::DownloadError::Unavailable(format!(
             "file {file_id} unavailable (remembered)"
@@ -723,11 +725,15 @@ fn remember_failure(
     use opensubtitles::DownloadError::*;
     match e {
         Gone(_) => state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL),
+        // Second failure inside the strike's window: two independent link failures on one file is
+        // enough. The strike lasts as long as the verdict, so the pair costs two metered credits and
+        // then a day of quiet — rather than one credit every ten minutes forever, which is what a
+        // short strike that could never promote actually did.
         Suspect(_) => {
             let strike = suspect_file_key(file_id);
             match state.cache.get_mem(&strike).is_some() {
                 true => state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL),
-                false => state.cache.put_mem(strike, "1".into(), SYNC_RETRY_TTL),
+                false => state.cache.put_mem(strike, "1".into(), DEAD_FILE_TTL),
             }
         }
         Unavailable(_) => {
@@ -990,7 +996,15 @@ pub async fn handle_translate(
             let Ok(candidates) = cached_search(state, &client, config, &imdb, season, episode, None).await else {
                 return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
             };
-            let Some(source) = translation_source(&candidates) else {
+            // Skip what is already known not to download. Without this the loop had no exit: a dead
+            // source was unpinned, the deterministic re-pick chose the same dead file, pinned it
+            // again, and refused again — a blocking pin write and a pin delete per request, forever,
+            // on the thread that serves every connection.
+            let usable: Vec<opensubtitles::Subtitle> = candidates
+                .into_iter()
+                .filter(|s| state.cache.get(&dead_file_key(s.file_id)).is_none())
+                .collect();
+            let Some(source) = translation_source(&usable) else {
                 return httputil::text(StatusCode::NOT_FOUND, "no source subtitle to translate");
             };
             // Written once, here, where a choice was actually made — not on every request. `put`
@@ -1108,6 +1122,10 @@ pub async fn handle_translate(
                             eprintln!("translate: unpinning {imdb} — source {source_id} will not download");
                             state.cache.remove(&pin_key);
                         }
+                        // Backed off like any other failure. Without this the refusal was free to
+                        // repeat, and each repeat re-ran the pin miss, the search, and a blocking
+                        // pin write — on the path the engine takes for every playback.
+                        state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
                         return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
                     }
                     // Charged here and nowhere else: this is the one path that starts a run, and it
@@ -1882,15 +1900,17 @@ mod translate_retry_tests {
         remember_failure(&state, &client, 5, &DownloadError::Gone("404".into()));
         assert!(matches!(remembered_failure(&state, &client, 5), Some(DownloadError::Gone(_))));
 
-        // One suspect link fetch is a strike, not a verdict — it must NOT read back as `Gone`, or a
-        // transient would unpin a source shared by every install and language.
+        // One suspect link fetch is a strike, not a verdict. It must NOT read back as anything — the
+        // gate is the last thing checked before the only download call, so a strike that gated would
+        // refuse the very attempt whose failure confirms it, and the promotion below could never
+        // happen. That is what made a junk upload loop forever at a credit a cycle.
         remember_failure(&state, &client, 6, &DownloadError::Suspect("link 404".into()));
         assert!(
-            matches!(remembered_failure(&state, &client, 6), Some(DownloadError::Suspect(_))),
-            "a single suspect failure was promoted to a verdict"
+            remembered_failure(&state, &client, 6).is_none(),
+            "a strike gated the retry that has to promote it"
         );
-        // A second one inside its window is. Otherwise a persistently junk file would be re-fetched
-        // every ten minutes, at one metered credit each.
+        // The second attempt is what earns the verdict, and from then on it is remembered — so the
+        // pair costs two metered credits and then a day of quiet.
         remember_failure(&state, &client, 6, &DownloadError::Suspect("link 404".into()));
         assert!(
             matches!(remembered_failure(&state, &client, 6), Some(DownloadError::Gone(_))),
