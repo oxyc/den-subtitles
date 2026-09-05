@@ -93,7 +93,11 @@ impl<'a> Client<'a> {
     }
 
     /// Resolve a `file_id` to a temporary download link, then fetch the subtitle text.
-    pub async fn download(&self, file_id: i64) -> Result<String, String> {
+    ///
+    /// The error says whether the FILE is the problem or the service is. Callers that remember a
+    /// file id — the pinned translation source — need to stop remembering it on the first and keep
+    /// it on the second, and the two are otherwise indistinguishable from a message.
+    pub async fn download(&self, file_id: i64) -> Result<String, DownloadError> {
         let mut req = self
             .http
             .post(format!("{}/download", self.api_base))
@@ -106,12 +110,20 @@ impl<'a> Client<'a> {
         if let Some(t) = self.token {
             req = req.bearer_auth(t);
         }
-        let resp = req.send().await.map_err(|e| format!("download request failed: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| DownloadError::Unavailable(format!("download request failed: {e}")))?;
         if !resp.status().is_success() {
-            return Err(format!("opensubtitles download {}", resp.status()));
+            let code = resp.status();
+            return Err(DownloadError::from_status(code, format!("opensubtitles download {code}")));
         }
-        let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY).await?;
-        let link = v["link"].as_str().ok_or("no download link")?;
+        let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY)
+            .await
+            .map_err(DownloadError::Unavailable)?;
+        let link = v["link"]
+            .as_str()
+            .ok_or_else(|| DownloadError::Unavailable("no download link".to_string()))?;
         // The link is OpenSubtitles-supplied and points at their CDN — cap the fetched body.
         let resp = self
             .http
@@ -120,21 +132,58 @@ impl<'a> Client<'a> {
             .await
             // `without_url`: reqwest's Display prints the URL it failed on, and this one is the
             // one-shot download link — a bearer capability that would land in the container log.
-            .map_err(|e| format!("fetch link failed: {}", e.without_url()))?;
+            .map_err(|e| DownloadError::Unavailable(format!("fetch link failed: {}", e.without_url())))?;
         // The API call above is status-checked and this one was not, so a CDN 403/404/429 (an
         // expired or rate-limited link) returned its HTML error page AS the subtitle — cached under
         // the file id for 60 days and served `immutable`. One transient blip, one track that
         // silently shows nothing forever.
         if !resp.status().is_success() {
-            return Err(format!("subtitle link {}", resp.status()));
+            let code = resp.status();
+            return Err(DownloadError::from_status(code, format!("subtitle link {code}")));
         }
-        let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY).await?;
+        let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY)
+            .await
+            .map_err(DownloadError::Unavailable)?;
         // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
         // enough. Anything with no cue in it cannot be one.
+        //
+        // `Gone`, not `Unavailable`: this body arrived intact and is not a subtitle, which is a fact
+        // about the file and not about the service.
         if !crate::srt::has_a_cue(&body) {
-            return Err("subtitle link returned no cues".to_string());
+            return Err(DownloadError::Gone("subtitle link returned no cues".to_string()));
         }
         Ok(body)
+    }
+}
+
+/// Why a subtitle could not be fetched, split by whether the FILE or the SERVICE is at fault.
+///
+/// The distinction is what lets a remembered file id be forgotten at the right time. A 404 says the
+/// upload is gone and whatever named it should stop; a 429 says the viewer is out of downloads for
+/// today, and forgetting the file over that throws away the choice — and, for a pinned translation
+/// source, re-buys every language of the film.
+#[derive(Debug)]
+pub enum DownloadError {
+    /// The file is the problem: deleted, or not a subtitle. Retrying it will not help.
+    Gone(String),
+    /// Everything else — quota, rate limit, transport, a CDN having a moment.
+    Unavailable(String),
+}
+
+impl DownloadError {
+    /// 404 and 410 name the file. Everything else — 401/403 (key), 406/429 (quota), 5xx — is the
+    /// service, and a file id must survive all of them.
+    fn from_status(status: reqwest::StatusCode, message: String) -> DownloadError {
+        match status.as_u16() {
+            404 | 410 => DownloadError::Gone(message),
+            _ => DownloadError::Unavailable(message),
+        }
+    }
+
+    pub fn message(self) -> String {
+        match self {
+            DownloadError::Gone(m) | DownloadError::Unavailable(m) => m,
+        }
     }
 }
 
@@ -385,10 +434,34 @@ mod download_tests {
         format!("http://{addr}")
     }
 
-    async fn download_from(status: &'static str, body: &'static str) -> Result<String, String> {
+    async fn download_from(status: &'static str, body: &'static str) -> Result<String, DownloadError> {
         let base = upstream(status, body).await;
         let http = reqwest::Client::new();
         Client { http: &http, api_key: "k", token: None, api_base: &base }.download(1).await
+    }
+
+    /// The error has to say whether the FILE or the SERVICE failed, because the pinned translation
+    /// source is forgotten on one and kept on the other — and keeping it through a quota exhaustion
+    /// is what stops a film being re-bought in every language because the viewer ran out of
+    /// downloads for the day.
+    #[tokio::test]
+    async fn a_download_error_says_whose_fault_it_is() {
+        // The upload is gone: whatever named this file should stop naming it.
+        let err = download_from("404 Not Found", "gone").await.expect_err("404 must fail");
+        assert!(matches!(err, DownloadError::Gone(_)), "a 404 is the file's fault: {err:?}");
+
+        // A body that arrives intact and is not a subtitle is also the file's fault.
+        let err = download_from("200 OK", "<html>not a subtitle</html>").await.expect_err("must fail");
+        assert!(matches!(err, DownloadError::Gone(_)), "a cue-less body is the file's fault: {err:?}");
+
+        // Quota, rate limit and server trouble are the service's, and a file id must survive them.
+        for status in ["406 Not Acceptable", "429 Too Many Requests", "503 Service Unavailable", "403 Forbidden"] {
+            let err = download_from(status, "nope").await.expect_err("must fail");
+            assert!(
+                matches!(err, DownloadError::Unavailable(_)),
+                "{status} was blamed on the file: {err:?}"
+            );
+        }
     }
 
     /// The API call was status-checked and the CDN fetch that follows it was not, so an expired or
@@ -399,6 +472,7 @@ mod download_tests {
         let err = download_from("403 Forbidden", "<html><body>Forbidden</body></html>")
             .await
             .expect_err("a 403 from the CDN must not become the subtitle");
+        let err = err.message();
         assert!(err.contains("403"), "unexpected error: {err}");
     }
 

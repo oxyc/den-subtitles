@@ -279,8 +279,10 @@ async fn cached_search(
     // The flight ahead of us may have failed. Nothing caches a failed search, so without this the
     // queue behind one miss ran a live search EACH, one after another, at up to the client timeout
     // apiece — the tenth caller waiting ten times as long as it used to for the same failure.
+    // `get_mem` to match the `put_mem` below: going through `get` would fall through to a disk probe
+    // for a key nothing ever writes to disk — a blocking ENOENT `open` per cache-miss search.
     let fail_key = format!("{SYNCFAIL}{search_key}");
-    if state.cache.get(&fail_key).is_some() {
+    if state.cache.get_mem(&fail_key).is_some() {
         return Err("search failed recently".to_string());
     }
     match client.search(imdb, season, episode, "all", hash).await {
@@ -380,7 +382,7 @@ pub async fn handle_subtitle_file(
     let target = match subtitle_srt(state, &client, file_id).await {
         Ok(body) => body,
         Err(e) => {
-            eprintln!("subtitle: download of file {file_id} failed: {e}");
+            eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
             return httputil::text(StatusCode::BAD_GATEWAY, "upstream subtitle fetch failed");
         }
     };
@@ -482,7 +484,7 @@ async fn sync_and_cache(
                 }
             }
             Err(e) => {
-                eprintln!("sync: reference {r} for {what} unavailable: {e}");
+                eprintln!("sync: reference {r} for {what} unavailable: {}", e.message());
                 None
             }
         }
@@ -515,7 +517,11 @@ async fn sync_and_cache(
 }
 
 /// Fetch a subtitle's SRT, cached by file id (the raw, un-synced text — reused as a sync input).
-async fn subtitle_srt(state: &Arc<AppState>, client: &opensubtitles::Client<'_>, file_id: i64) -> Result<String, String> {
+async fn subtitle_srt(
+    state: &Arc<AppState>,
+    client: &opensubtitles::Client<'_>,
+    file_id: i64,
+) -> Result<String, opensubtitles::DownloadError> {
     let key = os_base_key(file_id);
     if let Some(hit) = state.cache.get(&key) {
         return Ok(hit);
@@ -872,32 +878,19 @@ pub async fn handle_translate(
 
     // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
     // either there is no anchor to find, and the answer would be the list we already have.
+    // A failed search here means no anchor, and no anchor means carry on without one: `ref_id`
+    // becomes `None`, `sync_cache_key` keys on `body_key` itself, and that IS the honest identity of
+    // an unaligned body — not a key an aligned one should have owned. Nothing is mis-filed, and a
+    // later request that does find an anchor misses `body_key:ref:R` and aligns then.
+    //
+    // Two stricter versions of this were both worse. Refusing outright returned 502 for a title
+    // already bought and cached; returning early with whatever happened to be cached could not
+    // translate a cold title at all during a blip. Neither wrote a backoff, so every client retry
+    // was another live search.
     let anchored = match hash.as_deref().filter(|_| cfg.auto_sync) {
-        Some(h) => match cached_search(state, &client, &imdb, season, episode, Some(h)).await {
-            Ok(s) => s,
-            // No anchor can be worked out, so no NEW work may start: which alignment this request
-            // belongs under is exactly what could not be determined, and guessing `None` would file
-            // an unaligned body under the key an aligned one should own.
-            //
-            // But refusing outright was worse than the disagreement it was meant to fix. It returned
-            // 502 for a title whose translation was already bought and cached, wrote no backoff
-            // marker, and left `.status` reporting `idle` — so a client retried freely and every
-            // retry was another live search against the metered upstream. Serve what we already
-            // have, unaligned and revalidating, and start nothing.
-            Err(_) => {
-                // `.json` asked for a URL and must get one whatever happens here, or the app — which
-                // calls that form FIRST — is handed an SRT body where it expects JSON, fails to
-                // parse, and retries; and since this path writes no backoff marker, every retry is
-                // another live search.
-                if want_json {
-                    return translate_url_response(state, headers, config, season, id, extra, lang_seg);
-                }
-                return match state.cache.get(&body_key) {
-                    Some(body) => httputil::srt_provisional(body),
-                    None => httputil::text(StatusCode::BAD_GATEWAY, "translation failed"),
-                };
-            }
-        },
+        Some(h) => cached_search(state, &client, &imdb, season, episode, Some(h))
+            .await
+            .unwrap_or_default(),
         None => Vec::new(),
     };
     // Whether the SOURCE is hash-matched to this encode is a fact about the hashed list, and the
@@ -965,7 +958,19 @@ pub async fn handle_translate(
                         );
                     }
                     None => match produce_translation(state, &client, llm, source_id, &lang, &body_key, &job_key).await {
-                        Ok(body) => body,
+                        Ok(body) => {
+                            // Refresh the pin on the path that actually produced a translation. It is
+                            // written once when the choice is made and never on a plain request, so
+                            // without this its lifetime and its mtime both stay frozen at the first
+                            // translation — and then it expires, or the disk sweep's oldest-first
+                            // eviction takes it, while the body it points at is still valid. Losing
+                            // the pointer and keeping the body is the expensive direction: the next
+                            // request re-picks, gets a different body key, and re-buys a film that is
+                            // sitting in the cache. One blocking write per real translation, not per
+                            // request, which is what the per-request version cost.
+                            state.cache.put(pin_key.clone(), source_id.to_string(), SOURCE_PIN_TTL);
+                            body
+                        }
                         Err(e) => {
                             // Log the detail (no key in these strings); hand the client a generic
                             // message rather than echoing a raw upstream error body.
@@ -1126,12 +1131,20 @@ async fn produce_translation(
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
     // on it would re-pick the source, and re-buy every language of the film, because the viewer ran
     // out of downloads.
-    let raw = subtitle_srt(state, client, source_file_id)
-        .await
-        .map_err(TranslationFailure::Model)?;
+    let raw = subtitle_srt(state, client, source_file_id).await.map_err(|e| match e {
+        // The upload is gone, or what came back is not a subtitle. The pin naming it is wrong.
+        opensubtitles::DownloadError::Gone(m) => TranslationFailure::Source(m),
+        // Quota, rate limit, transport. The pin is innocent and must survive — classifying these as
+        // the source's fault would re-pick and re-buy every language of the film because the viewer
+        // ran out of downloads for the day.
+        opensubtitles::DownloadError::Unavailable(m) => TranslationFailure::Model(m),
+    })?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
-        // This one really is the file: it downloaded and holds no cues.
+        // Unreachable in practice — `download` gates on `has_a_cue`, and a differential test pins
+        // that gate to agree with `parse` in both directions. Kept because "it parsed to nothing"
+        // is a statement about the file either way, and the classification should not depend on
+        // which of two agreeing checks happened to run first.
         return Err(TranslationFailure::Source("source subtitle was empty".into()));
     }
     // The cache doubles as the batch store: a run that dies at cue 1100 of 1200 leaves the 1100
