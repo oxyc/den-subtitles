@@ -956,6 +956,17 @@ fn credential_refused_key(config: &str, llm: &LlmConfig) -> String {
     format!("{SYNCFAIL}llm:{:016x}:{}:{}", short_hash(config), llm.provider.tag(), llm.model)
 }
 
+/// Which title last hit an AMBIGUOUS refusal on this credential — a 400 or a 403 that might be the
+/// key and might be this film's dialogue tripping a content filter.
+///
+/// Two such refusals on two DIFFERENT titles is the thing that tells them apart: a content filter is
+/// a fact about one film, a dead key is not. Guessing per provider got it wrong twice in two rounds
+/// in both directions, so this measures it instead. One title alone never arms the install-wide
+/// block, so a filtered series cannot take the rest of the library down with it.
+fn ambiguous_refusal_key(config: &str, llm: &LlmConfig) -> String {
+    format!("{SYNCFAIL}llm-amb:{:016x}:{}:{}", short_hash(config), llm.provider.tag(), llm.model)
+}
+
 /// Is today's allowance already gone? A read, not a charge.
 ///
 /// Consulted before the source download so a refusal is free. Charging only after the download —
@@ -1303,7 +1314,20 @@ pub async fn handle_translate(
                             // filter, and blocking the install on that lets one series take every
                             // other title down with it, ten minutes at a time, as the viewer works
                             // through the episodes. The per-title marker below covers that case.
-                            if key_certain {
+                            // Certain: block the install at once. Ambiguous: block it only once a
+                            // SECOND title has refused the same way, which is what separates a dead
+                            // key from one film's dialogue upsetting a content filter.
+                            let block = key_certain || {
+                                let seen = ambiguous_refusal_key(config, llm);
+                                match state.cache.get_mem(&seen) {
+                                    Some(other) if other != imdb => true,
+                                    _ => {
+                                        state.cache.put_mem(seen, imdb.clone(), SYNC_RETRY_TTL);
+                                        false
+                                    }
+                                }
+                            };
+                            if block {
                                 state.cache.put_mem(
                                     credential_refused_key(config, llm),
                                     "1".into(),
@@ -1559,6 +1583,16 @@ async fn produce_translation(
             "subtitle too large: {} cues (max {})",
             cues.len(),
             translate::MAX_CUES
+        )));
+    }
+    // And the same question asked of the bytes, which is what the bill is made of. A cue count says
+    // nothing about how much text goes through the model, and everything else on this path bounds
+    // the download rather than the dialogue.
+    let dialogue: usize = cues.iter().map(|c| c.text.len()).sum();
+    if dialogue > translate::MAX_DIALOGUE_BYTES {
+        return Err(TranslationFailure::Model(format!(
+            "subtitle too large: {dialogue} bytes of dialogue (max {})",
+            translate::MAX_DIALOGUE_BYTES
         )));
     }
     // Charged HERE — the last point before the first token is spent, and after everything that can
@@ -2103,6 +2137,41 @@ mod translate_retry_tests {
         for i in 0..DAILY_TRANSLATIONS {
             assert!(charge_translation(&state, "install-one"), "the refund lost a slot at {i}");
         }
+    }
+
+    /// An ambiguous refusal blocks the install only once a SECOND title has hit it.
+    ///
+    /// A 400 or a 403 might be the key and might be one film's dialogue tripping a content filter.
+    /// Guessing per provider got that wrong twice in two rounds, in both directions — first blocking
+    /// the whole library on one filtered series, then letting a dead key spend a metered download per
+    /// title browsed. Two different titles refusing the same way is what actually distinguishes them.
+    #[test]
+    fn an_ambiguous_refusal_needs_two_titles_to_block_the_install() {
+        let state = state("ambiguous");
+        let llm = LlmConfig {
+            provider: userconfig::Provider::OpenRouter,
+            model: "m".into(),
+            api_key: "k".into(),
+        };
+        let seen = ambiguous_refusal_key("install-one", &llm);
+
+        // What the handler does on an ambiguous refusal, for a given title.
+        let refuse = |imdb: &str| match state.cache.get_mem(&seen) {
+            Some(other) if other != imdb => true,
+            _ => {
+                state.cache.put_mem(seen.clone(), imdb.to_string(), SYNC_RETRY_TTL);
+                false
+            }
+        };
+
+        assert!(!refuse("tt0111161"), "one title blocked the whole install");
+        // The same title again is still one film — a filtered series must not escalate by repeating.
+        assert!(!refuse("tt0111161"), "the same title twice blocked the install");
+        // A different one is the signal that this is the key, not the dialogue.
+        assert!(refuse("tt0068646"), "two distinct titles did not escalate");
+
+        // And the two markers are distinct namespaces, so neither can be read as the other.
+        assert_ne!(seen, credential_refused_key("install-one", &llm));
     }
 
     /// A failure belongs to the install that had it. The translated BODY is the same bytes whoever

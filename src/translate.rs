@@ -57,6 +57,18 @@ const LLM_TIMEOUT: Duration = Duration::from_secs(120);
 /// Ceiling on cues we'll translate for one title. A real film is ~1–3k cues; anything past this is a
 /// pathological/hostile SRT that would run unbounded (cost, wall-clock), so we refuse it.
 pub const MAX_CUES: usize = 6000;
+/// Ceiling on the DIALOGUE, which is what the bill is actually made of.
+///
+/// `MAX_CUES` counts cues and says nothing about their size, and nothing else on this path bounds
+/// bytes — `fetch::MAX_BODY` caps the download at 12 MiB, `srt::parse` caps nothing, and a batch is
+/// forty cues however large they are. So a source of 3000 cues at 4 KB each clears every gate and
+/// puts megabytes of text through the viewer's own key: millions of input tokens and a double-digit
+/// bill for one film, against pennies for a normal one. It does not take a hostile file — dual-
+/// language subs, ASS conversions that kept their inline styling, and transcript-style uploads all
+/// run to megabytes.
+///
+/// A normal film's dialogue is well under 100 KB, so this leaves an order of magnitude of headroom.
+pub const MAX_DIALOGUE_BYTES: usize = 1024 * 1024;
 /// Characters of dialogue the glossary pass is allowed to read. A film is well under this; the cue
 /// ceiling above allows something several times larger, and one call carrying all of it would cost
 /// more than the translation it is meant to improve.
@@ -513,7 +525,11 @@ fn is_credential_refusal(status: reqwest::StatusCode) -> bool {
 fn is_certainly_the_key(provider: Provider, status: reqwest::StatusCode) -> bool {
     match status.as_u16() {
         401 | 402 | 456 => true,
-        400 => provider == Provider::Anthropic,
+        // Anthropic reports an empty balance this way; Google reports an invalid API key this way
+        // (`INVALID_ARGUMENT` / `API_KEY_INVALID`) rather than with a 401. Between them that is the
+        // two commonest BYOK deaths there are. For the others a 400 is a request the model would not
+        // take, which is about this film.
+        400 => matches!(provider, Provider::Anthropic | Provider::Google),
         _ => false,
     }
 }
@@ -1531,8 +1547,11 @@ mod contract_tests {
         // the model would not take, which is about this film.
         let bad_request = StatusCode::from_u16(400).unwrap();
         assert!(is_credential_refusal(bad_request));
-        assert!(is_certainly_the_key(Provider::Anthropic, bad_request), "Anthropic's empty balance was read as per-title");
-        for p in [Provider::OpenAI, Provider::Google, Provider::Xai, Provider::OpenRouter, Provider::DeepL] {
+        // Anthropic: empty balance. Google: invalid API key, which it reports as 400 rather than 401.
+        for p in [Provider::Anthropic, Provider::Google] {
+            assert!(is_certainly_the_key(p, bad_request), "{p:?}'s dead key was read as per-title");
+        }
+        for p in [Provider::OpenAI, Provider::Xai, Provider::OpenRouter, Provider::DeepL] {
             assert!(!is_certainly_the_key(p, bad_request), "{p:?} 400 blocked the whole install");
         }
 
