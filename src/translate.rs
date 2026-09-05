@@ -31,7 +31,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -201,12 +201,20 @@ fn dead_count(translated: &[String], sources: &[String]) -> usize {
 
 /// Translate every cue's text into `target_lang` (a display name like "English"), preserving each
 /// cue's index/timing. Returns the same cues with translated `text`, or an error string.
+/// `billed` is the caller's copy of the one measurement it cannot get from the return value: whether
+/// this run has had a provider call answered. It is written as the run goes, so it is still readable
+/// after the future is DROPPED — which is the case it exists for. A client that hangs up mid-run
+/// returns no `Err`, so the caller's error handling never runs, and the allowance slot it charged was
+/// neither refunded nor spent on anything the retry can use. Reading this on drop lets the caller
+/// apply the same rule it applies to a failure — give the slot back only if nothing was paid for —
+/// instead of guessing in one direction or the other.
 pub async fn translate(
     client: &reqwest::Client,
     llm: &LlmConfig,
     cues: &[Cue],
     target_lang: &str,
     store: &dyn BatchStore,
+    billed: &AtomicBool,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<Cue>, TranslateError> {
     if cues.is_empty() {
@@ -219,7 +227,15 @@ pub async fn translate(
         store,
         prefix: format!("{}:{}:{}", llm.provider.tag(), llm.model, canonical_lang(target_lang)),
     };
-    run_translation(&Upstream { client, llm, target_lang }, cues, RUN_DEADLINE, Some(&resume), progress).await
+    run_translation(
+        &Upstream { client, llm, target_lang },
+        cues,
+        RUN_DEADLINE,
+        Some(&resume),
+        billed,
+        progress,
+    )
+    .await
 }
 
 /// The harness proper, over any upstream. Split from `translate` so the same-length contract and the
@@ -229,6 +245,7 @@ async fn run_translation(
     cues: &[Cue],
     deadline: Duration,
     resume: Option<&Resume<'_>>,
+    billed: &AtomicBool,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<Vec<Cue>, TranslateError> {
     // Rolling context: the tail of already-translated pairs, refreshed as batches land. Shared
@@ -239,8 +256,10 @@ async fn run_translation(
     // A wrong-length reply degrades to keeping the source text, which is right for one stray cue and
     // wrong for a film: a consistently misbehaving model hits that leaf for every cue and returns the
     // untranslated original, which then caches for 60 days as a successful translation.
+    // `billed` is the caller's, not ours, so it survives this future being dropped mid-run — see
+    // `translate`. Everything else here dies with the run and is owned.
     let budget = Budget {
-        billed: std::sync::atomic::AtomicBool::new(false),
+        billed,
         untranslated: AtomicUsize::new(0),
         started: tokio::time::Instant::now(),
         deadline,
@@ -366,7 +385,7 @@ async fn one_batch<'c>(
     batch: &'c [Cue],
     glossary: &[(String, String)],
     context: &Mutex<Vec<(String, String)>>,
-    budget: &Budget,
+    budget: &Budget<'_>,
     resume: Option<&Resume<'_>>,
 ) -> Result<(&'c [Cue], Vec<String>), TranslateError> {
     let sources: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
@@ -436,13 +455,17 @@ fn unusable(kept: usize, seen: usize) -> bool {
 /// its own shape. A counter on top of that could only ever fire below the structural maximum, and
 /// sized below it, it becomes a stricter quality gate than the quality gate. Time is the bound that
 /// is actually reachable, so time is the bound that is kept.
-struct Budget {
-    /// Has any call come back successfully — i.e. has the viewer's key actually been billed?
+struct Budget<'b> {
+    /// Has any call come back — i.e. has the viewer's key actually been billed?
     ///
     /// Not inferable from the assembled output: batches run CONCURRENCY-wide and surface in order, so
     /// a refusal on the first one leaves the output empty while three others were sent and paid for.
     /// The glossary is billed before any batch and never appears there at all.
-    billed: std::sync::atomic::AtomicBool,
+    ///
+    /// BORROWED from the caller rather than owned here, so the answer outlives the run. A cancelled
+    /// request drops this whole future without producing an `Err`, and the caller still has an
+    /// allowance slot charged that it must decide about — see `translate`.
+    billed: &'b AtomicBool,
     untranslated: AtomicUsize,
     /// Tokio's clock rather than `std`'s. Unpaused the two are the same thing, but the deadline is
     /// now the only bound on a run that concurrency made faster than the wall clock it was tuned
@@ -452,7 +475,7 @@ struct Budget {
     deadline: Duration,
 }
 
-impl Budget {
+impl Budget<'_> {
     fn spent(&self) -> bool {
         self.started.elapsed() > self.deadline
     }
@@ -763,7 +786,7 @@ async fn translate_batch(
     upstream: &(dyn BatchCall + Sync),
     sources: &[String],
     context: &[(String, String)],
-    budget: &Budget,
+    budget: &Budget<'_>,
     resume: Option<&Resume<'_>>,
 ) -> Result<Vec<String>, TranslateError> {
     if sources.is_empty() {
@@ -885,7 +908,7 @@ async fn call_with_retries(
     upstream: &(dyn BatchCall + Sync),
     sources: &[String],
     context: &[(String, String)],
-    budget: &Budget,
+    budget: &Budget<'_>,
 ) -> Result<Vec<String>, CallError> {
     /// Attempts in total. Three is enough for a rate limiter's window to open; more would just
     /// spend the run's deadline waiting.
@@ -1761,14 +1784,14 @@ mod contract_tests {
             }
             Ok(src.iter().map(|s| format!("SV {s}")).collect())
         });
-        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume), &no_progress).await;
+        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume), &AtomicBool::new(false), &no_progress).await;
         assert!(first.is_err(), "the run should have failed on the third batch");
         assert_eq!(*up.calls.lock().unwrap(), 3, "two good batches and the refusal");
         assert_eq!(store.len(), 2, "the two paid batches should have been remembered");
 
         // Second attempt, provider healthy. Only the batch that failed may reach it.
         let up2 = fake(|src: &[String]| Ok(src.iter().map(|s| format!("SV {s}")).collect()));
-        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume), &no_progress)
+        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume), &AtomicBool::new(false), &no_progress)
             .await
             .expect("the retry should finish");
         assert_eq!(*up2.calls.lock().unwrap(), 1, "the retry re-bought batches it already had");
@@ -1792,7 +1815,7 @@ mod contract_tests {
         // a single cue still gets three back — so every leaf is a wrong-length reply and keeps its
         // source. (One line back would have MATCHED a split-to-one batch and translated it.)
         let up = fake(|_: &[String]| Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
-        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume), &no_progress).await;
+        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume), &AtomicBool::new(false), &no_progress).await;
         assert!(out.is_err(), "a film that translated nothing is not a translation");
         assert_eq!(store.len(), 0, "a kept-source leaf was remembered as if it were a translation");
     }
@@ -1807,27 +1830,44 @@ mod contract_tests {
         // Echoes the source back: right length, no translation. Trips the ratio gate.
         let echo = |src: &[String]| Ok(src.to_vec());
 
-        let fresh = run_translation(&fake(echo), &film, Duration::from_secs(600), None, &no_progress).await;
+        let billed = AtomicBool::new(false);
+        let fresh =
+            run_translation(&fake(echo), &film, Duration::from_secs(600), None, &billed, &no_progress).await;
         assert!(fresh.is_err(), "an echo is not a translation");
 
         // Same film, same echo, but with everything served from the store the second time.
         let store = MemStore::default();
         let resume = Resume { store: &store, prefix: "p".into() };
-        let _ = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume), &no_progress).await;
-        let replayed = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume), &no_progress).await;
+        let first = AtomicBool::new(false);
+        let _ = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume), &first, &no_progress)
+            .await;
+        // A run served entirely from the store bills nothing, which is what makes the caller's
+        // refund honest — and is the case that used to be the only one answering `spent` correctly.
+        let replay_billed = AtomicBool::new(false);
+        let replayed = run_translation(
+            &fake(echo),
+            &film,
+            Duration::from_secs(600),
+            Some(&resume),
+            &replay_billed,
+            &no_progress,
+        )
+        .await;
         assert!(replayed.is_err(), "a replayed echo passed the gate a fresh one failed");
+        assert!(!replay_billed.load(Ordering::Relaxed), "a fully resumed run reported spend");
     }
 
     /// The harness with a deadline long enough never to be the thing under test, and no batch store
     /// — these cases are about what the model does, so nothing may be answered from a previous run.
     async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, TranslateError> {
-        run_translation(up, cues, Duration::from_secs(600), None, &no_progress).await
+        run_translation(up, cues, Duration::from_secs(600), None, &AtomicBool::new(false), &no_progress).await
     }
 
     async fn run(upstream: &(dyn BatchCall + Sync), n: usize) -> Result<Vec<String>, TranslateError> {
         let src: Vec<String> = cues(n).iter().map(|c| c.text.clone()).collect();
+        let billed = AtomicBool::new(false);
         let budget = Budget {
-            billed: std::sync::atomic::AtomicBool::new(false),
+            billed: &billed,
             untranslated: AtomicUsize::new(0),
             started: tokio::time::Instant::now(),
             deadline: Duration::from_secs(600),
@@ -1986,7 +2026,7 @@ mod contract_tests {
         }
         // 400 cues is 10 batches at 20ms each; the deadline expires partway, far under the budget.
         let up = Slow(Mutex::new(0));
-        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None, &no_progress).await;
+        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None, &AtomicBool::new(false), &no_progress).await;
         // It stops CALLING — that is the deadline's whole job. One 40-cue batch splits into up to
         // 79 calls, so a deadline checked only between batches would let all of them run first.
         assert!(*up.0.lock().unwrap() < 20, "it kept calling past the deadline");
@@ -2126,7 +2166,7 @@ mod contract_tests {
         // was never sent is not evidence about translation quality.
         let groups = 5;
         let deadline = Duration::from_millis(20 * groups);
-        let out = run_translation(&up, &cues(2000), deadline, None, &no_progress).await;
+        let out = run_translation(&up, &cues(2000), deadline, None, &AtomicBool::new(false), &no_progress).await;
 
         let called = *up.0.lock().unwrap();
         // Groups that fit inside the deadline, plus one: `spent()` is strictly-greater, so the group
@@ -2509,7 +2549,7 @@ mod contract_tests {
                 retry: Some(Duration::from_secs(3600)), fatal: false, key_certain: false,
             })
         });
-        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &no_progress).await;
+        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &AtomicBool::new(false), &no_progress).await;
         assert!(out.is_err());
         assert_eq!(*up.calls.lock().unwrap(), 1, "an hour-long backoff was taken inside a ten-minute run");
     }

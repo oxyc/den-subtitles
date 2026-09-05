@@ -1020,6 +1020,30 @@ fn quota_key(config: &str, now: std::time::SystemTime) -> String {
     format!("quota:{}:{day}", short_hash(config))
 }
 
+/// Holds a charged allowance slot until the run it paid for finishes on its own terms.
+///
+/// It exists for the one ending that produces no `Err` to inspect: the client hanging up mid-run,
+/// which drops the whole future. Disarmed as soon as the run returns, so on every ordinary path the
+/// explicit decision at the call site is the only one made.
+struct ChargeGuard<'a> {
+    state: &'a Arc<AppState>,
+    config: &'a str,
+    billed: &'a std::sync::atomic::AtomicBool,
+    source_was_cached: bool,
+    armed: bool,
+}
+
+impl Drop for ChargeGuard<'_> {
+    fn drop(&mut self) {
+        // The same two conditions the failure path applies — no tokens, no metered credit — because
+        // the question is the same one and it has a measured answer even here.
+        let billed = self.billed.load(Ordering::Relaxed);
+        if self.armed && !billed && self.source_was_cached {
+            refund_translation(self.state, self.config);
+        }
+    }
+}
+
 /// Give a slot back, for a run that was charged and then spent nothing at all.
 ///
 /// "Nothing at all" is both resources, not just the model: a request that bought a metered
@@ -1855,6 +1879,21 @@ async fn produce_translation(
     if !charge_translation(state, config) {
         return Err(TranslationFailure::Allowance);
     }
+    // Declared BEFORE the guard below, so it is still alive when the guard's `drop` reads it: locals
+    // drop in reverse declaration order.
+    let billed = std::sync::atomic::AtomicBool::new(false);
+    // The charge, made refundable however this frame ends — including the way that produces no
+    // `Err` at all. A client that hangs up mid-run drops this future, so `map_err` below never runs
+    // and the slot it charged was neither refunded nor spent on anything a retry can use. The retry
+    // then charged a second slot, and with a client timeout shorter than a run (up to RUN_DEADLINE)
+    // a handful of films emptied the day — the same self-inflicted lockout the comment above
+    // describes, reached by a different road.
+    //
+    // The guard applies the same rule as the failure path rather than a guess in either direction:
+    // give the slot back only if nothing was paid for. Refunding unconditionally would let a client
+    // that cancels just before the first batch lands bill the glossary and four batches per attempt
+    // forever without ever consuming allowance.
+    let mut slot = ChargeGuard { state, config, billed: &billed, source_was_cached, armed: true };
     // The cache doubles as the batch store: a run that dies at cue 1100 of 1200 leaves the 1100
     // behind, so the retry the viewer is about to make re-buys only what actually failed.
     //
@@ -1862,10 +1901,13 @@ async fn produce_translation(
     // poll from the request alone — deriving the body key needs a search, and a poll happens every
     // second while the expensive thing runs.
     let reporter = state.progress.start(job_key, cues.len());
-    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache, &|done, total| {
+    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache, &billed, &|done, total| {
         reporter.set(done, total);
     })
     .await;
+    // Past the await, so this frame is going to finish on its own terms: every path from here either
+    // returns the body or classifies the failure, and both decide the refund explicitly below.
+    slot.armed = false;
     // Dropped however this ends — returned, failed, or the request cancelled out from under us
     // mid-run. That third case is the one a matching `clear` call could not cover, and it is the one
     // that leaves `.status` insisting a dead run is still working.
@@ -2408,6 +2450,83 @@ mod translate_retry_tests {
         assert_ne!(quota_key(&one, now), quota_key(&one, yesterday));
         // The hash is of the config, so the secret itself never lands in a filename.
         assert!(!quota_key(&one, now).contains(&one));
+    }
+
+    /// A run the client hangs up on must not keep the slot it charged.
+    ///
+    /// It is the one ending that produces no `Err` to inspect — the future is simply dropped — so
+    /// the explicit refund at the call site never runs. The retry then charged a second slot, and a
+    /// client timeout shorter than a run (up to RUN_DEADLINE, ten minutes) turned a handful of films
+    /// into an empty day. But only when nothing was billed: a cancelled run that had already paid
+    /// for batches keeps the slot, or a client cancelling just before the first batch lands could
+    /// bill the glossary and four batches per attempt forever without ever consuming allowance.
+    #[test]
+    fn a_cancelled_run_gives_its_slot_back_only_if_it_bought_nothing() {
+        let state = state("cancel");
+        let config = config_segment();
+        let used = |s: &Arc<AppState>| -> u64 {
+            s.cache
+                .get(&quota_key(&config, std::time::SystemTime::now()))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        };
+
+        // Cancelled having called nothing: the slot comes back.
+        assert!(charge_translation(&state, &config));
+        assert_eq!(used(&state), 1);
+        {
+            let billed = std::sync::atomic::AtomicBool::new(false);
+            let _slot = ChargeGuard {
+                state: &state,
+                config: &config,
+                billed: &billed,
+                source_was_cached: true,
+                armed: true,
+            };
+        }
+        assert_eq!(used(&state), 0, "a run that bought nothing kept its slot");
+
+        // Cancelled after a batch was billed: it keeps it, exactly as the failure path would.
+        assert!(charge_translation(&state, &config));
+        {
+            let billed = std::sync::atomic::AtomicBool::new(true);
+            let _slot = ChargeGuard {
+                state: &state,
+                config: &config,
+                billed: &billed,
+                source_was_cached: true,
+                armed: true,
+            };
+        }
+        assert_eq!(used(&state), 1, "a cancelled run refunded work it had paid for");
+
+        // And a request that spent a metered download keeps it too — the second condition, which is
+        // what stops an unbounded number of distinct titles each burning a credit for free.
+        assert!(charge_translation(&state, &config));
+        {
+            let billed = std::sync::atomic::AtomicBool::new(false);
+            let _slot = ChargeGuard {
+                state: &state,
+                config: &config,
+                billed: &billed,
+                source_was_cached: false,
+                armed: true,
+            };
+        }
+        assert_eq!(used(&state), 2, "a cancelled run refunded a metered download");
+
+        // Disarmed, the guard does nothing: every ordinary ending decides for itself.
+        {
+            let billed = std::sync::atomic::AtomicBool::new(false);
+            let _slot = ChargeGuard {
+                state: &state,
+                config: &config,
+                billed: &billed,
+                source_was_cached: true,
+                armed: false,
+            };
+        }
+        assert_eq!(used(&state), 2, "a disarmed guard refunded anyway");
     }
 
     /// A refused credential is a fact about the install, and has to be remembered as one.
