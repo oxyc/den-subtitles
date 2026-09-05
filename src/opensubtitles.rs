@@ -139,11 +139,7 @@ impl<'a> Client<'a> {
         // silently shows nothing forever.
         if !resp.status().is_success() {
             let code = resp.status();
-            // Unavailable whatever the status, unlike the API call above. This is a one-shot
-            // capability URL, and the comment above says what a 404 here usually means: the link
-            // expired, or it was rate-limited. That is the service, not the file — and `Gone`
-            // mutates state shared by every install, so it is reserved for the API's own verdict.
-            return Err(DownloadError::Unavailable(format!("subtitle link {code}")));
+            return Err(DownloadError::from_status(code, format!("subtitle link {code}")));
         }
         let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY)
             .await
@@ -151,12 +147,16 @@ impl<'a> Client<'a> {
         // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
         // enough. Anything with no cue in it cannot be one.
         //
-        // `Unavailable`, deliberately, despite this looking like a fact about the file: the comment
-        // above is the reason. An interstitial or an error page served as a 200 is the far more
-        // common cause than a genuinely cue-less upload, and `Gone` drops a pin shared by every
-        // install and every language. The API's 404 is the signal for a file that is really gone.
+        // `Gone`, because whatever the cause, asking again immediately will not fix it — and the
+        // credit is already spent by the time we get here, so remembering this for a day rather than
+        // ten minutes is the difference between one wasted credit and a hundred and forty.
+        //
+        // It might still be a transient interstitial rather than a bad upload, and `Gone` is what
+        // can drop a pin shared by every install. That is safe because the drop needs a REMEMBERED
+        // failure — a marker left by an earlier request — so a single blip records and refuses, and
+        // only a file that is still failing on the next attempt loses the pin.
         if !crate::srt::has_a_cue(&body) {
-            return Err(DownloadError::Unavailable("subtitle link returned no cues".to_string()));
+            return Err(DownloadError::Gone("subtitle link returned no cues".to_string()));
         }
         Ok(body)
     }
@@ -455,17 +455,16 @@ mod download_tests {
     /// downloads for the day.
     #[tokio::test]
     async fn a_download_error_says_whose_fault_it_is() {
-        // Only one signal names the file: the API's own 404/410 for that id. Everything the CDN
-        // says is about the service — `Gone` drops state shared by every install and language, so it
-        // is deliberately the narrow, authoritative case.
+        // A 404 and a cue-less body are both "asking again now will not help": remembered for a day
+        // rather than ten minutes, which is the difference between one wasted credit and a hundred
+        // and forty, since the credit is spent on the API call before either is discovered. Whether
+        // that also drops the shared source pin is decided elsewhere, and needs the failure to have
+        // been seen on an EARLIER request — so a single blip cannot unpin anything.
         let err = download_from("404 Not Found", "gone").await.expect_err("404 must fail");
-        assert!(matches!(err, DownloadError::Unavailable(_)),
-            "the CDN's 404 means an expired link, not a missing file: {err:?}");
+        assert!(matches!(err, DownloadError::Gone(_)), "a 404 is not worth retrying now: {err:?}");
 
-        // A body that arrives as a 200 and is not a subtitle is an interstitial far more often than
-        // a genuinely cue-less upload.
         let err = download_from("200 OK", "<html>not a subtitle</html>").await.expect_err("must fail");
-        assert!(matches!(err, DownloadError::Unavailable(_)), "a cue-less 200 dropped the pin: {err:?}");
+        assert!(matches!(err, DownloadError::Gone(_)), "a cue-less 200 is not worth retrying now: {err:?}");
 
         // Quota, rate limit and server trouble are the service's, and a file id must survive them.
         for status in ["406 Not Acceptable", "429 Too Many Requests", "503 Service Unavailable", "403 Forbidden"] {

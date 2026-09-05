@@ -179,6 +179,13 @@ impl Cache {
     /// all this needs. Anything unreadable sorts first: a file this cache cannot name is a file it
     /// cannot serve.
     fn evict_rank(path: &std::path::Path) -> u8 {
+        // A scratch file goes first, whatever key it was named after. Only an UNDATABLE temp reaches
+        // the budget at all (see the sweep), and it is a half-written file of unknown provenance —
+        // decoding its name would hand it the rank of the real entry it was becoming, so a temp
+        // named after a translation would be kept while live entries that cost credits were evicted.
+        if path.extension().is_some_and(|e| e.to_string_lossy().starts_with('t')) {
+            return 0;
+        }
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return 0 };
         let head = name.split('~').next().unwrap_or(name);
         let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(head) else { return 0 };
