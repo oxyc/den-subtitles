@@ -138,8 +138,10 @@ impl<'a> Client<'a> {
         // the file id for 60 days and served `immutable`. One transient blip, one track that
         // silently shows nothing forever.
         if !resp.status().is_success() {
+            // `Suspect`, not `from_status`: a 404 here is an expired one-shot capability URL far
+            // more often than a missing file, and only the API's verdict is trusted to unpin.
             let code = resp.status();
-            return Err(DownloadError::from_status(code, format!("subtitle link {code}")));
+            return Err(DownloadError::Suspect(format!("subtitle link {code}")));
         }
         let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY)
             .await
@@ -147,16 +149,11 @@ impl<'a> Client<'a> {
         // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
         // enough. Anything with no cue in it cannot be one.
         //
-        // `Gone`, because whatever the cause, asking again immediately will not fix it — and the
-        // credit is already spent by the time we get here, so remembering this for a day rather than
-        // ten minutes is the difference between one wasted credit and a hundred and forty.
-        //
-        // It might still be a transient interstitial rather than a bad upload, and `Gone` is what
-        // can drop a pin shared by every install. That is safe because the drop needs a REMEMBERED
-        // failure — a marker left by an earlier request — so a single blip records and refuses, and
-        // only a file that is still failing on the next attempt loses the pin.
+        // `Suspect`: an interstitial served as a 200 and a genuinely cue-less upload look identical
+        // from here. The credit is already spent, so it is worth remembering either way — but not
+        // worth unpinning on, which is what the caller does with a repeat.
         if !crate::srt::has_a_cue(&body) {
-            return Err(DownloadError::Gone("subtitle link returned no cues".to_string()));
+            return Err(DownloadError::Suspect("subtitle link returned no cues".to_string()));
         }
         Ok(body)
     }
@@ -170,18 +167,24 @@ impl<'a> Client<'a> {
 /// source, re-buys every language of the film.
 #[derive(Debug)]
 pub enum DownloadError {
-    /// The file is the problem: deleted, or not a subtitle. Retrying it will not help.
+    /// The API says this id does not exist. Authoritative, true for everyone, and the only verdict
+    /// trusted to drop a source pin shared by every install.
     Gone(String),
-    /// Everything else — quota, rate limit, transport, a CDN having a moment.
+    /// The API handed us a link and what came back was not a subtitle — a CDN 404 on the one-shot
+    /// URL, or an interstitial served as a 200. Usually transient, occasionally a bad upload, and
+    /// not distinguishable from here. Retrying immediately will not help either way, so it is
+    /// remembered; but a single one of these must not unpin anything.
+    Suspect(String),
+    /// Quota, rate limit, a revoked key, transport. About one credential, not about the file.
     Unavailable(String),
 }
 
 impl DownloadError {
-    /// 404 and 410 from the API name the file. Everything else — 401/403 (key), 406/429 (quota),
-    /// 5xx — is the service, and a file id must survive all of them.
+    /// The API's own verdict on the id: 404 and 410 name the file. Everything else — 401/403 (key),
+    /// 406/429 (quota), 5xx — is the service, and a file id must survive all of them.
     ///
-    /// Used at the API call only. The CDN link that follows it classifies everything as
-    /// `Unavailable`: a 404 there means an expired one-shot URL, not a missing file.
+    /// Only for the API call. A 404 on the CDN link that follows means an expired one-shot URL, not
+    /// a missing file, so that site reports `Suspect`.
     fn from_status(status: reqwest::StatusCode, message: String) -> DownloadError {
         match status.as_u16() {
             404 | 410 => DownloadError::Gone(message),
@@ -191,7 +194,7 @@ impl DownloadError {
 
     pub fn message(self) -> String {
         match self {
-            DownloadError::Gone(m) | DownloadError::Unavailable(m) => m,
+            DownloadError::Gone(m) | DownloadError::Suspect(m) | DownloadError::Unavailable(m) => m,
         }
     }
 }
@@ -455,35 +458,44 @@ mod download_tests {
     /// downloads for the day.
     #[tokio::test]
     async fn a_download_error_says_whose_fault_it_is() {
-        // A 404 and a cue-less body are both "asking again now will not help": remembered for a day
-        // rather than ten minutes, which is the difference between one wasted credit and a hundred
-        // and forty, since the credit is spent on the API call before either is discovered. Whether
-        // that also drops the shared source pin is decided elsewhere, and needs the failure to have
-        // been seen on an EARLIER request — so a single blip cannot unpin anything.
+        // The CDN's verdicts are SUSPECT, never `Gone`. A 404 on a one-shot link means it expired,
+        // and a cue-less 200 is usually an interstitial — both clear on their own, and only `Gone`
+        // is allowed to drop the source pin shared by every install and language. A repeat promotes
+        // them; one does not.
         let err = download_from("404 Not Found", "gone").await.expect_err("404 must fail");
-        assert!(matches!(err, DownloadError::Gone(_)), "a 404 is not worth retrying now: {err:?}");
+        assert!(matches!(err, DownloadError::Suspect(_)), "an expired link unpinned the source: {err:?}");
 
         let err = download_from("200 OK", "<html>not a subtitle</html>").await.expect_err("must fail");
-        assert!(matches!(err, DownloadError::Gone(_)), "a cue-less 200 is not worth retrying now: {err:?}");
+        assert!(matches!(err, DownloadError::Suspect(_)), "an interstitial unpinned the source: {err:?}");
 
-        // Quota, rate limit and server trouble are the service's, and a file id must survive them.
+        // Every other CDN status is the same kind of fact — the link did not work — and none of them
+        // may unpin either. `download_from` drives the CDN leg only; the fake API always answers.
         for status in ["406 Not Acceptable", "429 Too Many Requests", "503 Service Unavailable", "403 Forbidden"] {
             let err = download_from(status, "nope").await.expect_err("must fail");
-            assert!(
-                matches!(err, DownloadError::Unavailable(_)),
-                "{status} was blamed on the file: {err:?}"
-            );
+            assert!(matches!(err, DownloadError::Suspect(_)), "{status} from the CDN: {err:?}");
         }
 
-        // And the API's verdict on the id itself is the one thing that does name the file.
+        // The API's own verdict on the id is the one signal that names the FILE, and the only one
+        // trusted to drop a shared pin. Everything else it can say is about the credential.
         assert!(matches!(
             DownloadError::from_status(reqwest::StatusCode::NOT_FOUND, "opensubtitles download 404".into()),
             DownloadError::Gone(_)
         ));
         assert!(matches!(
-            DownloadError::from_status(reqwest::StatusCode::TOO_MANY_REQUESTS, "opensubtitles download 429".into()),
-            DownloadError::Unavailable(_)
+            DownloadError::from_status(reqwest::StatusCode::GONE, "opensubtitles download 410".into()),
+            DownloadError::Gone(_)
         ));
+        for code in [
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::NOT_ACCEPTABLE,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                matches!(DownloadError::from_status(code, "x".into()), DownloadError::Unavailable(_)),
+                "the API's {code} was blamed on the file"
+            );
+        }
     }
 
     /// The API call was status-checked and the CDN fetch that follows it was not, so an expired or

@@ -566,9 +566,7 @@ async fn subtitle_srt(
     // credit and made no progress, for as long as anything kept asking. The picker hands back a URL
     // per subtitle and re-ranks the same dead track every playback, so a handful of clicks emptied
     // the day's allowance and then broke every other download with it.
-    let gone_key = dead_file_key(file_id);
-    let unavailable_key = unavailable_file_key(client, file_id);
-    if let Some(e) = remembered_failure(state, &gone_key, &unavailable_key, file_id) {
+    if let Some(e) = remembered_failure(state, client, file_id) {
         return Err(e);
     }
     let _flight = state.inflight.acquire(&key).await;
@@ -580,25 +578,13 @@ async fn subtitle_srt(
     // twenty call this for the SAME reference — they clear the check above together, queue on
     // `os:R`, and then every one of them re-issues the download on release. Twenty metered credits
     // out of a daily handful, for a file already known to be failing.
-    if let Some(e) = remembered_failure(state, &gone_key, &unavailable_key, file_id) {
+    if let Some(e) = remembered_failure(state, client, file_id) {
         return Err(e);
     }
     let body = match client.download(file_id).await {
         Ok(body) => body,
         Err(e) => {
-            // How long, and whose business it is. `Gone` is the API's verdict on the id: true for
-            // everyone, remembered for a day. `Unavailable` is quota, a revoked key or a blip —
-            // facts about ONE install's credential, so it is remembered per credential. Shared, one
-            // install exhausting its free-tier allowance would have denied the file to every other
-            // install, including for alignment and translation, since this is the only download path.
-            match &e {
-                opensubtitles::DownloadError::Gone(_) => {
-                    state.cache.put(gone_key, "1".into(), DEAD_FILE_TTL)
-                }
-                opensubtitles::DownloadError::Unavailable(_) => {
-                    state.cache.put_mem(unavailable_key, "1".into(), SYNC_RETRY_TTL)
-                }
-            }
+            remember_failure(state, client, file_id, &e);
             return Err(e);
         }
     };
@@ -677,11 +663,17 @@ fn source_pin_key(imdb: &str, season: Option<i64>, episode: Option<i64>) -> Stri
     format!("source:{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0))
 }
 
-/// "The API says this file id does not exist." A fact about the file, so it is shared by every
-/// install — and its own namespace inside `syncfail:`, since `sync_and_cache`'s retry marker is
-/// `syncfail:{cache_key}` and for a request that asked for no sync that key IS `os:{id}`.
+/// "This file will not download." A fact about the file, so shared by every install — and its own
+/// namespace inside `syncfail:`, since `sync_and_cache`'s retry marker is `syncfail:{cache_key}` and
+/// for a request that asked for no sync that key IS `os:{id}`.
 fn dead_file_key(file_id: i64) -> String {
     format!("{SYNCFAIL}dl:gone:{}", os_base_key(file_id))
+}
+
+/// "The link for this file failed once." One strike, shared, short-lived. A second strike inside its
+/// lifetime promotes to `dead_file_key`.
+fn suspect_file_key(file_id: i64) -> String {
+    format!("{SYNCFAIL}dl:suspect:{}", os_base_key(file_id))
 }
 
 /// "This credential could not fetch this file just now." Quota, a revoked key, a blip — facts about
@@ -695,20 +687,53 @@ fn unavailable_file_key(client: &opensubtitles::Client<'_>, file_id: i64) -> Str
 /// a metered credit finding that out again.
 fn remembered_failure(
     state: &Arc<AppState>,
-    gone_key: &str,
-    unavailable_key: &str,
+    client: &opensubtitles::Client<'_>,
     file_id: i64,
 ) -> Option<opensubtitles::DownloadError> {
-    if state.cache.get(gone_key).is_some() {
+    if state.cache.get(&dead_file_key(file_id)).is_some() {
         return Some(opensubtitles::DownloadError::Gone(format!("file {file_id} is gone (remembered)")));
     }
-    // `get_mem` to match its `put_mem`: this one is short-lived and not worth a disk probe per miss.
-    if state.cache.get_mem(unavailable_key).is_some() {
+    // `get_mem` for the two short-lived ones, to match their `put_mem` — going through `get` would
+    // probe a disk tier nothing writes them to.
+    if state.cache.get_mem(&suspect_file_key(file_id)).is_some() {
+        return Some(opensubtitles::DownloadError::Suspect(format!(
+            "file {file_id} would not download (remembered)"
+        )));
+    }
+    if state.cache.get_mem(&unavailable_file_key(client, file_id)).is_some() {
         return Some(opensubtitles::DownloadError::Unavailable(format!(
             "file {file_id} unavailable (remembered)"
         )));
     }
     None
+}
+
+/// Remember a download failure so the next request does not spend a credit rediscovering it.
+///
+/// A `Suspect` escalates on repeat: the first one is a short shared strike, and a second inside that
+/// window promotes to the day-long `Gone` marker. That is what separates a CDN interstitial — which
+/// clears on its own and must not touch the shared source pin — from an upload that really is junk,
+/// which would otherwise be re-fetched every ten minutes for a metered credit each time.
+fn remember_failure(
+    state: &Arc<AppState>,
+    client: &opensubtitles::Client<'_>,
+    file_id: i64,
+    e: &opensubtitles::DownloadError,
+) {
+    use opensubtitles::DownloadError::*;
+    match e {
+        Gone(_) => state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL),
+        Suspect(_) => {
+            let strike = suspect_file_key(file_id);
+            match state.cache.get_mem(&strike).is_some() {
+                true => state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL),
+                false => state.cache.put_mem(strike, "1".into(), SYNC_RETRY_TTL),
+            }
+        }
+        Unavailable(_) => {
+            state.cache.put_mem(unavailable_file_key(client, file_id), "1".into(), SYNC_RETRY_TTL)
+        }
+    }
 }
 
 /// The `ref` a request may actually use. `tier1_ref_for` refuses a self-reference when it BUILDS a
@@ -975,29 +1000,6 @@ pub async fn handle_translate(
             source.file_id
         }
     };
-    // A pinned source already known to be failing must not cost an allowance slot to rediscover
-    // that, and one the API has called GONE must not stay pinned.
-    //
-    // Narrowing `Gone` to the API's own verdict left the pin with no trigger that fires across
-    // requests: the download failure was classified `Model`, the pin survived, the ten-minute marker
-    // lapsed, and the same dead source was tried again — for the pin's whole 180-day life, charging
-    // one of the fifty daily translations each time for a run that could never start. Read here,
-    // where the marker from the previous attempt is visible, it becomes a trigger again.
-    // The drop needs a REMEMBERED failure, which is what makes it safe to act on a verdict that may
-    // have been a transient: a first failure only records a marker and refuses, and the pin goes
-    // only if the source is still failing when the next request arrives.
-    if let Some(e) = remembered_failure(
-        state,
-        &dead_file_key(source_id),
-        &unavailable_file_key(&client, source_id),
-        source_id,
-    ) {
-        if matches!(e, opensubtitles::DownloadError::Gone(_)) {
-            eprintln!("translate: unpinning {imdb} — source {source_id} still will not download");
-            state.cache.remove(&pin_key);
-        }
-        return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
-    }
     let body_key = translate_body_key(source_id, &lang_key, llm);
 
     // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
@@ -1087,6 +1089,27 @@ pub async fn handle_translate(
                 match state.cache.get(&body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
                     Some(body) => body,
+                    // A source already known to be failing must not cost an allowance slot to
+                    // rediscover that, and one confirmed dead must not stay pinned — otherwise the
+                    // ten-minute marker lapses, the same source is tried again, and the title burns
+                    // one of the fifty daily translations per attempt for the pin's 180-day life.
+                    //
+                    // Every cache read comes first, including the post-flight one just above.
+                    // Checked any earlier, this refused translations that were already bought and
+                    // sitting in the cache — serving one never touches the source file, only the
+                    // anchor — and dropped the pin protecting that body while it stayed cached,
+                    // which is the expensive direction.
+                    None if remembered_failure(state, &client, source_id).is_some() => {
+                        // `Gone` here means the API named the id, or a repeat confirmed it. A single
+                        // `Suspect` never reaches this arm as `Gone`, so a transient cannot unpin.
+                        if let Some(opensubtitles::DownloadError::Gone(_)) =
+                            remembered_failure(state, &client, source_id)
+                        {
+                            eprintln!("translate: unpinning {imdb} — source {source_id} will not download");
+                            state.cache.remove(&pin_key);
+                        }
+                        return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
+                    }
                     // Charged here and nowhere else: this is the one path that starts a run, and it
                     // is already behind the cache check and the single-flight guard, so nothing that
                     // merely waited for someone else's work is counted against the allowance.
@@ -1247,19 +1270,21 @@ enum TranslationFailure {
 
 /// Carry a download failure's own verdict through to the pin.
 ///
-/// The one judgement call: a body that arrives as a 200 with no cues in it is treated as the file's
-/// fault. It could be a CDN interstitial, which is the service's — but a pin that keeps resolving to
-/// something unparseable has to be droppable, or the title is stuck. The cost of being wrong is
-/// small and self-correcting: `translation_source` is deterministic, so unless the candidate list
-/// has drifted the re-pick lands on the same file and re-pins it, buying nothing.
+/// Only `Gone` — the API's own 404/410 on the id, or a `Suspect` that has now failed twice and been
+/// promoted — is allowed to drop a pin shared by every install and every language. A single
+/// `Suspect` is not: an expired one-shot CDN link and an interstitial served as a 200 both look like
+/// that, both clear on their own, and unpinning on one risks a re-pick against a drifted candidate
+/// list, which re-buys every language of the film at full price.
 fn classify_download(e: opensubtitles::DownloadError) -> TranslationFailure {
     match e {
-        // The upload is gone, or what came back is not a subtitle. The pin naming it is wrong.
+        // The API says the id does not exist, or a repeat has confirmed the file will not download.
         opensubtitles::DownloadError::Gone(m) => TranslationFailure::Source(m),
-        // Quota, rate limit, transport. The pin is innocent and must survive: blaming it here would
-        // re-pick the source and re-buy every language of the film because the viewer ran out of
-        // downloads for the day.
-        opensubtitles::DownloadError::Unavailable(m) => TranslationFailure::Model(m),
+        // One failed link fetch, or quota, a revoked key, transport. The pin is innocent and must
+        // survive all of them: blaming it here would re-pick the source and re-buy every language of
+        // the film because the viewer ran out of downloads for the day.
+        opensubtitles::DownloadError::Suspect(m) | opensubtitles::DownloadError::Unavailable(m) => {
+            TranslationFailure::Model(m)
+        }
     }
 }
 
@@ -1825,6 +1850,10 @@ mod translate_retry_tests {
             DownloadError::Unavailable("opensubtitles download 429".into()),
             DownloadError::Unavailable("opensubtitles download 406".into()),
             DownloadError::Unavailable("download request failed: connection reset".into()),
+            // A single suspect link fetch is not evidence about the file either. Only a repeat,
+            // which `remember_failure` promotes to `Gone`, may drop a pin shared by every install.
+            DownloadError::Suspect("subtitle link 404 Not Found".into()),
+            DownloadError::Suspect("subtitle link returned no cues".into()),
         ] {
             let message = format!("{service:?}");
             assert!(
@@ -1832,6 +1861,53 @@ mod translate_retry_tests {
                 "a service failure dropped the pin: {message}"
             );
         }
+    }
+
+    /// A failed download must not be re-bought on the next request — the credit is charged on the
+    /// API call, so a file that will not resolve costs one every time anything asks. And the two
+    /// kinds of failure are remembered differently: the API naming an id is a fact about the file
+    /// and shared, a credential's quota is not.
+    #[test]
+    fn a_failed_download_is_remembered_and_a_repeat_escalates() {
+        use opensubtitles::DownloadError;
+
+        let state = state("dl-fail");
+        let http = reqwest::Client::new();
+        let cfg = userconfig::decode(state.config_keyring.as_ref(), &config_segment()).unwrap();
+        let client = os_client(&state, &http, &cfg);
+
+        assert!(remembered_failure(&state, &client, 5).is_none(), "precondition: nothing remembered");
+
+        // The API's verdict lands straight on the shared marker.
+        remember_failure(&state, &client, 5, &DownloadError::Gone("404".into()));
+        assert!(matches!(remembered_failure(&state, &client, 5), Some(DownloadError::Gone(_))));
+
+        // One suspect link fetch is a strike, not a verdict — it must NOT read back as `Gone`, or a
+        // transient would unpin a source shared by every install and language.
+        remember_failure(&state, &client, 6, &DownloadError::Suspect("link 404".into()));
+        assert!(
+            matches!(remembered_failure(&state, &client, 6), Some(DownloadError::Suspect(_))),
+            "a single suspect failure was promoted to a verdict"
+        );
+        // A second one inside its window is. Otherwise a persistently junk file would be re-fetched
+        // every ten minutes, at one metered credit each.
+        remember_failure(&state, &client, 6, &DownloadError::Suspect("link 404".into()));
+        assert!(
+            matches!(remembered_failure(&state, &client, 6), Some(DownloadError::Gone(_))),
+            "a repeat was not escalated"
+        );
+
+        // A credential's own trouble is remembered per credential, not for everyone: one install
+        // exhausting its allowance must not deny the file to another.
+        remember_failure(&state, &client, 7, &DownloadError::Unavailable("429".into()));
+        assert!(matches!(remembered_failure(&state, &client, 7), Some(DownloadError::Unavailable(_))));
+        let other = opensubtitles::Client { api_key: "a-different-install-key", ..client };
+        assert!(
+            remembered_failure(&state, &other, 7).is_none(),
+            "one install's quota denied the file to another"
+        );
+        // And the file-scoped ones are shared, because they are facts about the file.
+        assert!(matches!(remembered_failure(&state, &other, 5), Some(DownloadError::Gone(_))));
     }
 
     /// The pin is what stops a drifting source pick from re-buying a film. It has to be scoped to
