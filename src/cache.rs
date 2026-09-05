@@ -16,6 +16,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 
+/// The three namespaces `evict_rank` prices, defined HERE because this is the module that reads
+/// them back and acts on them. They were spelled as literals at both ends — built in `addon.rs`,
+/// re-typed in the ranking — and nothing linked the two. An unmatched prefix falls to rank 3, which
+/// is evicted LAST, so renaming a namespace would not degrade the ranking but invert it: free
+/// search results would become the most protected entries in the store and translations the first
+/// spent. Both sides now name the same constant, so that rename cannot compile into a silent
+/// inversion.
+pub const SEARCH_NS: &str = "search:";
+pub const OS_NS: &str = "os:";
+pub const TRANSLATE_NS: &str = "translate:";
+
 struct Entry {
     value: String,
     size: usize,
@@ -190,11 +201,11 @@ impl Cache {
         let head = name.split('~').next().unwrap_or(name);
         let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(head) else { return 0 };
         let key = String::from_utf8_lossy(&bytes);
-        if key.starts_with("search:") {
+        if key.starts_with(SEARCH_NS) {
             0 // a free round trip to rebuild
-        } else if key.starts_with("os:") {
+        } else if key.starts_with(OS_NS) {
             1 // one metered download credit
-        } else if key.starts_with("translate:") {
+        } else if key.starts_with(TRANSLATE_NS) {
             2 // a whole film's LLM bill
         } else {
             // Pins, allowance counters, failure markers. All tiny, so evicting them frees nothing —
@@ -547,15 +558,21 @@ mod tests {
     #[test]
     fn the_sweep_spends_the_cheap_entries_first() {
         let dir = tmpdir("sweep-rank");
+        // Built from the namespace constants the ranking itself reads, not from literals that only
+        // look like them. Spelled out at both ends, a renamed namespace fell to the `else` arm —
+        // which is evicted LAST — so the ranking would have inverted rather than degraded, and this
+        // test would have gone on passing over keys that no longer existed.
+        let translate_key = format!("{}500:SV:openai:m", TRANSLATE_NS);
+        let search_key = format!("{}tt0111161:0:0:", SEARCH_NS);
         // The expensive entry is written FIRST, so age alone would take it.
         let c = Cache::new(120, Some(dir.clone()));
-        c.put("translate:500:SV:openai:m".into(), "x".repeat(40), HOUR);
+        c.put(translate_key.clone(), "x".repeat(40), HOUR);
         std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime has 1s resolution
-        c.put("os:777".into(), "x".repeat(40), HOUR);
-        c.put("search:tt0111161:0:0:".into(), "x".repeat(40), HOUR);
+        c.put(format!("{}777", OS_NS), "x".repeat(40), HOUR);
+        c.put(search_key.clone(), "x".repeat(40), HOUR);
 
-        let translation = c.disk_path("translate:500:SV:openai:m").unwrap();
-        let search = c.disk_path("search:tt0111161:0:0:").unwrap();
+        let translation = c.disk_path(&translate_key).unwrap();
+        let search = c.disk_path(&search_key).unwrap();
         c.sweep();
 
         assert!(!search.exists(), "the free-to-rebuild entry survived");

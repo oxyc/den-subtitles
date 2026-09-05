@@ -13,7 +13,7 @@ binary + the subtitle-sync toolchain. It does three things the public OpenSubtit
 Den (Apple TV) ──/<config>/subtitles/movie/tt…/videoHash=…──►  addon   OpenSubtitles (hash-first)
                ◄──── { subtitles:[ {url:/subtitle/…} ] }──────┘         served from our cache
 Den (app UX)   ──/<config>/translate/movie/tt…/<extra>/Sw.json►  addon  fetch source → LLM → SRT → sync
-               ◄──── { url:/translate/…/Swedish.srt }─────────┘         cached per source+lang+model
+               ◄──── { url:/translate/…/Swedish.srt }─────────┘         cached per title+lang+model
 Den (engine)   ──GET …/English.srt───────────────────────────►  addon   instant (cache warm) native track
 ```
 
@@ -31,10 +31,17 @@ carrying `alass`/`ffsubsync`/`ffmpeg`.
   can render a faded "English → Translate to X" track: on tap it warms the `.json` endpoint (showing
   its own wait), then hands the returned `.srt` URL to the engine as a **native track**.
 - **A translation goes through the sync ladder too.** It is an SRT carrying its source's timings, so
-  it inherits whatever offset that source had. The translated *text* is cached against the source
-  file — one LLM bill however many encodes of the film you watch — and the per-encode alignment hangs
-  off that entry the same way `?ref=` variants hang off a downloaded sub. Pass the `<extra>` blob for
+  it inherits whatever offset that source had. The translated *text* is cached against the **title**
+  — one LLM bill however many encodes of the film you watch — and the per-encode alignment hangs off
+  that entry the same way `?ref=` variants hang off a downloaded sub. Pass the `<extra>` blob for
   this: it is what makes a hash-matched anchor findable.
+
+  Keyed by title rather than by the source file it was translated from, which is the correction of
+  the obvious design: a per-title pin already guarantees one film translates from one source, so
+  source-keying bought nothing, and it meant that if the pin ever moved — a source going dead while
+  a second language was being added — every language already paid for became unreachable and was
+  re-bought at full price from a cache that still held it. See `translate_body_key` in
+  `src/addon.rs` for the full argument.
 - **The translation harness** (`src/translate.rs`) is the crown jewel. The model never sees the
   whole file or any timestamp; cues go out in small JSON-array batches under a strict same-length
   contract; a length mismatch splits the batch and retries down to a single cue; a rolling window of

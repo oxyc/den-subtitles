@@ -22,6 +22,7 @@ use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
 use serde_json::{json, Value};
 
+use crate::cache;
 use crate::httputil::{self, Body};
 use crate::opensubtitles;
 use crate::state::AppState;
@@ -40,7 +41,7 @@ const MAX_IMDB_DIGITS: usize = 10;
 /// Longest a target-language name may be. The longest real one is a couple of dozen characters.
 const MAX_LANG: usize = 64;
 #[cfg(test)]
-const BODY_PREFIXES: [&str; 3] = ["os:", "search:", "translate:"];
+const BODY_PREFIXES: [&str; 3] = [cache::OS_NS, cache::SEARCH_NS, cache::TRANSLATE_NS];
 // Search results turn over as new subs are uploaded, so a short TTL — enough to spare repeated
 // round-trips when the app reopens a title, not so long that fresh uploads stay hidden.
 const SEARCH_TTL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
@@ -265,7 +266,8 @@ async fn cached_search(
     hash: Option<&str>,
 ) -> Result<Vec<opensubtitles::Subtitle>, String> {
     let search_key = format!(
-        "search:{imdb}:{}:{}:{}",
+        "{}{imdb}:{}:{}:{}",
+        cache::SEARCH_NS,
         season.unwrap_or(0),
         episode.unwrap_or(0),
         hash.unwrap_or("")
@@ -340,10 +342,17 @@ async fn cached_search(
 /// cue count to work from, but trust/ratings/downloads separate a full dialogue track from a signs
 /// track well enough.
 ///
-/// `Reverse` + `min_by_key` rather than `max_by_key`: both pick a highest score, but `max_by_key`
-/// returns the LAST of equal maxima and `min_by_key` the first. Ties are common here (two untrusted,
-/// unrated hash matches), and the anchor decides the `?ref=` in every URL we hand back — so it has to
-/// be the same choice on every request over the same cached list, not merely a valid one.
+/// The anchor decides the `?ref=` in every URL we hand back, so it has to be the same choice on
+/// every request over the same title — not merely a valid one. Ties are common here (two untrusted,
+/// unrated hash matches), so the score alone does not settle it and `file_id` breaks the tie.
+///
+/// It used to rest on list order instead, with `Reverse` + `min_by_key` to take the first of equal
+/// maxima. That held only for a list someone had already ranked, and it was a precondition the two
+/// callers did not both meet: the picker ranks, and the translate path reads `cached_search`, which
+/// caches deliberately UNRANKED. So one title could anchor two different ways — a second metered
+/// download, a second alignment and a duplicate `:ref:` entry — and the anchor could flip again
+/// whenever the six-hour search entry lapsed and the API answered in a different order. Ordering by
+/// something intrinsic to the subtitle costs nothing and removes the precondition.
 ///
 /// `None` when the search produced no hash match at all. That is the gap behind the out-of-sync
 /// complaint: with no trusted anchor we deliberately do NOT align to an untrusted sub (that could
@@ -352,7 +361,7 @@ async fn cached_search(
 fn tier1_reference(subs: &[opensubtitles::Subtitle]) -> Option<i64> {
     subs.iter()
         .filter(|s| s.hash_match)
-        .min_by_key(|s| std::cmp::Reverse(opensubtitles::fit_score(s, None)))
+        .min_by_key(|s| (std::cmp::Reverse(opensubtitles::fit_score(s, None)), s.file_id))
         .map(|s| s.file_id)
 }
 
@@ -824,7 +833,7 @@ fn vetted_ref(file_id: i64, ref_id: Option<i64>) -> Option<i64> {
 /// The cache key for one raw OpenSubtitles file: the unaligned body that every sync variant of it
 /// hangs off. Also what `subtitle_srt` files it under.
 fn os_base_key(file_id: i64) -> String {
-    format!("os:{file_id}")
+    format!("{}{file_id}", cache::OS_NS)
 }
 
 /// Cache key for one servable subtitle, namespaced by sync mode so the unaligned / reference-aligned
@@ -867,7 +876,8 @@ fn translate_fail_key(
     llm: &LlmConfig,
 ) -> String {
     format!(
-        "translate:{:016x}:{imdb}:{}:{}:{lang_key}:{}:{}",
+        "{}{:016x}:{imdb}:{}:{}:{lang_key}:{}:{}",
+        cache::TRANSLATE_NS,
         short_hash(config),
         season.unwrap_or(0),
         episode.unwrap_or(0),
@@ -902,7 +912,8 @@ fn translate_body_key(
     llm: &LlmConfig,
 ) -> String {
     format!(
-        "translate:{imdb}:{}:{}:{lang_key}:{}:{}",
+        "{}{imdb}:{}:{}:{lang_key}:{}:{}",
+        cache::TRANSLATE_NS,
         season.unwrap_or(0),
         episode.unwrap_or(0),
         llm.provider.tag(),
@@ -1868,10 +1879,21 @@ mod tests {
         assert_eq!(tier1_reference(&[sub(1, false), sub(2, false)]), None);
         // A hash match becomes the anchor, and a non-match never does.
         assert_eq!(tier1_reference(&[sub(1, false), sub(2, true), sub(3, true)]), Some(2));
-        // Among equally-scoring hash matches the choice is the FIRST, and it is stable: the anchor
-        // decides the `?ref=` in every URL handed back, so it must be the same answer every time the
-        // same cached list is ranked, not merely a valid one.
-        assert_eq!(tier1_reference(&[sub(3, true), sub(2, true), sub(1, true)]), Some(3));
+        // Among equally-scoring hash matches the choice is stable AND independent of list order —
+        // the anchor decides the `?ref=` in every URL handed back, so it must be the same answer
+        // every time, not merely a valid one. Pinning it to list order was the bug: the picker ranks
+        // its list and the translate path does not, so one title anchored two ways and paid a second
+        // metered download for it.
+        assert_eq!(tier1_reference(&[sub(3, true), sub(2, true), sub(1, true)]), Some(1));
+        assert_eq!(tier1_reference(&[sub(1, true), sub(2, true), sub(3, true)]), Some(1));
+        // Every permutation, since "some order happened to agree" is what the old assertion proved.
+        for order in [[1, 2, 3], [1, 3, 2], [2, 1, 3], [2, 3, 1], [3, 1, 2], [3, 2, 1]] {
+            let subs: Vec<Subtitle> = order.iter().map(|&i| sub(i, true)).collect();
+            assert_eq!(tier1_reference(&subs), Some(1), "order {order:?} chose a different anchor");
+        }
+        // The tie-break is the LAST word, not the first: a better score still wins over a lower id.
+        let better = Subtitle { downloads: 50_000, from_trusted: true, ..sub(9, true) };
+        assert_eq!(tier1_reference(&[sub(1, true), better]), Some(9));
     }
 
     /// The anchor is the BEST hash match, not the first one in language order. `tier1_reference`
