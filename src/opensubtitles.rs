@@ -163,8 +163,8 @@ impl<'a> Client<'a> {
 ///
 /// The distinction is what lets a remembered file id be forgotten at the right time. A 404 says the
 /// upload is gone and whatever named it should stop; a 429 says the viewer is out of downloads for
-/// today, and forgetting the file over that throws away the choice — and, for a pinned translation
-/// source, re-buys every language of the film.
+/// today, and forgetting the file over that throws away a choice that was fine — so the replacement
+/// costs another metered credit, out of the allowance that just ran out.
 #[derive(Debug)]
 pub enum DownloadError {
     /// The API says this id does not exist. Authoritative, true for everyone, and the only verdict
@@ -455,8 +455,8 @@ mod download_tests {
 
     /// The error has to say whether the FILE or the SERVICE failed, because the pinned translation
     /// source is forgotten on one and kept on the other — and keeping it through a quota exhaustion
-    /// is what stops a film being re-bought in every language because the viewer ran out of
-    /// downloads for the day.
+    /// is what stops the addon buying a replacement source, with a credit it does not have, for a
+    /// source that was never the problem.
     #[tokio::test]
     async fn a_download_error_says_whose_fault_it_is() {
         // The CDN's verdicts are SUSPECT, never `Gone`. A 404 on a one-shot link means it expired,

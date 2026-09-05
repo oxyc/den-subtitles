@@ -1540,9 +1540,10 @@ pub async fn handle_translate(
                             // the title is stuck for every install and language, since the pin is
                             // scoped to neither.
                             //
-                            // For everything else the pin is innocent, and dropping it is what costs
-                            // money: a provider timeout or a rate limit would re-pick the source and
-                            // re-buy every language of the film already bought.
+                            // For everything else the pin is innocent, and dropping it spends a
+                            // metered download to learn nothing: a provider timeout or a rate limit
+                            // says nothing about the file, so the re-pick lands on the same title
+                            // needing the same source fetched again.
                             if matches!(e, TranslationFailure::Source(_)) {
                                 state.cache.remove(&pin_key);
                             }
@@ -1663,22 +1664,27 @@ pub async fn handle_translate_status(
 /// The distinction decides whether the pin survives. `Source` means this file cannot be translated
 /// from — it will not download, or it parses to nothing — so the pin naming it is wrong and has to
 /// go. `Model` means the provider timed out, refused, or produced junk: nothing to do with which
-/// file was chosen, and dropping the pin then is actively expensive. The pin is scoped to neither
-/// install nor language, so one install's rate limit would re-pick the source for everybody and
-/// re-buy every language of that title at full price.
+/// file was chosen, so dropping the pin buys a metered download and learns nothing. And the pin is
+/// scoped to neither install nor language, so one install's rate limit would spend that credit on
+/// behalf of everybody.
 enum TranslationFailure {
     Source(String),
     Model(String),
     /// The install has used up today's translations. Distinct because it is the one failure the
     /// client should see as "not now" rather than "something broke".
     Allowance,
-    /// The provider refused the credential itself. Distinct because it will happen identically for
-    /// the next title, so it earns an install-wide backoff rather than a per-title one — and because
-    /// nothing was spent to learn it, so the allowance slot is given back.
+    /// The provider refused the credential itself. Distinct because a refusal that really is about
+    /// the key will happen identically for the next title, so it can earn a backoff wider than the
+    /// one title — see `refusal_scope`, which decides how much wider from the two fields below.
     ///
-    /// `key_certain` says whether it can only be about the credential. A 401 or an empty balance
-    /// can; a 400 or a 403 might instead be this film's dialogue tripping a content filter, and
-    /// blocking a whole install on one of those lets a series take every other title down with it.
+    /// It is NOT a free failure, and the two fields are there because it used to be treated as one.
+    /// The per-title marker is written as well as whatever wider scope is armed, and the allowance
+    /// slot comes back only when this request spent nothing at all — neither tokens nor a metered
+    /// download.
+    ///
+    /// `key_certain` says whether the status can only be about the credential. A 401 or an empty
+    /// balance can; a 400 or a 403 might instead be this film's dialogue tripping a content filter,
+    /// and blocking a whole install on one of those lets a series take every other title down.
     ///
     /// `spent` is the strongest signal of the three and is a measurement rather than a guess: if a
     /// batch was billed before the refusal, the provider accepted this credential in this very run,
@@ -1691,15 +1697,15 @@ enum TranslationFailure {
 /// Only `Gone` — the API's own 404/410 on the id, or a `Suspect` that has now failed twice and been
 /// promoted — is allowed to drop a pin shared by every install and every language. A single
 /// `Suspect` is not: an expired one-shot CDN link and an interstitial served as a 200 both look like
-/// that, both clear on their own, and unpinning on one risks a re-pick against a drifted candidate
-/// list, which re-buys every language of the film at full price.
+/// that, both clear on their own, and unpinning on one re-picks against a drifted candidate list and
+/// spends another metered credit on a source that was fine.
 fn classify_download(e: opensubtitles::DownloadError) -> TranslationFailure {
     match e {
         // The API says the id does not exist, or a repeat has confirmed the file will not download.
         opensubtitles::DownloadError::Gone(m) => TranslationFailure::Source(m),
         // One failed link fetch, or quota, a revoked key, transport. The pin is innocent and must
-        // survive all of them: blaming it here would re-pick the source and re-buy every language of
-        // the film because the viewer ran out of downloads for the day.
+        // survive all of them: blaming it here would spend a download credit re-picking a source,
+        // because the viewer ran out of download credits for the day.
         opensubtitles::DownloadError::Suspect(m) | opensubtitles::DownloadError::Unavailable(m) => {
             TranslationFailure::Model(m)
         }
@@ -1751,8 +1757,8 @@ async fn produce_translation(
     let source_was_cached = state.cache.get(&os_base_key(source_file_id)).is_some();
     // A download failure is NOT charged to the source. An exhausted daily credit and a dead upload
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
-    // on it would re-pick the source, and re-buy every language of the film, because the viewer ran
-    // out of downloads.
+    // on it would re-pick the source and owe another credit for the replacement, because the viewer
+    // ran out of credits.
     let raw = subtitle_srt(state, client, source_file_id)
         .await
         .map_err(classify_download)?;
@@ -1997,8 +2003,9 @@ mod tests {
         assert!(encode_a.starts_with(&base) && encode_b.starts_with(&base));
 
         // A different title, or a different model, is a different translation. A different SOURCE is
-        // not — the pin decides which file a title reads from, and a body already paid for must stay
-        // reachable when that decision changes, or one language's dead source re-buys the others.
+        // not — the pin decides which file a title reads from, and a body already paid for stays
+        // reachable when that decision changes. Were the source in this key, one language's source
+        // dying would have re-bought every other language of the film.
         assert_ne!(translate_body_key("tt0068646", None, None, "SV", &llm), base);
         assert_ne!(translate_body_key("tt0111161", Some(1), Some(2), "SV", &llm), base);
         let bigger = LlmConfig { model: "gpt-4o".into(), ..llm.clone() };
@@ -2542,8 +2549,8 @@ mod translate_retry_tests {
     }
 
     /// Only a failure that indicts the SOURCE may drop the pin, and this is the mapping that decides
-    /// it. Blaming the source for a quota exhaustion or a rate limit re-picks and re-buys every
-    /// language of the film because the viewer ran out of downloads for the day; blaming the service
+    /// it. Blaming the source for a quota exhaustion or a rate limit re-picks and owes a metered
+    /// credit for the replacement, at the moment the viewer has run out of them; blaming the service
     /// for a deleted upload leaves the pin resolving to nothing, and the ten-minute marker then
     /// cycles the same failure for the pin's whole 180-day life, for every install and language.
     #[test]
@@ -2647,9 +2654,10 @@ mod translate_retry_tests {
         assert!(matches!(remembered_failure(&state, &other, 5), Some(DownloadError::Gone(_))));
     }
 
-    /// The pin is what stops a drifting source pick from re-buying a film. It has to be scoped to
-    /// the title alone — every language of one film translating from the same source — and it has to
-    /// be removable, because a pin naming a file that will not download would otherwise be honoured
+    /// The pin is what keeps a drifting source pick from spending a metered credit each time it
+    /// drifts. It has to be scoped to the title alone — every language of one film translating from
+    /// the same source, so a film costs one download rather than one per language — and removable,
+    /// because a pin naming a file that will not download would otherwise be honoured
     /// forever: the ten-minute marker expires, the same pin is read, the same failure follows, and
     /// the title is stuck for every install and language, since the pin is scoped to neither.
     #[test]

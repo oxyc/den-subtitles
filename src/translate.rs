@@ -508,10 +508,6 @@ impl CallError {
     }
 }
 
-/// How long to wait before trying the same request again, or `None` if trying again cannot help.
-///
-/// Only rate limiting and the provider being unwell are worth repeating. `Some(ZERO)` means "worth
-/// retrying, no delay stated" — the caller still applies its own backoff on top.
 /// Is this refusal about the CREDENTIAL rather than the moment?
 ///
 /// A 401 or 403 is a key that will refuse the next film identically; a 400 is a request shape that
@@ -566,6 +562,11 @@ fn is_certainly_the_key(provider: Provider, status: reqwest::StatusCode) -> bool
 // credential failure would give a merely rate-limited install an install-wide block and a refund it
 // did not earn, which is the worse error of the two.
 
+/// How long to wait before trying the same request again, or `None` if trying again cannot help.
+///
+/// Only rate limiting and the provider being unwell are worth repeating. `Some(ZERO)` means "worth
+/// retrying, no delay stated" — the caller still applies its own backoff on top, and
+/// `call_with_retries` depends on that distinction: `None` ends the run, `Some` costs another call.
 fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     if status.as_u16() != 429 && !status.is_server_error() {
         return None;
@@ -862,8 +863,10 @@ async fn translate_batch(
             budget.untranslated.fetch_add(sources.len(), Ordering::Relaxed);
             Ok(sources.to_vec())
         }
-        // The provider's own verdict on the credential travels with the message. It is the one
-        // failure the caller must not charge a slot for, since nothing was spent to earn it.
+        // The provider's own verdict on the credential travels with the message, so the caller can
+        // decide how widely to remember it. The `spent: false` here is a placeholder, NOT a claim:
+        // `run_translation` overwrites it with the measurement before this leaves the harness, and a
+        // refusal that arrives after billed batches keeps its slot.
         Err(CallError::Upstream { message, fatal: true, key_certain, .. }) => {
             Err(TranslateError { message, credential_refused: true, key_certain, spent: false })
         }

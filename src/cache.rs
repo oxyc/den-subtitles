@@ -208,8 +208,10 @@ impl Cache {
         } else if key.starts_with(TRANSLATE_NS) {
             2 // a whole film's LLM bill
         } else {
-            // Pins, allowance counters, failure markers. All tiny, so evicting them frees nothing —
-            // and a lost pin can cost a re-translation of every language of a film.
+            // Pins, allowance counters, failure markers. All tiny, so evicting them frees nothing,
+            // and each one costs something to lose: a pin is a metered download, an allowance
+            // counter is the ceiling on a whole day's spend, a failure marker is the backoff that
+            // keeps a known-bad source from being bought again.
             3
         }
     }
