@@ -335,6 +335,10 @@ async fn serve_until(
                     if ACCEPT_FAILED.allow() {
                         eprintln!("accept: {e}");
                     }
+                    // And back off before trying again. The listener stays readable while the process is
+                    // out of descriptors, so an immediate retry fails at once and the loop spins a core
+                    // at 100% until one frees up — on the one runtime thread that serves every request.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             },
