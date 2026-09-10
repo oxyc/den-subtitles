@@ -32,6 +32,11 @@ base64 = "0.23"
 crypto_box = { version = "0.9", features = ["seal"] }
 # Constant-time comparison of the /metrics bearer token. Already in the tree under crypto_box.
 subtle = "2"
+# Subtitle files are whatever encoding the uploader's editor saved (Windows-1250/1251, ISO-8859-x,
+# UTF-16), and the player downstream drops any cue that is not UTF-8. chardetng guesses the legacy
+# encoding the way Firefox does for unlabeled pages; encoding_rs decodes it.
+chardetng = "1"
+encoding_rs = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }

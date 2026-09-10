@@ -96,7 +96,10 @@ reason.
   hash-matched-first OpenSubtitles results, each `url` pointing at `/subtitle` below.
 - `GET /<config>/subtitle/<file_id>.srt` (or `.vtt`) — one subtitle, proxied and cached; `.vtt` is
   the same document as WebVTT. `?ref=<file_id>` reference-aligns it to a hash-matched anchor (Tier 1);
-  `?resync=<stream-url>` aligns it to the stream's audio with `alass` (Tier 2).
+  `?resync=<stream-url>` aligns it to the stream's audio with `alass` (Tier 2). Whatever encoding the
+  upload is in (Windows-125x, ISO-8859-x, UTF-16), it is served as UTF-8; `lang=<code>`, set on the
+  URLs the subtitles resource hands back for languages with their own legacy encodings, hints that
+  detection.
 - `GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.json` — runs (or finds cached) the
   translation and answers `{"url":"…/<lang>.srt"}`.
 - `GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.srt` (or `.vtt`) — the translated subtitle,
@@ -148,7 +151,7 @@ cargo test --locked           # what CI runs, with cargo fmt --check and clippy 
 OPENSUBTITLES_KEY=… ./scripts/smoke.sh   # live smoke test against the real OpenSubtitles API
 ```
 
-`cargo test` covers the SRT round-trip, config decode/validate, the JSON-array parse, the
+`cargo test` covers the SRT round-trip, subtitle encoding detection, config decode/validate, the JSON-array parse, the
 OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` SSRF guard, the
 router's status codes and headers, and the sync subprocess orchestration (spawn → arg contract →
 read-back → cleanup, against fake binaries).

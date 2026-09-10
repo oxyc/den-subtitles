@@ -99,7 +99,10 @@ impl<'a> Client<'a> {
     /// The error says whether the FILE is the problem or the service is. Callers that remember a
     /// file id — the pinned translation source — need to stop remembering it on the first and keep
     /// it on the second, and the two are otherwise indistinguishable from a message.
-    pub async fn download(&self, file_id: i64) -> Result<String, DownloadError> {
+    ///
+    /// `lang` is the subtitle's declared language, when the caller knows it — a hint for working out
+    /// the file's encoding (see `fetch::subtitle_text`).
+    pub async fn download(&self, file_id: i64, lang: Option<&str>) -> Result<String, DownloadError> {
         let mut req = self
             .http
             .post(format!("{}/download", self.api_base))
@@ -144,9 +147,14 @@ impl<'a> Client<'a> {
             let code = resp.status();
             return Err(DownloadError::Suspect(format!("subtitle link {code}")));
         }
-        let body = crate::fetch::capped_text(resp, crate::fetch::MAX_BODY)
+        let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_BODY)
             .await
             .map_err(DownloadError::Unavailable)?;
+        let (body, converted) = crate::fetch::subtitle_text(bytes, lang);
+        // Once per download: the result is cached, so this never repeats per request.
+        if let Some(encoding) = converted {
+            eprintln!("subtitle: file {file_id} was {}, converted to UTF-8", encoding.name());
+        }
         // A 200 is not proof it is a subtitle: a CDN error or interstitial page is a 200 often
         // enough. Anything with no cue in it cannot be one.
         //
@@ -479,7 +487,7 @@ mod download_tests {
     async fn download_from(status: &'static str, body: &'static str) -> Result<String, DownloadError> {
         let base = upstream(status, body).await;
         let http = reqwest::Client::new();
-        Client { http: &http, api_key: "k", token: None, api_base: &base }.download(1).await
+        Client { http: &http, api_key: "k", token: None, api_base: &base }.download(1, None).await
     }
 
     /// The error has to say whether the FILE or the SERVICE failed, because the pinned translation

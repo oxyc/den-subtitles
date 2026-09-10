@@ -252,9 +252,21 @@ pub async fn handle_subtitles(
         .map(|s| {
             // A sub that needs Tier-1 gets `?ref=<id>` so the proxy reference-aligns it on fetch; a
             // hash match (or anything, when there's no anchor) is served as-is.
-            let mut url = format!("{base}/subtitle/{}.srt", s.file_id);
+            let mut query = Vec::new();
             if let Some(ref_id) = tier1_ref_for(s, reference) {
-                url = format!("{url}?ref={ref_id}");
+                query.push(format!("ref={ref_id}"));
+            }
+            // The language rides along when it narrows which legacy encoding the file may be in
+            // (see `fetch::encoding_tld`); a code outside the URL-safe set is left off rather than
+            // escaped, since it would map to no hint anyway.
+            if crate::fetch::encoding_tld(&s.lang).is_some()
+                && s.lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                query.push(format!("lang={}", s.lang));
+            }
+            let mut url = format!("{base}/subtitle/{}.srt", s.file_id);
+            if !query.is_empty() {
+                url = format!("{url}?{}", query.join("&"));
             }
             // Standard Stremio fields (id/url/lang) plus Den-specific detail the app renders in the
             // subtitle picker; a generic client ignores the unknown fields.
@@ -444,15 +456,17 @@ fn tier1_ref_for(s: &opensubtitles::Subtitle, reference: Option<i64>) -> Option<
     reference.filter(|&r| r != s.file_id)
 }
 
-/// GET /<config>/subtitle/<file_id>.srt[?ref=<id>|?resync=<url>] — download one OpenSubtitles file,
-/// optionally auto-sync it (Tier 1 against a reference sub, or Tier 2 against the stream audio),
-/// cache, serve. Any sync failure falls back to the raw sub — a slightly-off sub beats none.
+/// GET /<config>/subtitle/<file_id>.srt[?ref=<id>|?resync=<url>][&lang=<code>] — download one
+/// OpenSubtitles file, optionally auto-sync it (Tier 1 against a reference sub, or Tier 2 against the
+/// stream audio), cache, serve. Any sync failure falls back to the raw sub — a slightly-off sub beats
+/// none. `lang` only hints the encoding detection on a download; it is not part of any cache key.
 pub async fn handle_subtitle_file(
     state: &Arc<AppState>,
     config: &str,
     file_id: i64,
     ref_id: Option<i64>,
     resync_url: Option<String>,
+    lang: Option<&str>,
 ) -> Response<Body> {
     let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
@@ -483,7 +497,7 @@ pub async fn handle_subtitle_file(
     let client = os_client(state, http, &cfg);
 
     let started = Instant::now();
-    let target = match subtitle_srt(state, &client, file_id).await {
+    let target = match subtitle_srt(state, &client, file_id, lang).await {
         Ok(body) => body,
         Err(e) => {
             if DOWNLOAD_FAILED.allow() {
@@ -617,7 +631,8 @@ async fn sync_and_cache(
         // Tier 1 — reference-align against the hash-matched sub (no audio needed). The reference is
         // fetched BEFORE taking a permit: that is a network download, and a permit meant to bound
         // subprocesses should not be spent waiting on OpenSubtitles.
-        match subtitle_srt(state, client, r).await {
+        // The reference's language is not known here; its encoding is detected unhinted.
+        match subtitle_srt(state, client, r, None).await {
             Ok(reference) => {
                 let aligned = {
                     let _slot = state.sync_slots.acquire().await;
@@ -680,10 +695,12 @@ async fn sync_and_cache(
 }
 
 /// Fetch a subtitle's SRT, cached by file id (the raw, un-synced text — reused as a sync input).
+/// `lang` hints the encoding detection when this call is the one that downloads.
 async fn subtitle_srt(
     state: &Arc<AppState>,
     client: &opensubtitles::Client<'_>,
     file_id: i64,
+    lang: Option<&str>,
 ) -> Result<String, opensubtitles::DownloadError> {
     let key = os_base_key(file_id);
     if let Some(hit) = state.cache.get(&key) {
@@ -714,7 +731,7 @@ async fn subtitle_srt(
     if let Some(e) = remembered_failure(state, client, file_id) {
         return Err(e);
     }
-    let body = match client.download(file_id).await {
+    let body = match client.download(file_id, lang).await {
         Ok(body) => {
             // A success clears the record. Without this the counter tallies failures across a whole
             // day with no credit for the successes between them, so a file that works nine times out
@@ -1897,7 +1914,7 @@ async fn produce_translation(
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
     // on it would re-pick the source and owe another credit for the replacement, because the viewer
     // ran out of credits.
-    let raw = subtitle_srt(state, client, source_file_id).await.map_err(classify_download)?;
+    let raw = subtitle_srt(state, client, source_file_id, None).await.map_err(classify_download)?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
         // Unreachable in practice — `download` gates on `has_a_cue`, and a differential test pins

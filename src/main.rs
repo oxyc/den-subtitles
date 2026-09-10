@@ -180,7 +180,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             addon::handle_subtitles(state, &parts.headers, config, id, extra).await
         }
         "subtitle" => {
-            // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>]
+            // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>][&lang=<code>]
             let file = segs.get(2).copied().unwrap_or("");
             let (stem, want_vtt) = split_subtitle_format(file);
             match stem.and_then(|n| n.parse::<i64>().ok()) {
@@ -188,7 +188,10 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                     let query = parts.uri.query().unwrap_or("");
                     let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
                     let resync = query_get(query, "resync");
-                    let resp = addon::handle_subtitle_file(state, config, file_id, ref_id, resync).await;
+                    let lang = query_get(query, "lang");
+                    let resp =
+                        addon::handle_subtitle_file(state, config, file_id, ref_id, resync, lang.as_deref())
+                            .await;
                     if want_vtt {
                         httputil::to_vtt(resp, &parts.headers).await
                     } else {
