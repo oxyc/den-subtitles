@@ -69,7 +69,7 @@ impl AppState {
         let config_keyring = match Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev) {
             Ok(kr) => kr,
             Err(e) => {
-                eprintln!("warning: SUBS_CONFIG_KEY invalid ({e}) — sealed configs disabled");
+                eprintln!("warning: CONFIG_KEY invalid ({e}) — sealed configs disabled");
                 None
             }
         };

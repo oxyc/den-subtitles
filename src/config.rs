@@ -46,8 +46,8 @@ impl Config {
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ffsubsync: env_opt("FFSUBSYNC_PATH").unwrap_or_else(|| "ffsubsync".to_string()),
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
-            config_key: env_opt("SUBS_CONFIG_KEY").unwrap_or_default(),
-            config_keys_prev: env_opt("SUBS_CONFIG_KEYS_PREV").unwrap_or_default(),
+            config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
+            config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
             os_api_base: crate::opensubtitles::API.to_string(),
         }
     }
