@@ -1,7 +1,4 @@
 # Weekly dependency PRs, grouped so a refresh is one reviewable PR rather than twenty.
-#
-# Does NOT cover the tools we download by URL and pin by checksum (yt-dlp, deno) — dependabot has no
-# ecosystem for those, which is why they have their own workflows.
 version: 2
 updates:
   - package-ecosystem: cargo

@@ -1,6 +1,7 @@
-//! Runtime configuration from the environment. No credentials live here — both the OpenSubtitles
+//! Runtime configuration from the environment. No user credentials live here — both the OpenSubtitles
 //! key and the LLM key are BYOK and ride in the install URL (see `userconfig.rs`). What lives here
-//! is addon-level infrastructure: binary paths, cache sizing, and the public origin.
+//! is addon-level infrastructure: binary paths, cache sizing, the public origin, and the addon's own
+//! sealing key and metrics token.
 
 use std::env;
 use std::path::PathBuf;

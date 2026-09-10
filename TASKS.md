@@ -132,6 +132,10 @@ the focus argument plus roughly doubled input tokens. Update the module doc if i
 `produce_translation`'s OpenSubtitles failures (`addon.rs:562`) never reach `/health`
 (`main.rs:45`, `:79`). Fix this before adding any cost/usage counters.
 
+**Since fixed:** the counter moved into the shared search path, so a translation's failed search
+reaches `/health` too — and it is also published on `/metrics` as
+`subtitles_opensubtitles_consecutive_failures`.
+
 ### 12. No progress signal on a request that can block 600s
 `RUN_DEADLINE` (`translate.rs:122`) awaited inline at `addon.rs:522`; no 202/polling shape in
 `main.rs:133`. This is *intentional* — `addon.rs:474` documents the app showing its own wait — so the

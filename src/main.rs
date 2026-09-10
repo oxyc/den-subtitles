@@ -7,7 +7,7 @@
 //! 3. SYNC — an auto-sync ladder (hash → reference-align → alass audio VAD) so subtitles line up.
 //!
 //! Both credentials (OpenSubtitles key, LLM key) are BYOK and ride in the install URL, Keychain-
-//! stored by the app. Nothing credential-shaped lives in the environment.
+//! stored by the app. No user credential lives in the environment.
 
 mod addon;
 mod cache;

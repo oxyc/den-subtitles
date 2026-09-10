@@ -52,8 +52,8 @@ carrying `alass`/`ffsubsync`/`ffmpeg`.
 Per-install config is base64url-encoded in the addon URL (den-scout / Torrentio style), a bearer
 secret the app stores in the Keychain. The **OpenSubtitles key** (subtitle source) is required; the
 **LLM key** (translation) is **optional** — omit it for a fetch + auto-sync-only install with no AI.
-Build it at `/configure`. Nothing credential-shaped lives in the environment; `.env.example` is just
-infra (port, cache, origin).
+Build it at `/configure`. No user credential lives in the environment; `.env.example` is addon infra
+(port, cache, origin, the sealing key `CONFIG_KEY`/`CONFIG_KEYS_PREV`, and `METRICS_TOKEN`).
 
 Supported providers: OpenAI, Google, Anthropic, xAI, OpenRouter (chat) and DeepL (MT). Default model
 is the cheap/fast/decent tier per provider; step up to a bigger model to re-translate a title that
@@ -96,7 +96,17 @@ Known gap: Tier 1 needs a hash-matched anchor in the results. When the search re
 match — the common out-of-sync case — there is no trusted reference, so Tier 1 stays off and the sub
 is served as-is; only the Tier-2 resync closes it. See the ticket.
 
-Deploy note: the addon builds the `/subtitle` and `/translate` URLs it hands back to the app from
+## Deploy
+
+The live deploy is Podman Quadlet on the homelab box, from the den repo's `deploy/` — its
+`deploy/README.md` covers the stack mechanics. The unit, `den-subtitles.container`, publishes LAN host
+port 8093, drops every capability, sets no-new-privileges, caps memory at 512 MiB, and bind-mounts the
+cache from `/var/lib/den/subtitles-cache` (owned by uid 65532, the image's non-root user). Updates go
+through the health-gated `den-update` script, which proves a new image answers `/health` and
+`/manifest.json` before pinning its digest; the image carries no HEALTHCHECK, so nothing probes an
+idle box.
+
+The addon builds the `/subtitle` and `/translate` URLs it hands back to the app from
 its own origin. On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host`
 header is fine — leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients
 (i.e. exposed publicly), set `PUBLIC_BASE_URL` to the real origin (see `.env.example`): a client
