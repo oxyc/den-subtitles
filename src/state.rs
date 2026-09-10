@@ -14,8 +14,13 @@ const MAX_CONCURRENT_SYNCS: usize = 2;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::inflight::{InFlight, Progress};
+use crate::logging::LogGate;
 use crate::seal::Keyring;
 use crate::sync::SyncTools;
+use crate::userconfig::{self, Rejected, UserConfig};
+
+static INSTALL_REVOKED: LogGate = LogGate::new();
+static INSTALL_TOO_OLD: LogGate = LogGate::new();
 
 pub struct AppState {
     pub cfg: Config,
@@ -84,6 +89,27 @@ impl AppState {
             sync,
             os_fails: AtomicU32::new(0),
         })
+    }
+
+    /// The install config in `blob`, if it decodes and its install is still admitted. Every route
+    /// that reads a config comes through here, so a revocation reaches every URL that embeds the
+    /// config, including the `/subtitle` and `/translate` URLs handed out before it. A refused
+    /// install gets the same answer as an undecodable segment; only the log line tells them apart,
+    /// once a minute per reason, because a revoked install keeps polling.
+    pub fn decode_config(&self, blob: &str) -> Option<UserConfig> {
+        let why = match userconfig::decode_checked(self.config_keyring.as_ref(), &self.cfg.revocation, blob) {
+            Ok(cfg) => return Some(cfg),
+            Err(why) => why,
+        };
+        let gate = match why {
+            Rejected::Undecodable => return None,
+            Rejected::Revoked { .. } => &INSTALL_REVOKED,
+            Rejected::EpochTooOld { .. } => &INSTALL_TOO_OLD,
+        };
+        if gate.allow() {
+            eprintln!("bad_config: {why}");
+        }
+        None
     }
 
     /// Tier binaries running now: the slots taken out of `sync_slots`. Callers still waiting for a

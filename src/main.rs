@@ -143,14 +143,21 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         }
         // The current X25519 public key (base64) so /configure can seal the config to it; 404 when
         // sealed configs are disabled (no key) — the page then keeps plaintext (SEALED-CONFIG.md).
+        // Both answers carry CONFIG_EPOCH, which the page stamps into every link it builds, sealed or
+        // not: a link stamped below it would be refused the moment it was built.
         "/config-key" => {
+            let epoch = state.cfg.revocation.epoch();
             return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
-                Some(pub_b64) if !pub_b64.is_empty() => {
-                    httputil::json(StatusCode::OK, &serde_json::json!({"key": pub_b64}), KEY_CACHE)
-                }
-                _ => {
-                    httputil::json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "no_key"}), "no-store")
-                }
+                Some(pub_b64) if !pub_b64.is_empty() => httputil::json(
+                    StatusCode::OK,
+                    &serde_json::json!({"key": pub_b64, "epoch": epoch}),
+                    KEY_CACHE,
+                ),
+                _ => httputil::json(
+                    StatusCode::NOT_FOUND,
+                    &serde_json::json!({"error": "no_key", "epoch": epoch}),
+                    "no-store",
+                ),
             };
         }
         _ => {}
@@ -161,7 +168,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
     let resource = segs.get(1).copied().unwrap_or("");
 
     match resource {
-        "manifest.json" => match userconfig::decode(state.config_keyring.as_ref(), config) {
+        "manifest.json" => match state.decode_config(config) {
             Some(_) => httputil::json(StatusCode::OK, &addon::manifest(true), STATIC_CACHE),
             None => httputil::json(
                 StatusCode::BAD_REQUEST,
@@ -286,12 +293,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     // den addon's line.
     let on_off = |on: bool| if on { "on" } else { "off" };
     eprintln!(
-        "den-subtitles {} listening on :{port} — metrics={} log_requests={} sealed={} cache_dir={} \
-         cache_max_mib={} public_base={} resync={}",
+        "den-subtitles {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
+         cache_dir={} cache_max_mib={} public_base={} resync={}",
         env!("CARGO_PKG_VERSION"),
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
         on_off(state.config_keyring.is_some()),
+        state.cfg.revocation.revoked_count(),
+        state.cfg.revocation.epoch(),
         state.cfg.cache_dir.display(),
         state.cfg.cache_max_bytes / (1024 * 1024),
         state.cfg.public_base_url.as_deref().unwrap_or("derived"),
@@ -480,7 +489,11 @@ mod tests {
     }
 
     fn test_state_with(config_key: &str, metrics_token: &str) -> Arc<AppState> {
-        let cfg = Config {
+        AppState::new(test_config(config_key, metrics_token))
+    }
+
+    fn test_config(config_key: &str, metrics_token: &str) -> Config {
+        Config {
             port: 0,
             cache_dir: std::env::temp_dir().join("den-subtitles-test-cache"),
             cache_max_bytes: 8 * 1024 * 1024,
@@ -494,8 +507,151 @@ mod tests {
             // Never the live API from a test: port 1 refuses instantly.
             os_api_base: "http://127.0.0.1:1".to_string(),
             scout_origins: Vec::new(),
-        };
+            revocation: Default::default(),
+        }
+    }
+
+    // Issue #8 R3: an install id as /configure mints it (bytes 0..16).
+    const IID: &str = "AAECAwQFBgcICQoLDA0ODw";
+
+    fn plain_segment(json: &str) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    }
+
+    /// A state refusing the installs in `revoked` and every link stamped below `epoch`, with a fixed
+    /// public origin so the URLs it hands back can be requested again.
+    fn revoking_state(revoked: &str, epoch: &str) -> Arc<AppState> {
+        let mut cfg = test_config("", "");
+        cfg.revocation = userconfig::Revocation::from_env(revoked, Some(epoch));
+        cfg.public_base_url = Some("http://subs.test".to_string());
         AppState::new(cfg)
+    }
+
+    /// Every route that reads a config refuses a revoked install, with exactly the answer an
+    /// undecodable segment gets on that route.
+    #[tokio::test]
+    async fn a_revoked_install_is_refused_on_every_config_route() {
+        let seg = plain_segment(&format!(r#"{{"osKey":"os-test","iid":"{IID}"}}"#));
+        let routes = [
+            "manifest.json",
+            "subtitles/movie/tt0000001.json",
+            "subtitle/42.srt",
+            "translate/movie/tt0000001/Swedish.json",
+            "translate/movie/tt0000001/Swedish.srt",
+            "translate/movie/tt0000001/Swedish.status",
+        ];
+        for route in routes {
+            let revoked = handle_request(
+                revoking_state(IID, "0"),
+                request(hyper::Method::GET, &format!("/{seg}/{route}")),
+            )
+            .await;
+            let garbage = handle_request(
+                revoking_state(IID, "0"),
+                request(hyper::Method::GET, &format!("/not-a-config/{route}")),
+            )
+            .await;
+            assert_eq!(revoked.status(), StatusCode::BAD_REQUEST, "{route}");
+            assert_eq!(revoked.status(), garbage.status(), "{route}");
+            let body = body_string(revoked).await;
+            assert_eq!(body, r#"{"error":"bad_config"}"#, "{route}");
+            assert_eq!(body, body_string(garbage).await, "{route}");
+        }
+        // The same install, not revoked, is served.
+        let resp = handle_request(
+            revoking_state("", "0"),
+            request(hyper::Method::GET, &format!("/{seg}/manifest.json")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_install_stamped_below_config_epoch_is_refused() {
+        for (json, want) in [
+            (r#"{"osKey":"o","ep":1}"#, StatusCode::BAD_REQUEST),
+            (r#"{"osKey":"o"}"#, StatusCode::BAD_REQUEST), // no epoch reads as 0
+            (r#"{"osKey":"o","ep":2}"#, StatusCode::OK),
+            (r#"{"osKey":"o","ep":3}"#, StatusCode::OK),
+        ] {
+            let uri = format!("/{}/manifest.json", plain_segment(json));
+            let resp = handle_request(revoking_state("", "2"), request(hyper::Method::GET, &uri)).await;
+            assert_eq!(resp.status(), want, "{json}");
+        }
+    }
+
+    /// Links built before install ids existed carry neither field, and keep working until an epoch
+    /// is raised.
+    #[tokio::test]
+    async fn a_config_without_an_install_id_works_at_epoch_zero() {
+        let uri = format!("/{}/manifest.json", plain_segment(r#"{"osKey":"o"}"#));
+        let resp = handle_request(revoking_state(IID, "0"), request(hyper::Method::GET, &uri)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The subtitle URLs the subtitles resource hands back embed the install's config, so a
+    /// revocation made after they were issued still reaches them.
+    #[tokio::test]
+    async fn a_revoked_install_s_issued_subtitle_url_is_refused() {
+        let seg = plain_segment(&format!(r#"{{"osKey":"os-test","iid":"{IID}"}}"#));
+        let before = revoking_state("", "0");
+        let sub = crate::opensubtitles::Subtitle {
+            file_id: 4242,
+            lang: "en".into(),
+            hash_match: false,
+            downloads: 1,
+            release: "Some.Film.2020.1080p".into(),
+            hd: true,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            ratings: 0.0,
+        };
+        let key = format!("{}tt0000093:0:0:", crate::cache::SEARCH_NS);
+        before.cache.put(key, serde_json::to_string(&vec![sub]).unwrap(), Duration::from_secs(60));
+        let list = handle_request(
+            before,
+            request(hyper::Method::GET, &format!("/{seg}/subtitles/movie/tt0000093.json")),
+        )
+        .await;
+        let list: serde_json::Value = serde_json::from_str(&body_string(list).await).unwrap();
+        let url = list["subtitles"][0]["url"].as_str().expect("a subtitle url").to_string();
+        let path = url.strip_prefix("http://subs.test").expect("the fixed public origin");
+        assert!(path.starts_with(&format!("/{seg}/subtitle/4242.srt")), "{url}");
+
+        let resp = handle_request(revoking_state(IID, "0"), request(hyper::Method::GET, path)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_string(resp).await, r#"{"error":"bad_config"}"#);
+    }
+
+    /// /configure stamps the epoch into every link, sealed or not, so both answers carry it.
+    #[tokio::test]
+    async fn config_key_carries_the_config_epoch() {
+        for (key, want) in [(VEC_PRIV_B64, StatusCode::OK), ("", StatusCode::NOT_FOUND)] {
+            let mut cfg = test_config(key, "");
+            cfg.revocation = userconfig::Revocation::from_env("", Some("4"));
+            let resp = handle_request(AppState::new(cfg), request(hyper::Method::GET, "/config-key")).await;
+            assert_eq!(resp.status(), want);
+            let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+            assert_eq!(body["epoch"], 4, "{body}");
+        }
+    }
+
+    /// Every link the page builds names its install and the epoch it was minted in, and both are
+    /// inside what gets sealed.
+    #[tokio::test]
+    async fn configure_page_mints_an_install_id_and_stamps_the_epoch() {
+        let page =
+            body_string(handle_request(test_state(""), request(hyper::Method::GET, "/configure")).await)
+                .await;
+        assert!(
+            page.contains("crypto.getRandomValues(bytes)"),
+            "the install id is not minted from the CSPRNG"
+        );
+        assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
+        assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
+        assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
     }
 
     async fn body_string(resp: Response<Body>) -> String {

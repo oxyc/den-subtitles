@@ -92,12 +92,13 @@ reason.
   computed per scrape, with nothing per-install in the labels.
 - `GET /`, `GET /configure` — the install page that builds (and, with `CONFIG_KEY` set, seals) the
   config segment.
-- `GET /config-key` — `{"key":"<base64 X25519 public key>"}` for `/configure` to seal to; 404
-  `{"error":"no_key"}` when sealing is off.
+- `GET /config-key` — `{"key":"<base64 X25519 public key>","epoch":<CONFIG_EPOCH>}` for `/configure`
+  to seal to; 404 `{"error":"no_key","epoch":<CONFIG_EPOCH>}` when sealing is off.
 - `GET /manifest.json` — the unconfigured manifest (`configurationRequired`), what a client sees
   before installing.
 - `GET /<config>/manifest.json` — the configured manifest; 400 `{"error":"bad_config"}` for a segment
-  that does not decode.
+  that does not decode, or whose install is revoked (see Configuration). Every `/<config>/…` route
+  gives a revoked install that same answer.
 - `GET /<config>/subtitles/<type>/<id>[/<extra>].json` — the Stremio subtitles resource:
   hash-matched-first OpenSubtitles results, each `url` pointing at `/subtitle` below.
 - `GET /<config>/subtitle/<file_id>.srt` (or `.vtt`) — one subtitle, proxied and cached; `.vtt` is
@@ -120,6 +121,15 @@ secret the app stores in the Keychain. The **OpenSubtitles key** (subtitle sourc
 **LLM key** (translation) is **optional** — omit it for a fetch + auto-sync-only install with no AI.
 Build it at `/configure`.
 
+Every link `/configure` builds also carries an install id (`iid`, 16 random bytes) and the config
+epoch it was built in (`ep`, from `/config-key`), sealed along with the keys. `REVOKED_INSTALLS`
+refuses one install by its id; raising `CONFIG_EPOCH` refuses every link stamped below it (a link
+from before ids existed counts as epoch 0), and new links pick up the new epoch. The config is in
+every `/subtitle` and `/translate` URL the addon hands out, so a revocation reaches those too. **Key
+rotation is not revocation:** `CONFIG_KEYS_PREV` keeps links sealed to an old key opening, so
+rotating `CONFIG_KEY` does nothing to a leaked link — revoke it instead. A refused install is logged
+as `bad_config: install revoked (iid=<first 6 chars>…)` or `bad_config: install epoch too old`.
+
 Supported providers: OpenAI, Google, Anthropic, xAI, OpenRouter (chat) and DeepL (MT). Default model
 is the cheap/fast/decent tier per provider; step up to a bigger model to re-translate a title that
 reads badly (the cache is keyed by provider+model, so it just overwrites).
@@ -134,7 +144,9 @@ it optional (`.env.example` lists the same):
 | `CACHE_MAX_BYTES` | `268435456` (256 MiB) | Cache byte budget. |
 | `PUBLIC_BASE_URL` | unset (derived from `Host`) | Fixed origin for the `/subtitle` and `/translate` URLs handed back to the app. |
 | `CONFIG_KEY` | unset (sealing off) | Base64 X25519 private key `/configure` seals configs to; back it up. |
-| `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working. |
+| `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working — which is also why rotation is not revocation. |
+| `REVOKED_INSTALLS` | unset | Comma-separated install ids (`iid`, 22 characters) refused outright. A malformed entry is skipped with a warning. |
+| `CONFIG_EPOCH` | `0` | Links stamped with an `ep` below this are refused; raise it to revoke every existing link without rotating `CONFIG_KEY`. `/config-key` hands it to `/configure` for new links. Not a non-negative integer → warned and enforced as `0`. |
 | `METRICS_TOKEN` | unset (`/metrics` 404s) | Bearer token for `/metrics`. |
 | `LOG_REQUESTS` | unset (off; `0` is off too) | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, with the config segment as `<config>` and no query string. |
 | `SCOUT_ORIGINS` | unset (Tier 2 off) | Comma-separated den-scout origins (`http://192.168.86.193:8080`) a `?resync=` target may be at — the origin of the stream URLs scout hands the app. |

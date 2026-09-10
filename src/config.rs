@@ -1,7 +1,7 @@
 //! Runtime configuration from the environment. No user credentials live here — both the OpenSubtitles
 //! key and the LLM key are BYOK and ride in the install URL (see `userconfig.rs`). What lives here
-//! is addon-level infrastructure: binary paths, cache sizing, the public origin, and the addon's own
-//! sealing key and metrics token.
+//! is addon-level infrastructure: binary paths, cache sizing, the public origin, the addon's own
+//! sealing key and metrics token, and which installs it refuses.
 
 use std::env;
 use std::path::PathBuf;
@@ -19,6 +19,9 @@ pub struct Config {
     /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
     pub config_key: String,
     pub config_keys_prev: String,
+    /// Installs refused outright (`REVOKED_INSTALLS`) and the oldest config epoch still admitted
+    /// (`CONFIG_EPOCH`). See `userconfig::Revocation`.
+    pub revocation: crate::userconfig::Revocation,
     /// Bearer token for `/metrics`. Empty → the route answers 404, like any unknown path.
     pub metrics_token: String,
     /// One stderr line per request (`LOG_REQUESTS`), off by default. Read once here so that, off, the
@@ -58,6 +61,10 @@ impl Config {
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
+            revocation: crate::userconfig::Revocation::from_env(
+                &env_opt("REVOKED_INSTALLS").unwrap_or_default(),
+                env_opt("CONFIG_EPOCH").as_deref(),
+            ),
             metrics_token: env_opt("METRICS_TOKEN").unwrap_or_default(),
             log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v != "0"),
             os_api_base: crate::opensubtitles::API.to_string(),

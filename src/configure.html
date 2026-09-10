@@ -3413,11 +3413,29 @@ function fillForm(s) {
 
   // Ask the addon for its X25519 public key. When present we SEAL the config to it (the keys become
   // ciphertext in the URL); when absent the addon only understands legacy plaintext, so we fall back.
+  // Either answer carries the addon's config epoch: a link stamped below it is refused, so one built
+  // without it would be born revoked. "no-cache" revalidates (a 304 when nothing changed), so an
+  // epoch raised a minute ago is not read from a five-minute-old copy.
   var sealPublicKey = null;
-  fetch("/config-key")
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (j) { if (j && j.key) sealPublicKey = j.key; })
+  var configEpoch = 0;
+  fetch("/config-key", { cache: "no-cache" })
+    .then(function (r) {
+      return r.json().then(function (j) {
+        if (r.ok && j.key) sealPublicKey = j.key;
+        if (typeof j.epoch === "number") configEpoch = j.epoch;
+      });
+    })
     .catch(function () { /* offline / no key served → plaintext fallback below */ });
+
+  // A fresh install id: 16 random bytes, base64url without padding (22 characters). It names this
+  // one link, so the operator can revoke it (REVOKED_INSTALLS) without touching any other install.
+  function mintInstallId() {
+    var bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
 
   // base64url(JSON) — the legacy plaintext segment, used only when no key is served.
   function encodePlain(config) {
@@ -3471,7 +3489,10 @@ function fillForm(s) {
     var config = collectConfig(); // page-specific; returns null (and focuses the bad field) if invalid
     if (!config) return;
     saveSettings(config);
-    $("url").value = location.origin + "/" + toSegment(config) + "/manifest.json";
+    // Stamped after saving, so every build is a new install: a rebuilt link never shares an id with
+    // the one it replaces, and revoking either leaves the other alone.
+    var install = Object.assign({}, config, { iid: mintInstallId(), ep: configEpoch });
+    $("url").value = location.origin + "/" + toSegment(install) + "/manifest.json";
     $("out").classList.remove("hidden");
     renderSecurityNote();
     copyInstallURL(); // selects the whole URL, focuses it, and copies to the clipboard

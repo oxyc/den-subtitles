@@ -27,7 +27,7 @@ use crate::httputil::{self, Body};
 use crate::logging::LogGate;
 use crate::opensubtitles;
 use crate::state::AppState;
-use crate::userconfig::{self, LlmConfig, UserConfig};
+use crate::userconfig::{LlmConfig, UserConfig};
 use crate::{resync, srt, translate};
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60); // 60 days — mirrors the app cache
@@ -199,7 +199,7 @@ pub async fn handle_subtitles(
     id: &str,
     extra: &str,
 ) -> Response<Body> {
-    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
+    let Some(cfg) = state.decode_config(config) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_config"}), "no-store");
     };
     let Some((imdb, season, episode)) = parse_id(id) else {
@@ -468,7 +468,7 @@ pub async fn handle_subtitle_file(
     resync_url: Option<String>,
     lang: Option<&str>,
 ) -> Response<Body> {
-    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
+    let Some(cfg) = state.decode_config(config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Vet BEFORE keying: a rejected URL changes which tier runs, so keying off the raw one filed a
@@ -1268,7 +1268,7 @@ pub async fn handle_translate(
     want_json: bool,
     resync_url: Option<String>,
 ) -> Response<Body> {
-    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
+    let Some(cfg) = state.decode_config(config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Translation needs the (optional) LLM credential — a subtitles-only install has none.
@@ -1727,7 +1727,7 @@ pub async fn handle_translate_status(
     id: &str,
     lang: &str,
 ) -> Response<Body> {
-    let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
+    let Some(cfg) = state.decode_config(config) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_config"}), "no-store");
     };
     let Some(llm) = &cfg.llm else {
@@ -1987,6 +1987,7 @@ fn type_of(season: Option<i64>) -> &'static str {
 mod tests {
     use super::*;
     use crate::opensubtitles::Subtitle;
+    use crate::userconfig;
 
     fn sub(file_id: i64, hash_match: bool) -> Subtitle {
         Subtitle {
@@ -2309,6 +2310,7 @@ mod translate_retry_tests {
     use super::*;
     use crate::config::Config;
     use crate::state::AppState;
+    use crate::userconfig;
 
     /// A state with its own cache directory. The disk tier is real and persists between runs, so a
     /// shared directory would carry one test's markers into another's preconditions.
@@ -2333,6 +2335,7 @@ mod translate_retry_tests {
             // dependency was invisible.
             os_api_base: "http://127.0.0.1:1".into(),
             scout_origins: Vec::new(),
+            revocation: Default::default(),
         })
     }
 
