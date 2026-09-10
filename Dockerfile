@@ -5,7 +5,7 @@
 # build in a side stage; ffsubsync is a pip install; ffmpeg supplies the audio decode both use.
 
 # ---- build the Rust binary -------------------------------------------------
-FROM rust:1-bookworm AS build
+FROM rust:1-trixie AS build
 WORKDIR /src
 # Cache deps: build manifests + a dummy main first so a code-only change re-links only our crate.
 COPY Cargo.toml Cargo.lock ./
@@ -14,7 +14,7 @@ COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked
 
 # ---- build alass (static Rust CLI) ----------------------------------------
-FROM rust:1-bookworm AS alass
+FROM rust:1-trixie AS alass
 # Pinned, like ffsubsync below: unpinned, every rebuild shipped whatever the registry served that day,
 # and nothing tells you when an aligner's behaviour changed. These are the versions the image ran when
 # they were pinned; bump them deliberately.
@@ -22,8 +22,10 @@ ARG ALASS_VERSION=2.0.0
 RUN cargo install alass-cli --version ${ALASS_VERSION} --root /alass --locked
 
 # ---- runtime --------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 # ffmpeg (audio decode for alass/ffsubsync) + python for ffsubsync + ca-certs for outbound TLS.
+# No compiler: on trixie's Python 3.13 every ffsubsync dependency is a cp313 manylinux or pure wheel,
+# except auditok and srt, which are pure-Python sdists pip builds without one.
 ARG FFSUBSYNC_VERSION=0.5.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg python3 python3-pip ca-certificates \
@@ -51,4 +53,4 @@ EXPOSE 8093
 # No HEALTHCHECK, deliberately: a periodic probe keeps an idle box awake. Health is checked when it
 # matters — by the deploy (den/deploy/den-update.sh), against /health and /manifest.json over HTTP.
 USER 65532:65532
-CMD ["den-subtitles"]
+ENTRYPOINT ["den-subtitles"]
