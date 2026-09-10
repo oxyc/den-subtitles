@@ -304,12 +304,8 @@ async fn run_translation(
     // untranslated original, which then caches for 60 days as a successful translation.
     // `spend` is the caller's, not ours, so it survives this future being dropped mid-run — see
     // `translate`. Everything else here dies with the run and is owned.
-    let budget = Budget {
-        spend,
-        untranslated: AtomicUsize::new(0),
-        started: tokio::time::Instant::now(),
-        deadline,
-    };
+    let budget =
+        Budget { spend, untranslated: AtomicUsize::new(0), started: tokio::time::Instant::now(), deadline };
 
     // Every exit from here down is stamped with the same measurement, once, at the bottom. Asking
     // each `return Err` to remember it is what went wrong before: the upstream-failure exit set it
@@ -317,99 +313,101 @@ async fn run_translation(
     // the ratio reported `spent: false` and had its allowance slot refunded. That is the one failure
     // that repeats identically on every title, so the daily ceiling never engaged for it.
     let outcome: Result<Vec<Cue>, TranslateError> = async {
-    let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
-    // Terms the whole film has to agree on, derived once and pinned ahead of the rolling context in
-    // every batch. It is what carries a name from the third act back to the first, and it is what
-    // gives the opening batches — which now overlap, and so start with nothing translated yet — any
-    // continuity at all. Cached like a batch: a retry should not re-derive it.
-    let sample = glossary_sample(cues);
-    let glossary_key = resume.map(|r| batch_key(&format!("{}:glossary", r.prefix), &sample));
-    let glossary: Vec<(String, String)> = match (resume, glossary_key) {
-        (Some(r), Some(k)) => match r.store.get(&k).and_then(|s| serde_json::from_str(&s).ok()) {
-            Some(hit) => hit,
-            None => {
-                // Billed where the call was ANSWERED, which is what `Some` means: "a call was made"
-                // would charge a dead key for a refusal it was never billed for and lose its
-                // refund, and "the result is non-empty" treats a 200 whose JSON will not parse as
-                // free, when that one is paid for in full. DISPATCH is marked inside the impl,
-                // which is the only place that knows whether a request actually goes out — several
-                // of them answer without calling anything.
+        let mut out: Vec<Cue> = Vec::with_capacity(cues.len());
+        // Terms the whole film has to agree on, derived once and pinned ahead of the rolling context in
+        // every batch. It is what carries a name from the third act back to the first, and it is what
+        // gives the opening batches — which now overlap, and so start with nothing translated yet — any
+        // continuity at all. Cached like a batch: a retry should not re-derive it.
+        let sample = glossary_sample(cues);
+        let glossary_key = resume.map(|r| batch_key(&format!("{}:glossary", r.prefix), &sample));
+        let glossary: Vec<(String, String)> = match (resume, glossary_key) {
+            (Some(r), Some(k)) => match r.store.get(&k).and_then(|s| serde_json::from_str(&s).ok()) {
+                Some(hit) => hit,
+                None => {
+                    // Billed where the call was ANSWERED, which is what `Some` means: "a call was made"
+                    // would charge a dead key for a refusal it was never billed for and lose its
+                    // refund, and "the result is non-empty" treats a 200 whose JSON will not parse as
+                    // free, when that one is paid for in full. DISPATCH is marked inside the impl,
+                    // which is the only place that knows whether a request actually goes out — several
+                    // of them answer without calling anything.
+                    let built = upstream.glossary(&sample, budget.spend).await;
+                    if built.is_some() {
+                        budget.spend.bill();
+                    }
+                    let built = built.unwrap_or_default();
+                    // Only a glossary that exists is worth remembering. "No glossary" is also what a
+                    // failed or unparseable derivation returns, and storing that would hold a transient
+                    // provider blip in place for a day — every retry that day translating the film
+                    // without the terms it should have had.
+                    if !built.is_empty() {
+                        if let Ok(json) = serde_json::to_string(&built) {
+                            r.store.put(k, json);
+                        }
+                    }
+                    built
+                }
+            },
+            _ => {
                 let built = upstream.glossary(&sample, budget.spend).await;
                 if built.is_some() {
                     budget.spend.bill();
                 }
-                let built = built.unwrap_or_default();
-                // Only a glossary that exists is worth remembering. "No glossary" is also what a
-                // failed or unparseable derivation returns, and storing that would hold a transient
-                // provider blip in place for a day — every retry that day translating the film
-                // without the terms it should have had.
-                if !built.is_empty() {
-                    if let Ok(json) = serde_json::to_string(&built) {
-                        r.store.put(k, json);
-                    }
-                }
-                built
+                built.unwrap_or_default()
             }
-        },
-        _ => {
-            let built = upstream.glossary(&sample, budget.spend).await;
-            if built.is_some() {
-                budget.spend.bill();
+        };
+
+        // Batches overlap, up to CONCURRENCY of them. `buffered` IS the bound — a batch's future does
+        // not start until it enters the window — which is what keeps the two guards below meaningful:
+        // the deadline is checked as a batch starts, so at most CONCURRENCY calls can ever be past it,
+        // and dropping this stream cancels whatever is still in flight.
+        //
+        // Results arrive in batch order regardless of which finished first, so a cue can never be
+        // reassembled against another cue's timing.
+        // Built eagerly (an async fn is lazy — constructing the future runs nothing) rather than through
+        // `StreamExt::map`, whose closure has to be generic over the item lifetime and cannot be, since
+        // every batch borrows the one `cues` slice.
+        let pending: Vec<_> = cues
+            .chunks(BATCH)
+            .map(|batch| one_batch(upstream, batch, &glossary, &context, &budget, resume))
+            .collect();
+        let mut stream = stream::iter(pending).buffered(CONCURRENCY);
+
+        while let Some(batch) = stream.next().await {
+            let (batch, translated) = batch?;
+            for (cue, text) in batch.iter().zip(translated) {
+                out.push(Cue { text, ..cue.clone() });
             }
-            built.unwrap_or_default()
+            // Cues settled, out of cues total. Reported per completed batch rather than per cue: the
+            // client polling this is drawing a bar, and a batch is the granularity at which anything
+            // actually changes.
+            progress(out.len(), cues.len());
+            // Bail on a film that is clearly not being translated: a wrong-length model costs 2n-1 calls
+            // a batch, so running to the end means thousands of paid calls to learn what the opening
+            // showed.
+            //
+            // Bail only when the verdict is already decided — when the dead count alone exceeds the bar
+            // for the WHOLE film, so no amount of perfect translation in the cues still to come could
+            // rescue it. `kept` only grows, so this can never refuse a film the final verdict would have
+            // passed, and that argument does not depend on the order batches finish in.
+            //
+            // Judging the sample against itself is what cannot be done here: three batches of a
+            // name-dense opening is not evidence about the ninety batches after it, and doing that
+            // refused films whose true ratio was nowhere near the bar.
+            //
+            // What concurrency costs is precision, not soundness: up to CONCURRENCY-1 batches are
+            // already in flight when this fires, and they are cancelled unpaid only if they have not
+            // been sent yet. That is the price of the window, and it is bounded by its size.
+            let kept = budget.untranslated.load(Ordering::Relaxed);
+            if unusable(kept, cues.len()) {
+                return Err(
+                    format!("model returned unusable output for {kept} of {} cues", cues.len()).into()
+                );
+            }
         }
-    };
-
-    // Batches overlap, up to CONCURRENCY of them. `buffered` IS the bound — a batch's future does
-    // not start until it enters the window — which is what keeps the two guards below meaningful:
-    // the deadline is checked as a batch starts, so at most CONCURRENCY calls can ever be past it,
-    // and dropping this stream cancels whatever is still in flight.
-    //
-    // Results arrive in batch order regardless of which finished first, so a cue can never be
-    // reassembled against another cue's timing.
-    // Built eagerly (an async fn is lazy — constructing the future runs nothing) rather than through
-    // `StreamExt::map`, whose closure has to be generic over the item lifetime and cannot be, since
-    // every batch borrows the one `cues` slice.
-    let pending: Vec<_> = cues
-        .chunks(BATCH)
-        .map(|batch| one_batch(upstream, batch, &glossary, &context, &budget, resume))
-        .collect();
-    let mut stream = stream::iter(pending).buffered(CONCURRENCY);
-
-    while let Some(batch) = stream.next().await {
-        let (batch, translated) = batch?;
-        for (cue, text) in batch.iter().zip(translated) {
-            out.push(Cue { text, ..cue.clone() });
-        }
-        // Cues settled, out of cues total. Reported per completed batch rather than per cue: the
-        // client polling this is drawing a bar, and a batch is the granularity at which anything
-        // actually changes.
-        progress(out.len(), cues.len());
-        // Bail on a film that is clearly not being translated: a wrong-length model costs 2n-1 calls
-        // a batch, so running to the end means thousands of paid calls to learn what the opening
-        // showed.
-        //
-        // Bail only when the verdict is already decided — when the dead count alone exceeds the bar
-        // for the WHOLE film, so no amount of perfect translation in the cues still to come could
-        // rescue it. `kept` only grows, so this can never refuse a film the final verdict would have
-        // passed, and that argument does not depend on the order batches finish in.
-        //
-        // Judging the sample against itself is what cannot be done here: three batches of a
-        // name-dense opening is not evidence about the ninety batches after it, and doing that
-        // refused films whose true ratio was nowhere near the bar.
-        //
-        // What concurrency costs is precision, not soundness: up to CONCURRENCY-1 batches are
-        // already in flight when this fires, and they are cancelled unpaid only if they have not
-        // been sent yet. That is the price of the window, and it is bounded by its size.
-        let kept = budget.untranslated.load(Ordering::Relaxed);
-        if unusable(kept, cues.len()) {
-            return Err(format!("model returned unusable output for {kept} of {} cues", cues.len()).into());
-        }
-    }
-    // No verdict after the loop: the check above runs after the last batch too, against the same
-    // count and the same denominator, so a second one could never reach a different answer.
-    debug_assert_eq!(out.len(), cues.len());
-    Ok(out)
+        // No verdict after the loop: the check above runs after the last batch too, against the same
+        // count and the same denominator, so a second one could never reach a different answer.
+        debug_assert_eq!(out.len(), cues.len());
+        Ok(out)
     }
     .await;
 
@@ -493,9 +491,6 @@ fn unusable(kept: usize, seen: usize) -> bool {
     seen > 1 && kept * 3 > seen * 2
 }
 
-
-
-
 /// What a run has produced, and how long it has had.
 ///
 /// There is no call counter. The split is a binary tree with one leaf per cue, so a batch of n
@@ -552,7 +547,12 @@ enum CallError {
     /// `fatal` narrows that further: the refusal is about the CREDENTIAL, not the moment, so it will
     /// happen identically for the next film. Worth telling the caller apart from a timeout, which
     /// looks the same from here and is genuinely per-title.
-    Upstream { message: String, retry: Option<Duration>, fatal: bool, key_certain: bool },
+    Upstream {
+        message: String,
+        retry: Option<Duration>,
+        fatal: bool,
+        key_certain: bool,
+    },
 }
 
 /// Everything that reaches here as a bare string came from the transport or a serialization step —
@@ -696,11 +696,7 @@ trait BatchCall: Sync {
     /// calling anything, and so does the real one for DeepL or an empty sample. Marked at the call
     /// site instead, a resumed run whose glossary came from the store reported having sent a request
     /// it never sent, and would have lost its refund for it.
-    fn glossary<'a>(
-        &'a self,
-        _sample: &'a [String],
-        _spend: &'a Spend,
-    ) -> GlossaryFuture<'a> {
+    fn glossary<'a>(&'a self, _sample: &'a [String], _spend: &'a Spend) -> GlossaryFuture<'a> {
         Box::pin(async { None })
     }
 }
@@ -746,7 +742,8 @@ fn parse_glossary(text: &str) -> Vec<(String, String)> {
     if end <= start {
         return Vec::new();
     }
-    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text[start..=end]) else {
+    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text[start..=end])
+    else {
         return Vec::new();
     };
     map.into_iter()
@@ -789,11 +786,7 @@ impl BatchCall for Upstream<'_> {
         })
     }
 
-    fn glossary<'a>(
-        &'a self,
-        sample: &'a [String],
-        spend: &'a Spend,
-    ) -> GlossaryFuture<'a> {
+    fn glossary<'a>(&'a self, sample: &'a [String], spend: &'a Spend) -> GlossaryFuture<'a> {
         Box::pin(async move {
             // DeepL has no chat path and ignores context entirely, so there is nothing to give it.
             // Both of these return without sending anything, which is why dispatch is marked below
@@ -938,7 +931,8 @@ async fn translate_batch(
             // don't thread the first half's output into the second here — keeps the split simple.
             let mid = sources.len() / 2;
             // Box the recursive futures — an async fn can't hold an unboxed future of itself.
-            let mut left = Box::pin(translate_batch(upstream, &sources[..mid], context, budget, resume)).await?;
+            let mut left =
+                Box::pin(translate_batch(upstream, &sources[..mid], context, budget, resume)).await?;
             let right = Box::pin(translate_batch(upstream, &sources[mid..], context, budget, resume)).await?;
             left.extend(right);
             Ok(left)
@@ -1071,10 +1065,7 @@ async fn call_chat_typed(
             Auth::AnthropicKey,
         ),
         Provider::Google => (
-            format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-                llm.model
-            ),
+            format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", llm.model),
             json!({
                 "systemInstruction": {"parts": [{"text": system}]},
                 "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -1090,9 +1081,7 @@ async fn call_chat_typed(
     let mut req = client.post(&url).timeout(LLM_TIMEOUT).json(&body);
     req = match auth {
         Auth::Bearer => req.bearer_auth(&llm.api_key),
-        Auth::AnthropicKey => req
-            .header("x-api-key", &llm.api_key)
-            .header("anthropic-version", "2023-06-01"),
+        Auth::AnthropicKey => req.header("x-api-key", &llm.api_key).header("anthropic-version", "2023-06-01"),
         Auth::GoogleKey => req.header("x-goog-api-key", &llm.api_key),
     };
 
@@ -1103,7 +1092,12 @@ async fn call_chat_typed(
         // The status only. This string is logged, and the body is the PROVIDER's text about a
         // request that carried the user's key — OpenAI's 401 quotes a masked form of it back, and a
         // self-hosted gateway is under no obligation to mask anything.
-        return Err(CallError::Upstream { message: format!("provider {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(llm.provider, code) });
+        return Err(CallError::Upstream {
+            message: format!("provider {code}"),
+            retry,
+            fatal: is_credential_refusal(code),
+            key_certain: is_certainly_the_key(llm.provider, code),
+        });
     }
     let v = provider_json(resp).await?;
     // Contract, not Upstream: a 200 with no usable text is a safety filter or an empty candidate
@@ -1170,15 +1164,15 @@ fn chat_base(_provider: Provider) -> String {
 /// This was the whole of the previous fix's gap: the classification was applied one statement too
 /// late, and `?` on the decode above it still resolved to Upstream through `From<String>`.
 async fn provider_json(resp: reqwest::Response) -> Result<Value, CallError> {
-    let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_BODY)
-        .await
-        .map_err(|e| match e.starts_with("read body:") {
+    let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_BODY).await.map_err(|e| {
+        match e.starts_with("read body:") {
             // Not marked retryable: the task at hand is 429s and 5xx, where the provider told us
             // what is wrong. A mid-body stream failure is arguably worth another go too, but that is
             // a separate judgement and it is not made here by accident.
             true => CallError::upstream(e),
             false => CallError::Contract(e),
-        })?;
+        }
+    })?;
     serde_json::from_slice(&bytes)
         .map_err(|e| CallError::Contract(format!("provider returned unparseable JSON: {e}")))
 }
@@ -1217,7 +1211,12 @@ async fn deepl_translate(
     if !resp.status().is_success() {
         let code = resp.status();
         let retry = retry_after(code, resp.headers());
-        return Err(CallError::Upstream { message: format!("deepl {code}"), retry, fatal: is_credential_refusal(code), key_certain: is_certainly_the_key(Provider::DeepL, code) });
+        return Err(CallError::Upstream {
+            message: format!("deepl {code}"),
+            retry,
+            fatal: is_credential_refusal(code),
+            key_certain: is_certainly_the_key(Provider::DeepL, code),
+        });
     }
     let v = provider_json(resp).await?;
     let arr = v["translations"]
@@ -1439,9 +1438,6 @@ impl Scan {
     }
 }
 
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1480,9 +1476,28 @@ mod tests {
     fn no_two_languages_canonicalize_to_one_key() {
         // Names, not codes: two spellings of ONE language are meant to agree, and do.
         let languages = [
-            "English", "Swedish", "Norwegian", "Danish", "Finnish", "German", "Spanish",
-            "Portuguese", "French", "Italian", "Dutch", "Polish", "Russian", "Turkish", "Czech",
-            "Greek", "Japanese", "Korean", "Estonian", "Slovak", "Slovenian", "Chinese",
+            "English",
+            "Swedish",
+            "Norwegian",
+            "Danish",
+            "Finnish",
+            "German",
+            "Spanish",
+            "Portuguese",
+            "French",
+            "Italian",
+            "Dutch",
+            "Polish",
+            "Russian",
+            "Turkish",
+            "Czech",
+            "Greek",
+            "Japanese",
+            "Korean",
+            "Estonian",
+            "Slovak",
+            "Slovenian",
+            "Chinese",
             "Indonesian",
         ];
         let mut seen: Vec<(&str, String)> = Vec::new();
@@ -1511,7 +1526,12 @@ mod contract_tests {
 
     fn cues(n: usize) -> Vec<Cue> {
         (0..n)
-            .map(|i| Cue { index: i as u32 + 1, start: i as u64 * 1000, end: i as u64 * 1000 + 900, text: format!("line {i}") })
+            .map(|i| Cue {
+                index: i as u32 + 1,
+                start: i as u64 * 1000,
+                end: i as u64 * 1000 + 900,
+                text: format!("line {i}"),
+            })
             .collect()
     }
 
@@ -1578,11 +1598,7 @@ mod contract_tests {
                 let out: Vec<String> = sources.iter().map(|t| format!("T:{t}")).collect();
                 Box::pin(async move { Ok(out) })
             }
-            fn glossary<'a>(
-                &'a self,
-                _sample: &'a [String],
-                spend: &'a Spend,
-            ) -> GlossaryFuture<'a> {
+            fn glossary<'a>(&'a self, _sample: &'a [String], spend: &'a Spend) -> GlossaryFuture<'a> {
                 Box::pin(async move {
                     spend.dispatch();
                     Some(vec![("Westeros".to_string(), "Västeros".to_string())])
@@ -1611,8 +1627,11 @@ mod contract_tests {
         // Fences and surrounding prose are fine — same tolerance the array parser has.
         let fenced = "Here you go:\n```json\n{\"Westeros\": \"Västeros\", \"Ser\": \"Ser\"}\n```";
         let parsed = parse_glossary(fenced);
-        assert_eq!(parsed, vec![("Westeros".to_string(), "Västeros".to_string())],
-            "a term that maps to itself teaches nothing and should be dropped");
+        assert_eq!(
+            parsed,
+            vec![("Westeros".to_string(), "Västeros".to_string())],
+            "a term that maps to itself teaches nothing and should be dropped"
+        );
 
         for junk in ["", "no json here", "[1,2,3]", "{", "}{", "{\"a\": 1}"] {
             assert!(parse_glossary(junk).is_empty(), "accepted junk: {junk:?}");
@@ -1651,9 +1670,8 @@ mod contract_tests {
         // The budget must hold when the bytes are CONCENTRATED, not just when they are spread. A
         // stride divides by the average length, so one enormous cue among many short ones strides
         // straight past the arithmetic — and that one cue is then the whole prompt.
-        let mut skewed: Vec<Cue> = (0..1000)
-            .map(|i| Cue { index: i, start: 0, end: 0, text: "x".into() })
-            .collect();
+        let mut skewed: Vec<Cue> =
+            (0..1000).map(|i| Cue { index: i, start: 0, end: 0, text: "x".into() }).collect();
         skewed[0].text = "y".repeat(4 * 1024 * 1024);
         let chars: usize = glossary_sample(&skewed).iter().map(|s| s.len() + 1).sum();
         assert!(chars <= GLOSSARY_SAMPLE_CHARS, "one huge cue put {chars} chars in the prompt");
@@ -1726,7 +1744,10 @@ mod contract_tests {
         // DeepL in particular documents it as its single auth failure and has no moderation at all.
         let forbidden = StatusCode::from_u16(403).unwrap();
         assert!(is_credential_refusal(forbidden));
-        assert!(!is_certainly_the_key(Provider::OpenRouter, forbidden), "a moderation 403 blocked the install");
+        assert!(
+            !is_certainly_the_key(Provider::OpenRouter, forbidden),
+            "a moderation 403 blocked the install"
+        );
         for p in [Provider::DeepL, Provider::OpenAI, Provider::Anthropic, Provider::Google, Provider::Xai] {
             assert!(is_certainly_the_key(p, forbidden), "{p:?}'s 403 was treated as ambiguous");
         }
@@ -1806,11 +1827,7 @@ mod contract_tests {
         // failure that repeats identically on every title, so the daily ceiling never engaged.
         let up = fake(|src: &[String]| Ok(src.to_vec())); // echoes: every cue falls to the keep leaf
         let err = run_translation_t(&up, &cues(120)).await.expect_err("an echoing model must fail");
-        assert!(
-            err.message.contains("unusable"),
-            "expected the quality gate, got: {}",
-            err.message
-        );
+        assert!(err.message.contains("unusable"), "expected the quality gate, got: {}", err.message);
         assert!(err.spent, "a film refused by the quality gate claimed nothing had been paid for");
 
         // And the same gate reached by CONTRACT failures, which is the dear way to reach it and the
@@ -1820,11 +1837,7 @@ mod contract_tests {
         // report `spent: false` after some 1,660 billed calls, and the slot went back.
         let up = fake(|_: &[String]| Err(CallError::Contract("model did not return a JSON array".into())));
         let err = run_translation_t(&up, &cues(120)).await.expect_err("a prose model must fail");
-        assert!(
-            err.message.contains("unusable"),
-            "expected the quality gate, got: {}",
-            err.message
-        );
+        assert!(err.message.contains("unusable"), "expected the quality gate, got: {}", err.message);
         assert!(err.spent, "a film of billed 200s claimed nothing had been paid for");
 
         // The other side of that line: a refusal is charged for nothing, and a transport error
@@ -1852,16 +1865,31 @@ mod contract_tests {
             }
             Ok(src.iter().map(|s| format!("SV {s}")).collect())
         });
-        let first = run_translation(&up, &film, Duration::from_secs(600), Some(&resume), &Spend::default(), &no_progress).await;
+        let first = run_translation(
+            &up,
+            &film,
+            Duration::from_secs(600),
+            Some(&resume),
+            &Spend::default(),
+            &no_progress,
+        )
+        .await;
         assert!(first.is_err(), "the run should have failed on the third batch");
         assert_eq!(*up.calls.lock().unwrap(), 3, "two good batches and the refusal");
         assert_eq!(store.len(), 2, "the two paid batches should have been remembered");
 
         // Second attempt, provider healthy. Only the batch that failed may reach it.
         let up2 = fake(|src: &[String]| Ok(src.iter().map(|s| format!("SV {s}")).collect()));
-        let done = run_translation(&up2, &film, Duration::from_secs(600), Some(&resume), &Spend::default(), &no_progress)
-            .await
-            .expect("the retry should finish");
+        let done = run_translation(
+            &up2,
+            &film,
+            Duration::from_secs(600),
+            Some(&resume),
+            &Spend::default(),
+            &no_progress,
+        )
+        .await
+        .expect("the retry should finish");
         assert_eq!(*up2.calls.lock().unwrap(), 1, "the retry re-bought batches it already had");
 
         // And the film is whole, in order — a resumed run is not a half-translated one.
@@ -1883,7 +1911,15 @@ mod contract_tests {
         // a single cue still gets three back — so every leaf is a wrong-length reply and keeps its
         // source. (One line back would have MATCHED a split-to-one batch and translated it.)
         let up = fake(|_: &[String]| Ok(vec!["a".to_string(), "b".to_string(), "c".to_string()]));
-        let out = run_translation(&up, &cues(2), Duration::from_secs(600), Some(&resume), &Spend::default(), &no_progress).await;
+        let out = run_translation(
+            &up,
+            &cues(2),
+            Duration::from_secs(600),
+            Some(&resume),
+            &Spend::default(),
+            &no_progress,
+        )
+        .await;
         assert!(out.is_err(), "a film that translated nothing is not a translation");
         assert_eq!(store.len(), 0, "a kept-source leaf was remembered as if it were a translation");
     }
@@ -1907,8 +1943,15 @@ mod contract_tests {
         let store = MemStore::default();
         let resume = Resume { store: &store, prefix: "p".into() };
         let first = Spend::default();
-        let _ = run_translation(&fake(echo), &film, Duration::from_secs(600), Some(&resume), &first, &no_progress)
-            .await;
+        let _ = run_translation(
+            &fake(echo),
+            &film,
+            Duration::from_secs(600),
+            Some(&resume),
+            &first,
+            &no_progress,
+        )
+        .await;
         // A run served entirely from the store sends nothing and is charged for nothing. BOTH
         // answers matter and they are different questions: the caller refunds a finished run on
         // `was_billed` and a cancelled one on `was_dispatched`, so a resumed run has to come back
@@ -1930,7 +1973,10 @@ mod contract_tests {
 
     /// The harness with a deadline long enough never to be the thing under test, and no batch store
     /// — these cases are about what the model does, so nothing may be answered from a previous run.
-    async fn run_translation_t(up: &(dyn BatchCall + Sync), cues: &[Cue]) -> Result<Vec<Cue>, TranslateError> {
+    async fn run_translation_t(
+        up: &(dyn BatchCall + Sync),
+        cues: &[Cue],
+    ) -> Result<Vec<Cue>, TranslateError> {
         run_translation(up, cues, Duration::from_secs(600), None, &Spend::default(), &no_progress).await
     }
 
@@ -1951,12 +1997,7 @@ mod contract_tests {
     /// track that loads, is selectable, and shows nothing.
     #[test]
     fn non_string_elements_are_not_a_valid_reply() {
-        for body in [
-            r#"[{"text":"a"},{"text":"b"}]"#,
-            r#"["a", null]"#,
-            r#"[["a"],["b"]]"#,
-            r#"[1, 2]"#,
-        ] {
+        for body in [r#"[{"text":"a"},{"text":"b"}]"#, r#"["a", null]"#, r#"[["a"],["b"]]"#, r#"[1, 2]"#] {
             assert!(parse_json_array(body).is_none(), "accepted a non-string array: {body}");
         }
         // The valid shape still parses, fences and prose included.
@@ -1970,8 +2011,11 @@ mod contract_tests {
             "I [will] translate:\n[\"a\",\"b\"]",
             "Sure! Here is [the] result: [\"a\",\"b\"]",
         ] {
-            assert_eq!(parse_json_array(chatty).as_deref(), Some(&["a".to_string(), "b".to_string()][..]),
-                "chatty reply not recovered: {chatty:?}");
+            assert_eq!(
+                parse_json_array(chatty).as_deref(),
+                Some(&["a".to_string(), "b".to_string()][..]),
+                "chatty reply not recovered: {chatty:?}"
+            );
         }
     }
 
@@ -2097,7 +2141,15 @@ mod contract_tests {
         }
         // 400 cues is 10 batches at 20ms each; the deadline expires partway, far under the budget.
         let up = Slow(Mutex::new(0));
-        let out = run_translation(&up, &cues(400), Duration::from_millis(50), None, &Spend::default(), &no_progress).await;
+        let out = run_translation(
+            &up,
+            &cues(400),
+            Duration::from_millis(50),
+            None,
+            &Spend::default(),
+            &no_progress,
+        )
+        .await;
         // It stops CALLING — that is the deadline's whole job. One 40-cue batch splits into up to
         // 79 calls, so a deadline checked only between batches would let all of them run first.
         assert!(*up.0.lock().unwrap() < 20, "it kept calling past the deadline");
@@ -2117,7 +2169,11 @@ mod contract_tests {
                     .map(|t| {
                         let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
                         // Three in ten unchanged, spread through the track.
-                        if n % 10 < 3 { t.clone() } else { format!("T:{t}") }
+                        if n % 10 < 3 {
+                            t.clone()
+                        } else {
+                            format!("T:{t}")
+                        }
                     })
                     .collect())
             });
@@ -2195,7 +2251,11 @@ mod contract_tests {
             Ok(s.iter()
                 .map(|t| {
                     let n: usize = t.trim_start_matches("line ").parse().unwrap_or(9999);
-                    if n < 90 { t.clone() } else { format!("T:{t}") }
+                    if n < 90 {
+                        t.clone()
+                    } else {
+                        format!("T:{t}")
+                    }
                 })
                 .collect())
         });
@@ -2264,7 +2324,9 @@ mod contract_tests {
     async fn exhausting_the_budget_does_not_refuse_an_acceptable_film() {
         // One cue in ten comes back wrong-length, so every batch splits to isolate four of them.
         let up = fake(|s: &[String]| {
-            if s.iter().any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n.is_multiple_of(10))) {
+            if s.iter()
+                .any(|t| t.trim_start_matches("line ").parse::<usize>().is_ok_and(|n| n.is_multiple_of(10)))
+            {
                 Ok(vec!["junk".to_string(); s.len() + 1])
             } else {
                 Ok(s.iter().map(|t| format!("T:{t}")).collect())
@@ -2426,7 +2488,11 @@ mod contract_tests {
             Ok(s.iter()
                 .map(|t| {
                     let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
-                    if n.is_multiple_of(10) { String::new() } else { format!("T:{t}") }
+                    if n.is_multiple_of(10) {
+                        String::new()
+                    } else {
+                        format!("T:{t}")
+                    }
                 })
                 .collect())
         });
@@ -2499,7 +2565,11 @@ mod contract_tests {
                 Ok(s.iter()
                     .map(|t| {
                         let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
-                        if n < matching { t.clone() } else { format!("T:{t}") }
+                        if n < matching {
+                            t.clone()
+                        } else {
+                            format!("T:{t}")
+                        }
                     })
                     .collect())
             });
@@ -2530,7 +2600,11 @@ mod contract_tests {
             Ok(s.iter()
                 .map(|t| {
                     let n: usize = t.trim_start_matches("line ").parse().unwrap_or(999);
-                    if n < 11 { t.clone() } else { format!("T:{t}") }
+                    if n < 11 {
+                        t.clone()
+                    } else {
+                        format!("T:{t}")
+                    }
                 })
                 .collect())
         });
@@ -2553,7 +2627,9 @@ mod contract_tests {
             sizes.lock().unwrap().push(src.len());
             Err(CallError::Upstream {
                 message: "provider 429: rate limited".into(),
-                retry: Some(Duration::ZERO), fatal: false, key_certain: false,
+                retry: Some(Duration::ZERO),
+                fatal: false,
+                key_certain: false,
             })
         });
         assert!(run_translation_t(&up, &cues(40)).await.is_err());
@@ -2577,7 +2653,9 @@ mod contract_tests {
             if *n == 1 {
                 return Err(CallError::Upstream {
                     message: "provider 429".into(),
-                    retry: Some(Duration::from_secs(2)), fatal: false, key_certain: false,
+                    retry: Some(Duration::from_secs(2)),
+                    fatal: false,
+                    key_certain: false,
                 });
             }
             Ok(src.iter().map(|s| format!("T:{s}")).collect())
@@ -2602,7 +2680,12 @@ mod contract_tests {
     #[tokio::test(start_paused = true)]
     async fn retries_are_bounded() {
         let up = fake(|_: &[String]| {
-            Err(CallError::Upstream { message: "provider 503".into(), retry: Some(Duration::ZERO), fatal: false, key_certain: false })
+            Err(CallError::Upstream {
+                message: "provider 503".into(),
+                retry: Some(Duration::ZERO),
+                fatal: false,
+                key_certain: false,
+            })
         });
         let err = run_translation_t(&up, &cues(40)).await.expect_err("a permanent 503 must fail");
         assert!(err.message.contains("503"), "the refusal should surface, not a timeout: {}", err.message);
@@ -2617,10 +2700,14 @@ mod contract_tests {
         let up = fake(|_: &[String]| {
             Err(CallError::Upstream {
                 message: "provider 429".into(),
-                retry: Some(Duration::from_secs(3600)), fatal: false, key_certain: false,
+                retry: Some(Duration::from_secs(3600)),
+                fatal: false,
+                key_certain: false,
             })
         });
-        let out = run_translation(&up, &cues(40), Duration::from_secs(600), None, &Spend::default(), &no_progress).await;
+        let out =
+            run_translation(&up, &cues(40), Duration::from_secs(600), None, &Spend::default(), &no_progress)
+                .await;
         assert!(out.is_err());
         assert_eq!(*up.calls.lock().unwrap(), 1, "an hour-long backoff was taken inside a ten-minute run");
     }
@@ -2665,11 +2752,7 @@ mod provider_reply_tests {
         let base = provider_owned(status, body).await;
         CHAT_BASE.with(|b| *b.borrow_mut() = Some(base));
         let http = reqwest::Client::new();
-        let llm = LlmConfig {
-            provider: Provider::OpenAI,
-            api_key: "k".into(),
-            model: "m".into(),
-        };
+        let llm = LlmConfig { provider: Provider::OpenAI, api_key: "k".into(), model: "m".into() };
         llm_translate(&http, &llm, &["a".to_string()], "Swedish", &[]).await
     }
 
@@ -2719,10 +2802,8 @@ mod provider_reply_tests {
                 let mut buf = [0u8; 8192];
                 let _ = sock.read(&mut buf).await;
                 // Declared over the cap: rejected before a byte of it is transferred.
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
-                    crate::fetch::MAX_BODY + 1
-                );
+                let head =
+                    format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", crate::fetch::MAX_BODY + 1);
                 let _ = sock.write_all(head.as_bytes()).await;
                 let _ = sock.shutdown().await;
             }
@@ -2747,9 +2828,7 @@ mod provider_reply_tests {
                 let mut buf = [0u8; 8192];
                 let _ = sock.read(&mut buf).await;
                 // Promise 500 bytes, send 10, hang up.
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 500\r\n\r\n0123456789")
-                    .await;
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 500\r\n\r\n0123456789").await;
                 let _ = sock.shutdown().await;
             }
         });

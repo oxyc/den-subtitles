@@ -87,11 +87,7 @@ impl SyncTools {
         let run_result = self
             .run(
                 &self.alass,
-                &[
-                    media_url,
-                    target.to_string_lossy().as_ref(),
-                    out.to_string_lossy().as_ref(),
-                ],
+                &[media_url, target.to_string_lossy().as_ref(), out.to_string_lossy().as_ref()],
                 TIER2_BUDGET,
             )
             .await;
@@ -124,7 +120,12 @@ impl SyncTools {
         }
     }
 
-    async fn run(&self, bin: &str, args: &[&str], budget: Duration) -> Result<std::process::ExitStatus, String> {
+    async fn run(
+        &self,
+        bin: &str,
+        args: &[&str],
+        budget: Duration,
+    ) -> Result<std::process::ExitStatus, String> {
         let child = Command::new(bin)
             .args(args)
             .stdin(Stdio::null())
@@ -155,9 +156,7 @@ impl SyncTools {
                 // having written nothing usable when handed a target they can't parse, and that
                 // empty string was cached for 60 days as the finished alignment — worse than the
                 // raw sub, which at least plays.
-                Ok(body) if !crate::srt::has_a_cue(&body) => {
-                    Err("sync produced no cues".to_string())
-                }
+                Ok(body) if !crate::srt::has_a_cue(&body) => Err("sync produced no cues".to_string()),
                 Ok(body) => Ok(body),
                 Err(e) => Err(format!("read synced: {e}")),
             },
@@ -176,9 +175,7 @@ impl SyncTools {
     }
 
     async fn write_temp(&self, tag: &str, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-        tokio::fs::create_dir_all(&self.work_dir)
-            .await
-            .map_err(|e| format!("mkdir work: {e}"))?;
+        tokio::fs::create_dir_all(&self.work_dir).await.map_err(|e| format!("mkdir work: {e}"))?;
         let path = self.temp_path(tag, name);
         let mut f = tokio::fs::File::create(&path).await.map_err(|e| format!("create temp: {e}"))?;
         // A failed write leaves the file `create` already made; nothing else ever removes it.
@@ -307,9 +304,8 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_errors_and_still_removes_input_temps() {
         let dir = work_dir("t1-nobin");
-        let out = tools(&dir, "/nonexistent/xyzzy-ffsubsync".into())
-            .sync_to_reference(SUB, REF, "tag-nobin")
-            .await;
+        let out =
+            tools(&dir, "/nonexistent/xyzzy-ffsubsync".into()).sync_to_reference(SUB, REF, "tag-nobin").await;
         assert!(out.is_err());
         // A spawn failure produced no exit status, but the temp inputs written before the spawn must
         // not leak — every request under a misconfigured binary path would otherwise pile them up.

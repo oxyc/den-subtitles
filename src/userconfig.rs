@@ -118,9 +118,7 @@ fn validate(raw: RawConfig) -> Option<UserConfig> {
     if raw.opensubtitles_key.is_empty() || raw.opensubtitles_key.len() > 128 {
         return None;
     }
-    let opensubtitles_token = raw
-        .opensubtitles_token
-        .filter(|t| !t.is_empty() && t.len() <= 512);
+    let opensubtitles_token = raw.opensubtitles_token.filter(|t| !t.is_empty() && t.len() <= 512);
 
     // The LLM credential is optional. It's absent iff neither a provider nor a key was given
     // (subtitles-only). If either is present, both must be valid — a half-filled AI section (e.g. a

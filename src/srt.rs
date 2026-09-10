@@ -546,7 +546,6 @@ mod separator_tests {
         assert!(took < std::time::Duration::from_secs(10), "parse took {took:?} — quadratic again?");
     }
 
-
     /// A separator line carrying a space or a tab is still a separator. Splitting on the literal
     /// "\n\n" missed those and swallowed the following cue whole — so this asserts the cue count,
     /// the recovered cue's OWN timing, and that no timecode leaked into anyone's dialogue. The
@@ -606,7 +605,8 @@ mod separator_tests {
     /// still yields its last cue — the final block is flushed after the loop, not by a separator.
     #[test]
     fn blank_runs_and_a_missing_trailing_newline() {
-        let cues = parse("1\n00:00:01,000 --> 00:00:02,000\nfirst\n\n \n\n2\n00:00:05,000 --> 00:00:06,000\nlast");
+        let cues =
+            parse("1\n00:00:01,000 --> 00:00:02,000\nfirst\n\n \n\n2\n00:00:05,000 --> 00:00:06,000\nlast");
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[1].text, "last");
     }

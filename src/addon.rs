@@ -202,7 +202,8 @@ pub async fn handle_subtitles(
     let hash = search_hash(extra);
     let filename = search_filename(extra);
     let client = os_client(state, http, &cfg);
-    let mut subs = match cached_search(state, &client, config, &imdb, season, episode, hash.as_deref()).await {
+    let mut subs = match cached_search(state, &client, config, &imdb, season, episode, hash.as_deref()).await
+    {
         Ok(s) => s,
         // Empty-200 is the correct Stremio shape for "nothing"; `cached_search` has already logged
         // the cause and counted it for /health.
@@ -247,11 +248,19 @@ pub async fn handle_subtitles(
         .collect();
     // A strong ETag (hash of this serialized ranked list) is attached by `json()`; add
     // stale-while-revalidate so a client can serve the last list instantly while refreshing.
-    httputil::json(StatusCode::OK, &json!({"subtitles": out}), "public, max-age=3600, stale-while-revalidate=3600")
+    httputil::json(
+        StatusCode::OK,
+        &json!({"subtitles": out}),
+        "public, max-age=3600, stale-while-revalidate=3600",
+    )
 }
 
 /// The OpenSubtitles client for one request, from that install's BYOK credentials.
-fn os_client<'a>(state: &'a AppState, http: &'a reqwest::Client, cfg: &'a UserConfig) -> opensubtitles::Client<'a> {
+fn os_client<'a>(
+    state: &'a AppState,
+    http: &'a reqwest::Client,
+    cfg: &'a UserConfig,
+) -> opensubtitles::Client<'a> {
     opensubtitles::Client {
         http,
         api_key: &cfg.opensubtitles_key,
@@ -470,11 +479,8 @@ pub async fn handle_subtitle_file(
 /// model name, and past NAME_MAX the write fails exactly the same silent way. Mapping to ASCII
 /// first makes the two agree — a multibyte model name counted 80 chars and wrote up to 320 bytes.
 fn scratch_tag(cache_key: &str, seq: u64) -> String {
-    let safe: String = cache_key
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .take(80)
-        .collect();
+    let safe: String =
+        cache_key.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).take(80).collect();
     format!("{safe}-{seq}")
 }
 
@@ -515,9 +521,7 @@ async fn sync_and_cache(
     let wanted_sync = resync_url.is_some() || ref_id.is_some();
     let shared_marker = format!("{SYNCFAIL}{cache_key}");
     let mine_marker = format!("{SYNCFAIL}{:016x}:{cache_key}", short_hash(client.api_key));
-    let backed_off = || {
-        state.cache.get(&shared_marker).is_some() || state.cache.get(&mine_marker).is_some()
-    };
+    let backed_off = || state.cache.get(&shared_marker).is_some() || state.cache.get(&mine_marker).is_some();
     if wanted_sync && backed_off() {
         return httputil::srt_provisional(target);
     }
@@ -817,10 +821,7 @@ fn remembered_failure(
 /// Seconds since the epoch. Wall clock rather than a monotonic instant because it is stored and
 /// compared across requests; a backward clock step just delays a promotion.
 fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// Drop the suspicion record for a file that has just downloaded cleanly.
@@ -1013,10 +1014,7 @@ const QUOTA_TTL: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 /// Key for one install's translation count today. The config segment is a bearer secret and this key
 /// becomes a filename in the disk tier, so the segment is hashed rather than named.
 fn quota_key(config: &str, now: std::time::SystemTime) -> String {
-    let day = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 86_400)
-        .unwrap_or(0);
+    let day = now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
     format!("quota:{}:{day}", short_hash(config))
 }
 
@@ -1437,7 +1435,9 @@ pub async fn handle_translate(
                         // charge itself still happens after the download, so a source that will not
                         // fetch continues to cost no slot.
                         if allowance_used_up(state, config) {
-                            eprintln!("translate: {imdb} → {lang} refused, install is over its daily allowance");
+                            eprintln!(
+                                "translate: {imdb} → {lang} refused, install is over its daily allowance"
+                            );
                             return httputil::text(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "translation allowance for today is used up",
@@ -1499,11 +1499,7 @@ pub async fn handle_translate(
                                         "no source subtitle to translate",
                                     );
                                 };
-                                state.cache.put(
-                                    pin_key.clone(),
-                                    source.file_id.to_string(),
-                                    SOURCE_PIN_TTL,
-                                );
+                                state.cache.put(pin_key.clone(), source.file_id.to_string(), SOURCE_PIN_TTL);
                                 source.file_id
                             }
                         };
@@ -1516,7 +1512,9 @@ pub async fn handle_translate(
                             // `Gone` means the API named the id, or two separate occasions confirmed
                             // it. A single `Suspect` is not `Gone`, so a transient cannot unpin.
                             if matches!(e, opensubtitles::DownloadError::Gone(_)) {
-                                eprintln!("translate: unpinning {imdb} — source {source_id} will not download");
+                                eprintln!(
+                                    "translate: unpinning {imdb} — source {source_id} will not download"
+                                );
                                 state.cache.remove(&pin_key);
                             }
                             // Backed off like any other failure, or the refusal is free to repeat and
@@ -1524,103 +1522,109 @@ pub async fn handle_translate(
                             state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
                             return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
                         }
-                        match produce_translation(state, &client, llm, config, source_id, &lang, &body_key, &job_key).await {
-                        Ok(body) => {
-                            // Refresh the pin on the path that actually produced a translation, so
-                            // its lifetime and mtime do not stay frozen at the first one. Losing it
-                            // is no longer expensive — the body is keyed by title, so a re-pick
-                            // cannot orphan anything paid for — but a stable pin still keeps every
-                            // language of a film reading from one source, which is one download
-                            // rather than several. One blocking write per real translation, not per
-                            // request, which is what the per-request version cost.
-                            state.cache.put(pin_key.clone(), source_id.to_string(), SOURCE_PIN_TTL);
-                            body
-                        }
-                        // Nothing was spent — the allowance was checked at the last moment before
-                        // the first token, so this costs neither a slot nor a backoff marker.
-                        Err(TranslationFailure::Allowance) => {
-                            eprintln!("translate: {imdb} → {lang} refused, install is over its daily allowance");
-                            return httputil::text(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "translation allowance for today is used up",
-                            );
-                        }
-                        // The provider refused the key itself. Remembered install-wide rather than
-                        // per title, because that is the scope of the fact — and no per-title
-                        // marker, since the title is innocent and will work once the key does.
-                        Err(TranslationFailure::Credential { message, key_certain, spent }) => {
-                            eprintln!("translate: provider refused this install's credential: {message}");
-                            // The install-wide block only when the status can ONLY mean the key.
-                            // A 400 or a 403 might be this film's dialogue tripping a content
-                            // filter, and blocking the install on that lets one series take every
-                            // other title down with it, ten minutes at a time, as the viewer works
-                            // through the episodes. The per-title marker below covers that case.
-                            // Certain: block the install at once. Ambiguous: block it only once a
-                            // SECOND title has refused the same way, which is what separates a dead
-                            // key from one film's dialogue upsetting a content filter.
-                            // A refusal that arrives AFTER a billed batch cannot be about the key:
-                            // the provider accepted this credential minutes ago, in this run. That
-                            // is a measurement, where `key_certain` is a guess and the two-title
-                            // heuristic is a proxy — so it settles the ambiguous case outright.
-                            //
-                            // It settles it as the SERIES, not as nothing. Demoting it to the
-                            // per-title marker alone left a moderation-filtered show with no
-                            // throttle at all: every next episode paid a metered download, an
-                            // allowance slot and half a film in tokens to rediscover the same
-                            // refusal — dearer than the install-wide block it was meant to spare.
-                            match refusal_scope(
-                                state,
-                                config,
-                                llm,
-                                &title_id(&imdb, season, episode),
-                                key_certain,
-                                spent,
-                            ) {
-                                RefusalScope::Install => state.cache.put_mem(
-                                    credential_refused_key(config, llm),
-                                    "1".into(),
-                                    SYNC_RETRY_TTL,
-                                ),
-                                RefusalScope::Series => state.cache.put_mem(
-                                    series_refused_key(config, llm, &imdb),
-                                    "1".into(),
-                                    SYNC_RETRY_TTL,
-                                ),
-                                RefusalScope::TitleOnly => {}
+                        match produce_translation(
+                            state, &client, llm, config, source_id, &lang, &body_key, &job_key,
+                        )
+                        .await
+                        {
+                            Ok(body) => {
+                                // Refresh the pin on the path that actually produced a translation, so
+                                // its lifetime and mtime do not stay frozen at the first one. Losing it
+                                // is no longer expensive — the body is keyed by title, so a re-pick
+                                // cannot orphan anything paid for — but a stable pin still keeps every
+                                // language of a film reading from one source, which is one download
+                                // rather than several. One blocking write per real translation, not per
+                                // request, which is what the per-request version cost.
+                                state.cache.put(pin_key.clone(), source_id.to_string(), SOURCE_PIN_TTL);
+                                body
                             }
-                            // The per-title marker too, even though this is meant to be a fact about
-                            // the install. `is_credential_refusal` reads a 400/403 as one, and those
-                            // are not exclusively about credentials — OpenRouter answers 403 when a
-                            // model's moderation trips, and this file already notes that film
-                            // dialogue trips content filters routinely. Without a per-title marker
-                            // such a title re-arms the install-wide one every ten minutes forever,
-                            // and takes every other title down with it each time.
-                            state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-                            return httputil::text(
-                                StatusCode::BAD_GATEWAY,
-                                "the AI provider refused this key",
-                            );
-                        }
-                        Err(e) => {
-                            // Log the detail (no key in these strings); hand the client a generic
-                            // message rather than echoing a raw upstream error body.
-                            eprintln!("translate: {imdb} → {lang} failed: {}", e.message());
-                            state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-                            // Unpin ONLY when the source is what failed. A pin naming a file that
-                            // holds no cues would otherwise be honoured forever — the marker expires
-                            // after ten minutes, the same pin is read, the same failure follows, and
-                            // the title is stuck for every install and language, since the pin is
-                            // scoped to neither.
-                            //
-                            // For everything else the pin is innocent, and dropping it spends a
-                            // metered download to learn nothing: a provider timeout or a rate limit
-                            // says nothing about the file, so the re-pick lands on the same title
-                            // needing the same source fetched again.
-                            if matches!(e, TranslationFailure::Source(_)) {
-                                state.cache.remove(&pin_key);
+                            // Nothing was spent — the allowance was checked at the last moment before
+                            // the first token, so this costs neither a slot nor a backoff marker.
+                            Err(TranslationFailure::Allowance) => {
+                                eprintln!(
+                                    "translate: {imdb} → {lang} refused, install is over its daily allowance"
+                                );
+                                return httputil::text(
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    "translation allowance for today is used up",
+                                );
                             }
-                            return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
-                        }
+                            // The provider refused the key itself. Remembered install-wide rather than
+                            // per title, because that is the scope of the fact — and no per-title
+                            // marker, since the title is innocent and will work once the key does.
+                            Err(TranslationFailure::Credential { message, key_certain, spent }) => {
+                                eprintln!("translate: provider refused this install's credential: {message}");
+                                // The install-wide block only when the status can ONLY mean the key.
+                                // A 400 or a 403 might be this film's dialogue tripping a content
+                                // filter, and blocking the install on that lets one series take every
+                                // other title down with it, ten minutes at a time, as the viewer works
+                                // through the episodes. The per-title marker below covers that case.
+                                // Certain: block the install at once. Ambiguous: block it only once a
+                                // SECOND title has refused the same way, which is what separates a dead
+                                // key from one film's dialogue upsetting a content filter.
+                                // A refusal that arrives AFTER a billed batch cannot be about the key:
+                                // the provider accepted this credential minutes ago, in this run. That
+                                // is a measurement, where `key_certain` is a guess and the two-title
+                                // heuristic is a proxy — so it settles the ambiguous case outright.
+                                //
+                                // It settles it as the SERIES, not as nothing. Demoting it to the
+                                // per-title marker alone left a moderation-filtered show with no
+                                // throttle at all: every next episode paid a metered download, an
+                                // allowance slot and half a film in tokens to rediscover the same
+                                // refusal — dearer than the install-wide block it was meant to spare.
+                                match refusal_scope(
+                                    state,
+                                    config,
+                                    llm,
+                                    &title_id(&imdb, season, episode),
+                                    key_certain,
+                                    spent,
+                                ) {
+                                    RefusalScope::Install => state.cache.put_mem(
+                                        credential_refused_key(config, llm),
+                                        "1".into(),
+                                        SYNC_RETRY_TTL,
+                                    ),
+                                    RefusalScope::Series => state.cache.put_mem(
+                                        series_refused_key(config, llm, &imdb),
+                                        "1".into(),
+                                        SYNC_RETRY_TTL,
+                                    ),
+                                    RefusalScope::TitleOnly => {}
+                                }
+                                // The per-title marker too, even though this is meant to be a fact about
+                                // the install. `is_credential_refusal` reads a 400/403 as one, and those
+                                // are not exclusively about credentials — OpenRouter answers 403 when a
+                                // model's moderation trips, and this file already notes that film
+                                // dialogue trips content filters routinely. Without a per-title marker
+                                // such a title re-arms the install-wide one every ten minutes forever,
+                                // and takes every other title down with it each time.
+                                state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
+                                return httputil::text(
+                                    StatusCode::BAD_GATEWAY,
+                                    "the AI provider refused this key",
+                                );
+                            }
+                            Err(e) => {
+                                // Log the detail (no key in these strings); hand the client a generic
+                                // message rather than echoing a raw upstream error body.
+                                eprintln!("translate: {imdb} → {lang} failed: {}", e.message());
+                                state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
+                                // Unpin ONLY when the source is what failed. A pin naming a file that
+                                // holds no cues would otherwise be honoured forever — the marker expires
+                                // after ten minutes, the same pin is read, the same failure follows, and
+                                // the title is stuck for every install and language, since the pin is
+                                // scoped to neither.
+                                //
+                                // For everything else the pin is innocent, and dropping it spends a
+                                // metered download to learn nothing: a provider timeout or a rate limit
+                                // says nothing about the file, so the re-pick lands on the same title
+                                // needing the same source fetched again.
+                                if matches!(e, TranslationFailure::Source(_)) {
+                                    state.cache.remove(&pin_key);
+                                }
+                                return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+                            }
                         }
                     }
                 }
@@ -1761,7 +1765,11 @@ enum TranslationFailure {
     /// `spent` is the strongest signal of the three and is a measurement rather than a guess: if a
     /// batch was billed before the refusal, the provider accepted this credential in this very run,
     /// so whatever it has now objected to is about the CONTENT, not the key.
-    Credential { message: String, key_certain: bool, spent: bool },
+    Credential {
+        message: String,
+        key_certain: bool,
+        spent: bool,
+    },
 }
 
 /// Carry a download failure's own verdict through to the pin.
@@ -1831,9 +1839,7 @@ async fn produce_translation(
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
     // on it would re-pick the source and owe another credit for the replacement, because the viewer
     // ran out of credits.
-    let raw = subtitle_srt(state, client, source_file_id)
-        .await
-        .map_err(classify_download)?;
+    let raw = subtitle_srt(state, client, source_file_id).await.map_err(classify_download)?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
         // Unreachable in practice — `download` gates on `has_a_cue`, and a differential test pins
@@ -1859,11 +1865,7 @@ async fn produce_translation(
     // to hand over as-is. It is unusable only as something to translate.
     let dialogue: usize = cues.iter().map(|c| c.text.len()).sum();
     let too_big = match (cues.len() > translate::MAX_CUES, dialogue > translate::MAX_DIALOGUE_BYTES) {
-        (true, _) => Some(format!(
-            "subtitle too large: {} cues (max {})",
-            cues.len(),
-            translate::MAX_CUES
-        )),
+        (true, _) => Some(format!("subtitle too large: {} cues (max {})", cues.len(), translate::MAX_CUES)),
         (_, true) => Some(format!(
             "subtitle too large: {dialogue} bytes of dialogue (max {})",
             translate::MAX_DIALOGUE_BYTES
@@ -1907,10 +1909,11 @@ async fn produce_translation(
     // poll from the request alone — deriving the body key needs a search, and a poll happens every
     // second while the expensive thing runs.
     let reporter = state.progress.start(job_key, cues.len());
-    let translated = translate::translate(client.http, llm, &cues, lang, &state.cache, &spend, &|done, total| {
-        reporter.set(done, total);
-    })
-    .await;
+    let translated =
+        translate::translate(client.http, llm, &cues, lang, &state.cache, &spend, &|done, total| {
+            reporter.set(done, total);
+        })
+        .await;
     // Past the await, so this frame is going to finish on its own terms: every path from here either
     // returns the body or classifies the failure, and both decide the refund explicitly below.
     slot.armed = false;
@@ -2153,7 +2156,7 @@ mod tests {
         assert!(!is_safe_resync_url("http://sub.localhost/a.mkv").await);
         assert!(!is_safe_resync_url("http://169.254.169.254/latest/meta-data/").await);
         assert!(!is_safe_resync_url("http://0.0.0.0/a.mkv").await); // unspecified
-        // IPv6 loopback / link-local / IPv4-mapped-loopback, bracketed.
+                                                                    // IPv6 loopback / link-local / IPv4-mapped-loopback, bracketed.
         assert!(!is_safe_resync_url("http://[::1]/a.mkv").await);
         assert!(!is_safe_resync_url("http://[::1]:8080/a.mkv").await);
         assert!(!is_safe_resync_url("http://[fe80::1]/a.mkv").await);
@@ -2182,9 +2185,9 @@ mod id_tests {
         assert_eq!(parse_id("tt0111161:2:5").unwrap(), ("tt0111161".into(), Some(2), Some(5)));
 
         for bad in [
-            "tt",                                  // no digits
-            "tt12a4",                              // not digits
-            "nope0111161",                         // no prefix
+            "tt",          // no digits
+            "tt12a4",      // not digits
+            "nope0111161", // no prefix
             "",
         ] {
             assert!(parse_id(bad).is_none(), "accepted {bad:?}");
@@ -2263,18 +2266,19 @@ mod sync_fallback_tests {
         // A videoHash is 16 hex digits. Anything else is not one — and it lands in a cache key
         // that becomes a filename, where an over-long value fails the write and consumes the
         // process's only "persistence degraded" warning on a request that was never valid.
-        assert_eq!(extra_field("videoHash=8e245d9679d31e12", "videoHash").as_deref(), Some("8e245d9679d31e12"));
-        for bad in ["videoHash=8e24", "videoHash=zzzzzzzzzzzzzzzz", &format!("videoHash={}", "a".repeat(300))] {
+        assert_eq!(
+            extra_field("videoHash=8e245d9679d31e12", "videoHash").as_deref(),
+            Some("8e245d9679d31e12")
+        );
+        for bad in ["videoHash=8e24", "videoHash=zzzzzzzzzzzzzzzz", &format!("videoHash={}", "a".repeat(300))]
+        {
             assert_eq!(search_hash(bad), None, "accepted a non-hash: {bad}");
         }
 
         // The extras arrive as a PATH segment, where `+` is a literal plus. Form-decoding it turned
         // every HDR10+ / DTS-HD 7.1+ release name into one the ranker scores differently.
         let plus = "filename=Movie.2013.2160p.HDR10+.WEB-DL.mkv";
-        assert_eq!(
-            extra_field(plus, "filename").as_deref(),
-            Some("Movie.2013.2160p.HDR10+.WEB-DL.mkv")
-        );
+        assert_eq!(extra_field(plus, "filename").as_deref(), Some("Movie.2013.2160p.HDR10+.WEB-DL.mkv"));
     }
 
     /// The filename is bounded because of where it goes, not because it becomes a filename like the
@@ -2294,21 +2298,19 @@ mod sync_fallback_tests {
         let absurd = "a.".repeat(100_000);
         let seen = search_filename(&format!("filename={absurd}"));
         assert_eq!(seen, None);
-        let mut subs = vec![
-            opensubtitles::Subtitle {
-                file_id: 2,
-                lang: "en".into(),
-                hash_match: false,
-                downloads: 0,
-                release: String::new(),
-                hd: false,
-                fps: 0.0,
-                from_trusted: false,
-                machine_translated: false,
-                ai_translated: false,
-                ratings: 0.0,
-            },
-        ];
+        let mut subs = vec![opensubtitles::Subtitle {
+            file_id: 2,
+            lang: "en".into(),
+            hash_match: false,
+            downloads: 0,
+            release: String::new(),
+            hd: false,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            ratings: 0.0,
+        }];
         opensubtitles::rank(&mut subs, seen.as_deref());
         assert_eq!(subs.len(), 1, "ranking dropped a candidate");
     }
@@ -2362,20 +2364,13 @@ mod translate_retry_tests {
         let llm = cfg.llm.as_ref().expect("test config carries an llm");
         // From the real key builder, not a literal: `lang` is canonicalized on the way into the key,
         // so a literal silently stopped addressing the same entry the handler reads.
-        let cache_key = translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
+        let cache_key =
+            translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
         state.cache.put(format!("{SYNCFAIL}{cache_key}"), "1".into(), SYNC_RETRY_TTL);
 
-        let resp = handle_translate(
-            &state,
-            &HeaderMap::new(),
-            &config,
-            "tt0111161",
-            "",
-            "Swedish",
-            false,
-            None,
-        )
-        .await;
+        let resp =
+            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
+                .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
         // The marker's value must never reach the client as a subtitle.
@@ -2482,8 +2477,12 @@ mod translate_retry_tests {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         };
-        let guard = |spend: &'static translate::Spend, source_was_cached: bool, armed: bool| {
-            ChargeGuard { state: &state, config: &config, spend, source_was_cached, armed }
+        let guard = |spend: &'static translate::Spend, source_was_cached: bool, armed: bool| ChargeGuard {
+            state: &state,
+            config: &config,
+            spend,
+            source_was_cached,
+            armed,
         };
 
         // Cancelled having sent nothing: the slot comes back.
@@ -2568,11 +2567,8 @@ mod translate_retry_tests {
     #[test]
     fn an_ambiguous_refusal_needs_two_titles_to_block_the_install() {
         let films = state("ambiguous");
-        let llm = LlmConfig {
-            provider: userconfig::Provider::OpenRouter,
-            model: "m".into(),
-            api_key: "k".into(),
-        };
+        let llm =
+            LlmConfig { provider: userconfig::Provider::OpenRouter, model: "m".into(), api_key: "k".into() };
         // Through the real function the handler calls — a re-typed copy of the rule cannot catch the
         // handler diverging from it, which is how the series case got in.
         let refuse = |title: &str| ambiguous_refusal_escalates(&films, "install-one", &llm, title);
@@ -2675,11 +2671,17 @@ mod translate_retry_tests {
         // every OpenRouter install, and asserting a literal would not have noticed.
         let model = userconfig::Provider::OpenRouter.default_model();
         assert!(model.contains('/'), "the case this guards is gone; find what replaced it");
-        let key = translate_body_key("tt0111161", None, None, "SV", &LlmConfig {
-            provider: userconfig::Provider::OpenRouter,
-            model: model.into(),
-            api_key: "k".into(),
-        });
+        let key = translate_body_key(
+            "tt0111161",
+            None,
+            None,
+            "SV",
+            &LlmConfig {
+                provider: userconfig::Provider::OpenRouter,
+                model: model.into(),
+                api_key: "k".into(),
+            },
+        );
         let tag = scratch_tag(&key, 0);
         assert!(!tag.contains('/'), "the tag names a subdirectory: {tag}");
         assert_eq!(std::path::Path::new(&tag).components().count(), 1, "{tag}");
@@ -2826,10 +2828,7 @@ mod translate_retry_tests {
         // convicted by two bad afternoons a day apart.
         remember_failure(&state, &client, 8, &DownloadError::Suspect("blip".into()));
         forget_failure(&state, 8);
-        assert!(
-            remembered_failure(&state, &client, 8).is_none(),
-            "a success left the file under suspicion"
-        );
+        assert!(remembered_failure(&state, &client, 8).is_none(), "a success left the file under suspicion");
 
         // A credential's own trouble is remembered per credential, not for everyone: one install
         // exhausting its allowance must not deny the file to another.
@@ -2895,7 +2894,8 @@ mod translate_retry_tests {
         let config = config_segment();
         let cfg = userconfig::decode(state.config_keyring.as_ref(), &config).unwrap();
         let llm = cfg.llm.as_ref().unwrap();
-        let job_key = translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
+        let job_key =
+            translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
 
         let read = |resp: Response<Body>| async {
             let bytes = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
@@ -2942,7 +2942,8 @@ mod translate_retry_tests {
         let state = state("long-lang");
         let config = config_segment();
         let long = "x".repeat(MAX_LANG + 1);
-        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", &long, false, None).await;
+        let resp =
+            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", &long, false, None).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an over-long language was accepted");
 
         // Nothing was written for it — not the body key, and not the failure marker either.
@@ -2953,7 +2954,9 @@ mod translate_retry_tests {
         assert_eq!(files, 0, "an invalid request left {files} cache files behind");
 
         // A real language still works its way through to the upstream check.
-        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None).await;
+        let resp =
+            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
+                .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "a valid language must not be refused");
     }
 
@@ -2972,8 +2975,9 @@ mod translate_retry_tests {
         let llm = cfg.llm.as_ref().unwrap();
         // Through the real builder and the real canonicalizer, so the keys the test addresses are
         // the keys the handler writes.
-        let key_for =
-            |lang: &str| translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang(lang), llm);
+        let key_for = |lang: &str| {
+            translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang(lang), llm)
+        };
         state.cache.put(format!("{SYNCFAIL}{}", key_for("Swedish")), "1".into(), SYNC_RETRY_TTL);
 
         let body_of = |resp: Response<Body>| async {
@@ -2982,7 +2986,9 @@ mod translate_retry_tests {
         };
 
         // Finnish is a different job: it must get past the marker and fail on its own merits.
-        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Finnish", false, None).await;
+        let resp =
+            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Finnish", false, None)
+                .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let finnish = body_of(resp).await;
         assert!(
@@ -2991,7 +2997,9 @@ mod translate_retry_tests {
         );
 
         // Swedish, the marked one, is still short-circuited.
-        let resp = handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None).await;
+        let resp =
+            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
+                .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let swedish = body_of(resp).await;
         assert!(swedish.contains("recently"), "the marked language was attempted anyway: {swedish}");

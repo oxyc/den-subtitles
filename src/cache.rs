@@ -58,11 +58,8 @@ impl Cache {
                 None
             }
         });
-        let cache = Cache {
-            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, tick: 0 }),
-            max_bytes,
-            dir,
-        };
+        let cache =
+            Cache { inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, tick: 0 }), max_bytes, dir };
         cache.sweep();
         cache
     }
@@ -85,12 +82,8 @@ impl Cache {
         {
             let mut g = self.inner.lock().unwrap();
             let now = Instant::now();
-            let dead: Vec<String> = g
-                .map
-                .iter()
-                .filter(|(_, e)| e.expires <= now)
-                .map(|(k, _)| k.clone())
-                .collect();
+            let dead: Vec<String> =
+                g.map.iter().filter(|(_, e)| e.expires <= now).map(|(k, _)| k.clone()).collect();
             for key in dead {
                 if let Some(e) = g.map.remove(&key) {
                     g.bytes -= e.size;
@@ -457,8 +450,11 @@ mod tests {
     fn tmpdir(name: &str) -> PathBuf {
         // The counter restarts per process, so include the pid: two concurrent `cargo test` runs
         // otherwise pick the same directory and delete each other's files.
-        let d = std::env::temp_dir()
-            .join(format!("den-subs-cache-{name}-{}-{}", std::process::id(), next_temp_id()));
+        let d = std::env::temp_dir().join(format!(
+            "den-subs-cache-{name}-{}-{}",
+            std::process::id(),
+            next_temp_id()
+        ));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
@@ -504,7 +500,12 @@ mod tests {
         // unreadable garbage that nothing ever reclaims. (The torn file was already dropped above.)
         c.put("k".into(), "v2".into(), HOUR);
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).collect();
-        assert_eq!(files.len(), 1, "a put left scratch behind: {:?}", files.iter().map(|f| f.file_name()).collect::<Vec<_>>());
+        assert_eq!(
+            files.len(),
+            1,
+            "a put left scratch behind: {:?}",
+            files.iter().map(|f| f.file_name()).collect::<Vec<_>>()
+        );
         assert_eq!(Cache::new(1 << 20, Some(dir)).get("k"), Some("v2".into()));
     }
 
@@ -548,7 +549,8 @@ mod tests {
         assert!(!expired_path.exists(), "the sweep left an expired entry on disk");
         let fresh = Cache::new(60, Some(dir.clone()));
         assert_eq!(fresh.get("new"), Some("x".repeat(40)), "the newest entry must survive");
-        let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
+        let bytes: u64 =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
         assert!(bytes <= 60, "the sweep left {bytes} bytes on disk, over the 60 budget");
     }
 
@@ -658,7 +660,8 @@ mod tests {
         shift_mtime(&stray, std::time::SystemTime::now() + Duration::from_secs(5));
         let entry = c.disk_path("k").unwrap();
         c.sweep();
-        let bytes: u64 = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
+        let bytes: u64 =
+            std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.metadata().unwrap().len()).sum();
         assert!(bytes <= 60, "an undatable temp escaped the budget: {bytes} bytes left");
         // And it goes BEFORE live data: evicting a real subtitle to keep a scratch file of unknown
         // provenance costs a re-download against the viewer's quota.

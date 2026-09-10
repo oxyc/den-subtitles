@@ -81,7 +81,9 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             let body = health_body(state.os_fails.load(std::sync::atomic::Ordering::Relaxed));
             return httputil::json(StatusCode::OK, &body, "no-store");
         }
-        "/manifest.json" => return httputil::json(StatusCode::OK, &addon::manifest(false), "public, max-age=3600"),
+        "/manifest.json" => {
+            return httputil::json(StatusCode::OK, &addon::manifest(false), "public, max-age=3600")
+        }
         "/" | "/configure" | "/configure/" => {
             return httputil::html(StatusCode::OK, CONFIGURE_PAGE, "public, max-age=3600")
         }
@@ -89,10 +91,14 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         // sealed configs are disabled (no key) — the page then keeps plaintext (SEALED-CONFIG.md).
         "/config-key" => {
             return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
-                Some(pub_b64) if !pub_b64.is_empty() => {
-                    httputil::json(StatusCode::OK, &serde_json::json!({"key": pub_b64}), "public, max-age=3600")
+                Some(pub_b64) if !pub_b64.is_empty() => httputil::json(
+                    StatusCode::OK,
+                    &serde_json::json!({"key": pub_b64}),
+                    "public, max-age=3600",
+                ),
+                _ => {
+                    httputil::json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "no_key"}), "no-store")
                 }
-                _ => httputil::json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "no_key"}), "no-store"),
             };
         }
         _ => {}
@@ -105,7 +111,11 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
     match resource {
         "manifest.json" => match userconfig::decode(state.config_keyring.as_ref(), config) {
             Some(_) => httputil::json(StatusCode::OK, &addon::manifest(true), "public, max-age=3600"),
-            None => httputil::json(StatusCode::BAD_REQUEST, &serde_json::json!({"error": "bad_config"}), "no-store"),
+            None => httputil::json(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": "bad_config"}),
+                "no-store",
+            ),
         },
         "subtitles" => {
             // /<config>/subtitles/<type>/<id>[/<extra>].json
@@ -164,7 +174,8 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             };
             let resync = query_get(parts.uri.query().unwrap_or(""), "resync");
             let resp =
-                addon::handle_translate(state, &parts.headers, config, id, extra, lang, want_json, resync).await;
+                addon::handle_translate(state, &parts.headers, config, id, extra, lang, want_json, resync)
+                    .await;
             if want_vtt {
                 httputil::to_vtt(resp, &parts.headers).await
             } else {
@@ -182,10 +193,7 @@ fn split_path(path: &str) -> Vec<&str> {
 /// Percent-decoded value of a query parameter, or None.
 fn query_get(query: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
-    query
-        .split('&')
-        .find_map(|p| p.strip_prefix(&prefix))
-        .map(httputil::percent_decode)
+    query.split('&').find_map(|p| p.strip_prefix(&prefix)).map(httputil::percent_decode)
 }
 
 fn strip_json(seg: &str) -> Option<&str> {
@@ -208,7 +216,10 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     // the sync scratch dir creates itself lazily. A failed pre-create is logged, not fatal (a hard
     // exit here would crash-loop the container and the app would see only connection-refused).
     if let Err(e) = std::fs::create_dir_all(&cfg.cache_dir) {
-        eprintln!("warning: cache dir {} not writable ({e}) — sync tiers will retry lazily", cfg.cache_dir.display());
+        eprintln!(
+            "warning: cache dir {} not writable ({e}) — sync tiers will retry lazily",
+            cfg.cache_dir.display()
+        );
     }
     let port = cfg.port;
     let state = AppState::new(cfg);
@@ -261,9 +272,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
                 let state = state.clone();
                 async move { Ok::<_, Infallible>(handle_request(state, req).await) }
             });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await;
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
         });
     }
 }
@@ -278,10 +287,7 @@ async fn healthcheck(port: u16) -> i32 {
 
 fn main() {
     let cfg = Config::from_env();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
 
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         std::process::exit(rt.block_on(healthcheck(cfg.port)));
@@ -330,21 +336,25 @@ mod tests {
 
     #[tokio::test]
     async fn config_key_serves_the_pubkey_when_keyring_set() {
-        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/config-key").body(()).unwrap()).await;
+        let resp =
+            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/config-key").body(()).unwrap())
+                .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(body_string(resp).await.contains(VEC_PUB_B64), "/config-key must serve the derived pubkey");
     }
 
     #[tokio::test]
     async fn config_key_404s_when_sealing_disabled() {
-        let resp = handle_request(test_state(""), Request::builder().uri("/config-key").body(()).unwrap()).await;
+        let resp =
+            handle_request(test_state(""), Request::builder().uri("/config-key").body(()).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn sealed_manifest_resolves_end_to_end() {
         let uri = format!("/{JS_SEG}/manifest.json");
-        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
+        let resp =
+            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK, "a sealed URL must resolve the manifest");
     }
 
@@ -352,21 +362,28 @@ mod tests {
     async fn sealed_manifest_fails_closed_without_a_keyring() {
         let uri = format!("/{JS_SEG}/manifest.json");
         let resp = handle_request(test_state(""), Request::builder().uri(uri).body(()).unwrap()).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "sealed URL with no key must fail closed, not open");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "sealed URL with no key must fail closed, not open"
+        );
     }
 
     #[tokio::test]
     async fn legacy_plaintext_manifest_still_resolves_with_a_keyring_present() {
         let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-legacy"}"#);
         let uri = format!("/{seg}/manifest.json");
-        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
+        let resp =
+            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
         assert_eq!(resp.status(), StatusCode::OK, "legacy plaintext config must still resolve (back-compat)");
     }
 
     #[tokio::test]
     async fn configure_page_renders_with_the_seal_bundle() {
         // Guards against a truncated/corrupt include_str! shipping silently (audit finding B).
-        let resp = handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/configure").body(()).unwrap()).await;
+        let resp =
+            handle_request(test_state(VEC_PRIV_B64), Request::builder().uri("/configure").body(()).unwrap())
+                .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let page = body_string(resp).await;
         // `contains("DenSeal")` alone passed on a page cut to 4% of its length — the marker sits in
@@ -394,11 +411,7 @@ mod tests {
         // Re-request with that ETag → 304 Not Modified, no body, same validator + Cache-Control.
         let resp = handle_request(
             test_state(VEC_PRIV_B64),
-            Request::builder()
-                .uri("/manifest.json")
-                .header(IF_NONE_MATCH, &etag_str)
-                .body(())
-                .unwrap(),
+            Request::builder().uri("/manifest.json").header(IF_NONE_MATCH, &etag_str).body(()).unwrap(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);

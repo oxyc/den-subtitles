@@ -34,15 +34,14 @@ impl Keyring {
                 return Ok(());
             }
             let raw = decode_key(s).ok_or("bad base64 config key")?;
-            let arr: [u8; 32] = raw
-                .try_into()
-                .map_err(|_| "config key must be a 32-byte X25519 private key".to_string())?;
+            let arr: [u8; 32] =
+                raw.try_into().map_err(|_| "config key must be a 32-byte X25519 private key".to_string())?;
             keys.push(SecretKey::from(arr));
             Ok(())
         };
         add(current).map_err(|e| format!("current: {e}"))?; // a bad CURRENT key is a real misconfig
-        // A malformed PRIOR key is skipped, not fatal — a typo in one rotation entry must not disable the
-        // whole ring (which would silently take sealing offline for the good current key too).
+                                                            // A malformed PRIOR key is skipped, not fatal — a typo in one rotation entry must not disable the
+                                                            // whole ring (which would silently take sealing offline for the good current key too).
         for p in prev.split(',') {
             if let Err(e) = add(p) {
                 eprintln!("den-subtitles: skipping a malformed SUBS_CONFIG_KEYS_PREV entry: {e}");

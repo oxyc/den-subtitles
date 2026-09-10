@@ -60,10 +60,8 @@ impl<'a> Client<'a> {
     ) -> Result<Vec<Subtitle>, String> {
         // The imdb id goes in as digits only (no "tt").
         let imdb_num = imdb_id.trim_start_matches("tt");
-        let mut query: Vec<(String, String)> = vec![
-            ("imdb_id".into(), imdb_num.into()),
-            ("languages".into(), languages.to_string()),
-        ];
+        let mut query: Vec<(String, String)> =
+            vec![("imdb_id".into(), imdb_num.into()), ("languages".into(), languages.to_string())];
         if let Some(s) = season {
             query.push(("season_number".into(), s.to_string()));
         }
@@ -121,9 +119,8 @@ impl<'a> Client<'a> {
         let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY)
             .await
             .map_err(DownloadError::Unavailable)?;
-        let link = v["link"]
-            .as_str()
-            .ok_or_else(|| DownloadError::Unavailable("no download link".to_string()))?;
+        let link =
+            v["link"].as_str().ok_or_else(|| DownloadError::Unavailable("no download link".to_string()))?;
         // The link is OpenSubtitles-supplied and points at their CDN — cap the fetched body.
         let resp = self
             .http
@@ -269,9 +266,7 @@ pub fn text_score(s: &Subtitle) -> i64 {
 /// app's own dedupe-keep-first then naturally keeps the optimal sub per language.
 pub fn rank(subs: &mut [Subtitle], filename: Option<&str>) {
     subs.sort_by(|a, b| {
-        a.lang
-            .cmp(&b.lang)
-            .then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
+        a.lang.cmp(&b.lang).then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
     });
 }
 
@@ -300,10 +295,27 @@ fn release_fit(filename: &str, release: &str) -> i64 {
 
 /// Resolution/source/codec tokens and their weights (higher = stronger same-encode evidence).
 const SIGNIFICANT: &[(&str, i64)] = &[
-    ("2160p", 800), ("1080p", 800), ("720p", 800), ("480p", 800),
-    ("bluray", 600), ("blu", 600), ("bdrip", 600), ("brrip", 600), ("remux", 600),
-    ("web", 500), ("webrip", 500), ("webdl", 500), ("hdtv", 500), ("dvdrip", 500), ("hdrip", 500),
-    ("x264", 200), ("x265", 200), ("h264", 200), ("h265", 200), ("hevc", 200), ("avc", 200),
+    ("2160p", 800),
+    ("1080p", 800),
+    ("720p", 800),
+    ("480p", 800),
+    ("bluray", 600),
+    ("blu", 600),
+    ("bdrip", 600),
+    ("brrip", 600),
+    ("remux", 600),
+    ("web", 500),
+    ("webrip", 500),
+    ("webdl", 500),
+    ("hdtv", 500),
+    ("dvdrip", 500),
+    ("hdrip", 500),
+    ("x264", 200),
+    ("x265", 200),
+    ("h264", 200),
+    ("h265", 200),
+    ("hevc", 200),
+    ("avc", 200),
 ];
 
 /// Lowercase alphanumeric tokens.
@@ -321,7 +333,11 @@ fn tokenize(s: &str) -> Vec<String> {
 fn release_group(s: &str) -> Option<String> {
     // Strip a trailing file extension so "…-GROUP.mkv" → "…-GROUP".
     let stem = match s.rsplit_once('.') {
-        Some((head, ext)) if (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) => head,
+        Some((head, ext))
+            if (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            head
+        }
         _ => s,
     };
     let tail = stem.rsplit_once('-')?.1;
@@ -387,8 +403,17 @@ mod tests {
 
     fn sub(id: i64, lang: &str, hash: bool, dl: i64, release: &str) -> Subtitle {
         Subtitle {
-            file_id: id, lang: lang.into(), hash_match: hash, downloads: dl, release: release.into(),
-            hd: false, fps: 0.0, from_trusted: false, machine_translated: false, ai_translated: false, ratings: 0.0,
+            file_id: id,
+            lang: lang.into(),
+            hash_match: hash,
+            downloads: dl,
+            release: release.into(),
+            hd: false,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            ratings: 0.0,
         }
     }
     fn sub_ai(id: i64, lang: &str, dl: i64, release: &str) -> Subtitle {
@@ -471,7 +496,9 @@ mod download_tests {
 
         // Every other CDN status is the same kind of fact — the link did not work — and none of them
         // may unpin either. `download_from` drives the CDN leg only; the fake API always answers.
-        for status in ["406 Not Acceptable", "429 Too Many Requests", "503 Service Unavailable", "403 Forbidden"] {
+        for status in
+            ["406 Not Acceptable", "429 Too Many Requests", "503 Service Unavailable", "403 Forbidden"]
+        {
             let err = download_from(status, "nope").await.expect_err("must fail");
             assert!(matches!(err, DownloadError::Suspect(_)), "{status} from the CDN: {err:?}");
         }

@@ -62,9 +62,7 @@ pub fn html(status: StatusCode, body: &'static str, cache_control: &str) -> Resp
 
 pub fn json<T: Serialize>(status: StatusCode, value: &T, cache_control: &str) -> Response<Body> {
     let bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
-    let mut b = Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "application/json");
+    let mut b = Response::builder().status(status).header(CONTENT_TYPE, "application/json");
     if !cache_control.is_empty() {
         b = b.header(CACHE_CONTROL, cache_control);
     }
@@ -116,12 +114,8 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
     if resp.status() != StatusCode::OK || !is_subtitle {
         return resp;
     }
-    let cache_control = resp
-        .headers()
-        .get(CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("no-store")
-        .to_string();
+    let cache_control =
+        resp.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()).unwrap_or("no-store").to_string();
 
     // The VTT ETag is derived from the SRT one rather than from the converted bytes, so a
     // conditional request can be answered WITHOUT converting. Conversion is a full parse and
@@ -133,17 +127,16 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
     /// (as escaping the payload did) leaves every revalidating client and proxy on the old output.
     const RENDERING: u32 = 2;
 
-    let vtt_etag = resp
-        .headers()
-        .get(ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(|srt_etag| {
-            let mut seed = srt_etag.as_bytes().to_vec();
-            seed.extend_from_slice(&RENDERING.to_le_bytes());
-            format!("\"{:016x}-vtt\"", stable_hash(&seed))
-        });
+    let vtt_etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok()).map(|srt_etag| {
+        let mut seed = srt_etag.as_bytes().to_vec();
+        seed.extend_from_slice(&RENDERING.to_le_bytes());
+        format!("\"{:016x}-vtt\"", stable_hash(&seed))
+    });
     if let Some(etag) = &vtt_etag {
-        if req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, &HeaderValue::from_str(etag).unwrap())) {
+        if req_headers
+            .get(IF_NONE_MATCH)
+            .is_some_and(|inm| if_none_match_matches(inm, &HeaderValue::from_str(etag).unwrap()))
+        {
             return Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(CACHE_CONTROL, cache_control)
@@ -177,9 +170,7 @@ pub fn apply_conditional(resp: Response<Body>, req_headers: &HeaderMap) -> Respo
     let Some(etag) = resp.headers().get(ETAG) else {
         return resp;
     };
-    let matched = req_headers
-        .get(IF_NONE_MATCH)
-        .is_some_and(|inm| if_none_match_matches(inm, etag));
+    let matched = req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, etag));
     if !matched {
         return resp;
     }
