@@ -1,36 +1,22 @@
-# Build the den-subtitles image and push it to GitHub Container Registry.
-# The homelab compose pulls ghcr.io/oxyc/den-subtitles:<tag>, so a code change here → new image →
-# `docker compose pull && up -d` on the box. No app release.
+# Build the den-subtitles image and push it to GitHub Container Registry, on a v* tag (a deliberate
+# release) or a manual run — NOT every main push. The box updates only when you cut a tag. No app release.
 name: docker-publish
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/den-subtitles
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --release
+  # The whole of ci.yml, against the tagged commit: a tag cannot publish an image CI would reject.
+  ci:
+    uses: ./.github/workflows/ci.yml
 
   build:
-    needs: test
-    # Publish only on a v* tag (a deliberate release) or a manual run — NOT every main push. `test`
-    # still runs on every push and PR; the box updates only when you cut a tag.
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -70,10 +56,12 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
+      # amd64 only: it is the one arch the box runs.
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
