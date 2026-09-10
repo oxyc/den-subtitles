@@ -69,15 +69,11 @@ fn cacheable(status: StatusCode, cache_control: &str) -> bool {
     status == StatusCode::OK && !cache_control.is_empty() && !cache_control.contains("no-store")
 }
 
-/// Text replies are always `no-store`: these are errors (400/404/502/503) and a transient upstream
-/// failure must never be cached — a cached 502 would wedge a subtitle until the entry expired.
-pub fn text(status: StatusCode, body: &str) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header(CACHE_CONTROL, "no-store")
-        .body(Full::new(Bytes::from(body.to_owned())))
-        .unwrap()
+/// An error reply: `{"error":"<slug>"}`, the body shape every den addon uses, and always `no-store` —
+/// a transient upstream failure must never be cached, or a cached 502 would wedge a subtitle until
+/// the entry expired.
+pub fn error(status: StatusCode, slug: &str) -> Response<Body> {
+    json(status, &serde_json::json!({ "error": slug }), "no-store")
 }
 
 /// The 404 every den addon answers for a path it does not serve. A refused /metrics answers the same,
@@ -92,7 +88,7 @@ pub fn not_found() -> Response<Body> {
 pub fn preflight() -> Response<Body> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, POST, OPTIONS")
+        .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, OPTIONS")
         .header(ACCESS_CONTROL_ALLOW_HEADERS, "*")
         .header(ACCESS_CONTROL_MAX_AGE, "86400")
         .body(Full::new(Bytes::new()))
@@ -199,10 +195,10 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
     let (mut parts, body) = resp.into_parts();
     let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => return text(StatusCode::INTERNAL_SERVER_ERROR, "subtitle body unavailable"),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "subtitle_unavailable"),
     };
     let Ok(srt) = std::str::from_utf8(&bytes) else {
-        return text(StatusCode::INTERNAL_SERVER_ERROR, "subtitle body was not utf-8");
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "subtitle_not_utf8");
     };
     let vtt = crate::srt::serialize_vtt(&crate::srt::parse(srt));
     // The SRT response's own head, so everything else the handler said about this body — its caching
@@ -364,9 +360,10 @@ mod tests {
 
     #[test]
     fn the_first_degraded_reason_stands() {
-        let resp = degraded(degraded(text(StatusCode::OK, ""), "sync_failed"), "upstream_unavailable");
+        let blank = || json(StatusCode::OK, &"", "no-store");
+        let resp = degraded(degraded(blank(), "sync_failed"), "upstream_unavailable");
         assert_eq!(resp.headers().get(X_DEN_DEGRADED).unwrap(), "sync_failed");
-        let resp = add_timing(add_timing(text(StatusCode::OK, ""), "download;dur=3"), "total;dur=4");
+        let resp = add_timing(add_timing(blank(), "download;dur=3"), "total;dur=4");
         assert_eq!(resp.headers().get(SERVER_TIMING).unwrap(), "download;dur=3, total;dur=4");
     }
 
@@ -402,9 +399,9 @@ mod tests {
     /// other part of the router already shaped.
     #[tokio::test]
     async fn a_non_subtitle_response_passes_through() {
-        let err = to_vtt(text(StatusCode::BAD_GATEWAY, "upstream said no"), &HeaderMap::new()).await;
+        let err = to_vtt(error(StatusCode::BAD_GATEWAY, "upstream_unavailable"), &HeaderMap::new()).await;
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(body_of(err).await, "upstream said no");
+        assert_eq!(body_of(err).await, r#"{"error":"upstream_unavailable"}"#);
 
         let js = to_vtt(json(StatusCode::OK, &"x", "no-store"), &HeaderMap::new()).await;
         assert_eq!(js.headers().get(CONTENT_TYPE).unwrap(), "application/json");

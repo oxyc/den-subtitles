@@ -278,7 +278,7 @@ pub async fn handle_subtitles(
     let resp = httputil::json(
         StatusCode::OK,
         &json!({"subtitles": out}),
-        "public, max-age=3600, stale-while-revalidate=3600",
+        "public, max-age=3600, stale-while-revalidate=3600, stale-if-error=86400",
     );
     httputil::add_timing(resp, &timing)
 }
@@ -455,7 +455,7 @@ pub async fn handle_subtitle_file(
     resync_url: Option<String>,
 ) -> Response<Body> {
     let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
-        return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
+        return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Vet BEFORE keying: a rejected URL changes which tier runs, so keying off the raw one filed a
     // reference-aligned (or raw) body under a `resync` key. Everything downstream reads the VETTED
@@ -478,7 +478,7 @@ pub async fn handle_subtitle_file(
         return httputil::add_timing(httputil::srt(hit), CACHE_HIT);
     }
     let Some(http) = state.http.as_ref() else {
-        return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "subtitle service unavailable");
+        return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
     };
     let client = os_client(state, http, &cfg);
 
@@ -489,7 +489,7 @@ pub async fn handle_subtitle_file(
             if DOWNLOAD_FAILED.allow() {
                 eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
             }
-            return httputil::text(StatusCode::BAD_GATEWAY, "upstream subtitle fetch failed");
+            return httputil::error(StatusCode::BAD_GATEWAY, "upstream_unavailable");
         }
     };
 
@@ -1305,14 +1305,14 @@ pub async fn handle_translate(
     resync_url: Option<String>,
 ) -> Response<Body> {
     let Some(cfg) = userconfig::decode(state.config_keyring.as_ref(), config) else {
-        return httputil::text(StatusCode::BAD_REQUEST, "bad_config");
+        return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
     };
     // Translation needs the (optional) LLM credential — a subtitles-only install has none.
     let Some(llm) = &cfg.llm else {
-        return httputil::text(StatusCode::BAD_REQUEST, "no AI provider configured for translation");
+        return httputil::error(StatusCode::BAD_REQUEST, "no_llm");
     };
     let Some((imdb, season, episode)) = parse_id(id) else {
-        return httputil::text(StatusCode::BAD_REQUEST, "bad_id");
+        return httputil::error(StatusCode::BAD_REQUEST, "bad_id");
     };
     // The path segment arrives percent-encoded ("Brazilian%20Portuguese"), and nothing decoded it.
     // So the escape sequence went into the cache key AND was interpolated into the prompt of every
@@ -1324,7 +1324,7 @@ pub async fn handle_translate(
     // hazard `search_hash` already bounds `videoHash` against — and it is interpolated into the
     // prompt of every batch, so its length multiplies the bill against the viewer's own key.
     if lang.is_empty() || lang.len() > MAX_LANG {
-        return httputil::text(StatusCode::BAD_REQUEST, "bad_lang");
+        return httputil::error(StatusCode::BAD_REQUEST, "bad_lang");
     }
     // Case and spacing are not different languages, but they were different cache keys, and a key
     // here is a whole film's LLM bill. Canonicalized separately from the name we send the model: the
@@ -1333,7 +1333,7 @@ pub async fn handle_translate(
     // All-whitespace survives the length check and normalizes to nothing, which would file every such
     // request under one shared key.
     if lang_key.is_empty() {
-        return httputil::text(StatusCode::BAD_REQUEST, "bad_lang");
+        return httputil::error(StatusCode::BAD_REQUEST, "bad_lang");
     }
     // Checked before any network call, and scoped to the title rather than to the source file: a
     // whole film's LLM bill is not something to re-pay on every tap. The `.json` and `.srt` forms are
@@ -1347,11 +1347,11 @@ pub async fn handle_translate(
     let job_key = translate_fail_key(config, &imdb, season, episode, &lang_key, llm);
     let failed_recently = format!("{SYNCFAIL}{job_key}");
     if state.cache.get(&failed_recently).is_some() {
-        return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
+        return httputil::error(StatusCode::BAD_GATEWAY, "translation_backoff");
     }
 
     let Some(http) = state.http.as_ref() else {
-        return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "translation service unavailable");
+        return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
     };
     let client = os_client(state, http, &cfg);
 
@@ -1476,7 +1476,7 @@ pub async fn handle_translate(
                 // own key. The marker exists to stop exactly that, so it is read again now that we
                 // know how the wait ended. `sync_and_cache` re-checks its marker for this reason.
                 if state.cache.get(&failed_recently).is_some() {
-                    return httputil::text(StatusCode::BAD_GATEWAY, "translation failed recently");
+                    return httputil::error(StatusCode::BAD_GATEWAY, "translation_backoff");
                 }
                 match state.cache.get(&body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
@@ -1498,10 +1498,7 @@ pub async fn handle_translate(
                                     "translate: {imdb} → {lang} refused, install is over its daily allowance"
                                 );
                             }
-                            return httputil::text(
-                                StatusCode::TOO_MANY_REQUESTS,
-                                "translation allowance for today is used up",
-                            );
+                            return httputil::error(StatusCode::TOO_MANY_REQUESTS, "allowance_exhausted");
                         }
                         // A refused credential is about the install, not this title, so the
                         // title-scoped marker cannot catch it — every film is a fresh key.
@@ -1512,19 +1509,13 @@ pub async fn handle_translate(
                         // makes no provider call at all, so a dead key was making the install's
                         // entire existing library unavailable, re-armed by every new title browsed.
                         if state.cache.get_mem(&credential_refused_key(config, llm)).is_some() {
-                            return httputil::text(
-                                StatusCode::BAD_GATEWAY,
-                                "the AI provider refused this key",
-                            );
+                            return httputil::error(StatusCode::BAD_GATEWAY, "llm_key_refused");
                         }
                         // And the series-scoped one, for the refusal that billed work before it
                         // arrived — a content filter, not a credential. Same placement and the same
                         // reason: behind the cache reads, so episodes already bought still serve.
                         if state.cache.get_mem(&series_refused_key(config, llm, &imdb)).is_some() {
-                            return httputil::text(
-                                StatusCode::BAD_GATEWAY,
-                                "the AI provider refused to translate this title",
-                            );
+                            return httputil::error(StatusCode::BAD_GATEWAY, "llm_title_refused");
                         }
                         let source_id = match pinned {
                             Some(id) => id,
@@ -1541,7 +1532,7 @@ pub async fn handle_translate(
                                 let Ok((candidates, _)) =
                                     cached_search(state, &client, config, &imdb, season, episode, None).await
                                 else {
-                                    return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+                                    return httputil::error(StatusCode::BAD_GATEWAY, "translation_failed");
                                 };
                                 // Skip what is already known not to download, or the loop has no
                                 // exit: a dead source is unpinned, the deterministic re-pick chooses
@@ -1554,10 +1545,7 @@ pub async fn handle_translate(
                                     .filter(|s| state.cache.get(&oversized_file_key(s.file_id)).is_none())
                                     .collect();
                                 let Some(source) = translation_source(&usable) else {
-                                    return httputil::text(
-                                        StatusCode::NOT_FOUND,
-                                        "no source subtitle to translate",
-                                    );
+                                    return httputil::error(StatusCode::NOT_FOUND, "no_source");
                                 };
                                 state.cache.put(pin_key.clone(), source.file_id.to_string(), SOURCE_PIN_TTL);
                                 source.file_id
@@ -1580,7 +1568,7 @@ pub async fn handle_translate(
                             // Backed off like any other failure, or the refusal is free to repeat and
                             // each repeat re-runs the search and the pin write.
                             state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-                            return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
+                            return httputil::error(StatusCode::BAD_GATEWAY, "source_unavailable");
                         }
                         let started = Instant::now();
                         match produce_translation(
@@ -1608,10 +1596,7 @@ pub async fn handle_translate(
                                         "translate: {imdb} → {lang} refused, install is over its daily allowance"
                                     );
                                 }
-                                return httputil::text(
-                                    StatusCode::TOO_MANY_REQUESTS,
-                                    "translation allowance for today is used up",
-                                );
+                                return httputil::error(StatusCode::TOO_MANY_REQUESTS, "allowance_exhausted");
                             }
                             // The provider refused the key itself. Remembered install-wide rather than
                             // per title, because that is the scope of the fact — and no per-title
@@ -1668,10 +1653,7 @@ pub async fn handle_translate(
                                 // such a title re-arms the install-wide one every ten minutes forever,
                                 // and takes every other title down with it each time.
                                 state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
-                                return httputil::text(
-                                    StatusCode::BAD_GATEWAY,
-                                    "the AI provider refused this key",
-                                );
+                                return httputil::error(StatusCode::BAD_GATEWAY, "llm_key_refused");
                             }
                             Err(e) => {
                                 // Log the detail (no key in these strings); hand the client a generic
@@ -1693,7 +1675,7 @@ pub async fn handle_translate(
                                 if matches!(e, TranslationFailure::Source(_)) {
                                     state.cache.remove(&pin_key);
                                 }
-                                return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
+                                return httputil::error(StatusCode::BAD_GATEWAY, "translation_failed");
                             }
                         }
                     }
@@ -2457,10 +2439,10 @@ mod translate_retry_tests {
         )
         .to_string();
         assert_ne!(body.trim(), "1", "the retry marker was served as the response body");
-        // "recently" is what says the marker short-circuited rather than a fresh attempt failing.
-        // The config's OpenSubtitles key is a test string, so an attempt that got as far as the
-        // upstream would ALSO come back 502 — the status alone proves nothing, only the body does.
-        assert!(body.contains("recently"), "the marker did not short-circuit; body: {body}");
+        // `translation_backoff` is what says the marker short-circuited rather than a fresh attempt
+        // failing. The config's OpenSubtitles key is a test string, so an attempt that got as far as
+        // the upstream would ALSO come back 502 — the status alone proves nothing, only the body does.
+        assert!(body.contains("translation_backoff"), "the marker did not short-circuit; body: {body}");
     }
 
     /// Spellings of one language are one cache key. A translate key is a whole film's LLM bill
@@ -3070,7 +3052,7 @@ mod translate_retry_tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let finnish = body_of(resp).await;
         assert!(
-            !finnish.contains("recently"),
+            !finnish.contains("translation_backoff"),
             "Finnish was short-circuited by Swedish's marker instead of being attempted: {finnish}"
         );
 
@@ -3080,6 +3062,9 @@ mod translate_retry_tests {
                 .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let swedish = body_of(resp).await;
-        assert!(swedish.contains("recently"), "the marked language was attempted anyway: {swedish}");
+        assert!(
+            swedish.contains("translation_backoff"),
+            "the marked language was attempted anyway: {swedish}"
+        );
     }
 }

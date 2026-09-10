@@ -134,7 +134,7 @@ the focus argument plus roughly doubled input tokens. Update the module doc if i
 
 **Since fixed:** the counter moved into the shared search path, so a translation's failed search
 reaches `/health` too — and it is also published on `/metrics` as
-`subtitles_opensubtitles_consecutive_failures`.
+`subtitles_consecutive_failures{kind="opensubtitles"}`.
 
 ### 12. No progress signal on a request that can block 600s
 `RUN_DEADLINE` (`translate.rs:122`) awaited inline at `addon.rs:522`; no 202/polling shape in

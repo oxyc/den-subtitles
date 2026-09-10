@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
@@ -43,6 +43,17 @@ use crate::state::AppState;
 
 /// The /configure page, embedded so the binary is self-contained.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
+
+/// The manifest and /configure change only on a redeploy. The stale-while-revalidate window lets a
+/// client answer from its copy while it re-checks, the same as every other den addon.
+const STATIC_CACHE: &str = "public, max-age=3600, stale-while-revalidate=600";
+
+/// The sealing key can rotate, so its freshness window is short; the ETag still busts a stale copy.
+const KEY_CACHE: &str = "public, max-age=300";
+
+/// How long a client gets to send a complete request head. Without it a socket that sends half a head
+/// holds a connection task open indefinitely.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Consecutive OpenSubtitles failures before /health reports `degraded` (ADDON-02).
 const HEALTH_FAIL_THRESHOLD: u32 = 3;
@@ -66,7 +77,7 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         // A CORS preflight is answered for any path, before routing.
         hyper::Method::OPTIONS => httputil::preflight(),
         // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
-        // collapses to a 304. Unsafe methods (none served today) keep their full response.
+        // collapses to a 304.
         hyper::Method::GET | hyper::Method::HEAD => {
             let resp = httputil::apply_conditional(route(&state, &parts).await, &parts.headers);
             // HEAD must not carry a body (the router builds one regardless of method).
@@ -76,11 +87,15 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
                 resp
             }
         }
-        _ => route(&state, &parts).await,
+        // Every route is a read. Routing on the path alone let a POST reach the same handlers — and a
+        // subtitle or translate route spends a metered download or an LLM bill.
+        _ => httputil::error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"),
     };
-    // `total` closes the header on any response whose handler named its phases.
+    // `total` closes the header on any response whose handler named its phases, in tenths of a
+    // millisecond like every other den addon.
     if resp.headers().contains_key(httputil::SERVER_TIMING) {
-        resp = httputil::add_timing(resp, &format!("total;dur={}", started.elapsed().as_millis()));
+        let total = format!("total;dur={:.1}", started.elapsed().as_secs_f64() * 1000.0);
+        resp = httputil::add_timing(resp, &total);
     }
     // Every reply is readable from a browser-based Stremio client. Nothing here rides on a cookie —
     // an install's credentials are in its path — so a wildcard origin grants a page nothing it could
@@ -117,21 +132,17 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         }
         // Prometheus text behind `METRICS_TOKEN`; 404 without it (see metrics.rs).
         "/metrics" => return metrics::handle(state, &parts.headers),
-        "/manifest.json" => {
-            return httputil::json(StatusCode::OK, &addon::manifest(false), "public, max-age=3600")
-        }
+        "/manifest.json" => return httputil::json(StatusCode::OK, &addon::manifest(false), STATIC_CACHE),
         "/" | "/configure" | "/configure/" => {
-            return httputil::html(StatusCode::OK, CONFIGURE_PAGE, "public, max-age=3600")
+            return httputil::html(StatusCode::OK, CONFIGURE_PAGE, STATIC_CACHE)
         }
         // The current X25519 public key (base64) so /configure can seal the config to it; 404 when
         // sealed configs are disabled (no key) — the page then keeps plaintext (SEALED-CONFIG.md).
         "/config-key" => {
             return match state.config_keyring.as_ref().map(|kr| kr.current_pub_b64()) {
-                Some(pub_b64) if !pub_b64.is_empty() => httputil::json(
-                    StatusCode::OK,
-                    &serde_json::json!({"key": pub_b64}),
-                    "public, max-age=3600",
-                ),
+                Some(pub_b64) if !pub_b64.is_empty() => {
+                    httputil::json(StatusCode::OK, &serde_json::json!({"key": pub_b64}), KEY_CACHE)
+                }
                 _ => {
                     httputil::json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "no_key"}), "no-store")
                 }
@@ -146,7 +157,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
 
     match resource {
         "manifest.json" => match userconfig::decode(state.config_keyring.as_ref(), config) {
-            Some(_) => httputil::json(StatusCode::OK, &addon::manifest(true), "public, max-age=3600"),
+            Some(_) => httputil::json(StatusCode::OK, &addon::manifest(true), STATIC_CACHE),
             None => httputil::json(
                 StatusCode::BAD_REQUEST,
                 &serde_json::json!({"error": "bad_config"}),
@@ -180,7 +191,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                         resp
                     }
                 }
-                None => httputil::text(StatusCode::BAD_REQUEST, "bad file id"),
+                None => httputil::error(StatusCode::BAD_REQUEST, "bad_file_id"),
             }
         }
         "translate" => {
@@ -260,19 +271,22 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let port = cfg.port;
     let state = AppState::new(cfg);
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    // Registered before the process says it is up, so a stop that arrives from here on drains.
+    let shutdown = shutdown_signal();
     // What this process is running with, minus anything secret: the key and the token appear only as
-    // on/off, and the origin is one the addon hands to every client anyway.
+    // on/off, and the origin is one the addon hands to every client anyway. Same shape as every other
+    // den addon's line.
     let on_off = |on: bool| if on { "on" } else { "off" };
     eprintln!(
-        "den-subtitles {} listening on :{port} — cache {} ({} MiB), public origin {}, sealed configs {}, \
-         metrics {}, request log {} (keys are per-install; build one at /configure)",
+        "den-subtitles {} listening on :{port} — metrics={} log_requests={} sealed={} cache_dir={} \
+         cache_max_mib={} public_base={}",
         env!("CARGO_PKG_VERSION"),
-        state.cfg.cache_dir.display(),
-        state.cfg.cache_max_bytes / (1024 * 1024),
-        state.cfg.public_base_url.as_deref().unwrap_or("from Host"),
-        on_off(state.config_keyring.is_some()),
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
+        on_off(state.config_keyring.is_some()),
+        state.cfg.cache_dir.display(),
+        state.cfg.cache_max_bytes / (1024 * 1024),
+        state.cfg.public_base_url.as_deref().unwrap_or("derived"),
     );
 
     // Reclaim the disk cache hourly. `Cache::new` sweeps at boot, which bounds the store across
@@ -306,7 +320,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         });
     }
 
-    serve_until(listener, state, shutdown_signal(), DRAIN_GRACE).await;
+    serve_until(listener, state, shutdown, DRAIN_GRACE).await;
     Ok(())
 }
 
@@ -330,6 +344,8 @@ async fn serve_until(
     grace: Duration,
 ) {
     let graceful = GracefulShutdown::new();
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
     tokio::pin!(shutdown);
     loop {
         let (stream, _) = tokio::select! {
@@ -354,7 +370,7 @@ async fn serve_until(
             let state = state.clone();
             async move { Ok::<_, Infallible>(handle_request(state, req).await) }
         });
-        let conn = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+        let conn = http.serve_connection(TokioIo::new(stream), service);
         let conn = graceful.watch(conn);
         tokio::spawn(async move {
             let _ = conn.await;
@@ -363,26 +379,65 @@ async fn serve_until(
     drop(listener);
     eprintln!("shutting down — draining in-flight requests");
     tokio::select! {
-        _ = graceful.shutdown() => {}
+        _ = graceful.shutdown() => eprintln!("shut down cleanly"),
         _ = tokio::time::sleep(grace) => {
             eprintln!("drain deadline ({grace:?}) reached with requests still in flight");
         }
     }
 }
 
-/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal).
-async fn shutdown_signal() {
+/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal). The same handler den-atlas and den-embed
+/// use.
+fn shutdown_signal() -> impl Future<Output = ()> {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot listen for SIGTERM ({e}); a redeploy will cut in-flight requests");
-            return std::future::pending().await;
+    // Registered NOW, by the caller, not lazily when the future is first polled. Polling starts once
+    // the server is already accepting, and until then SIGTERM keeps its default disposition — so a
+    // stop arriving in that window killed the process outright rather than draining it.
+    let term = signal(SignalKind::terminate());
+    let int = signal(SignalKind::interrupt());
+    async move {
+        tokio::select! {
+            _ = wait_for(term, "SIGTERM") => {}
+            _ = wait_for(int, "SIGINT") => {}
         }
-    };
-    tokio::select! {
-        _ = term.recv() => {},
-        _ = tokio::signal::ctrl_c() => {},
+        // A SECOND signal ends it now. Both handles above are dropped by here, and tokio does not
+        // restore the default disposition when a `Signal` drops — so every later SIGTERM and ^C would
+        // be caught and discarded, and an operator could not get out of the drain short of SIGKILL.
+        // Exit 0, because asking twice is a deliberate choice, not a failure.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = quietly(signal(SignalKind::terminate())) => {}
+                _ = quietly(signal(SignalKind::interrupt())) => {}
+            }
+            eprintln!("second signal — exiting without finishing the drain");
+            std::process::exit(0);
+        });
+    }
+}
+
+/// Like `wait_for`, but says nothing — for a caller that prints its own, different message.
+async fn quietly(registered: std::io::Result<tokio::signal::unix::Signal>) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+/// Resolve when this signal arrives, or never if it could not be registered — returning at once would
+/// shut the server down the moment it started. The two signals are registered independently, so one
+/// failing does not take the other with it.
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut sig) => {
+            sig.recv().await;
+            eprintln!("{name} — draining in-flight requests");
+        }
+        Err(e) => {
+            eprintln!("{name} handler unavailable ({e}); it will be a hard kill");
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -688,7 +743,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{uri}");
             let h = resp.headers();
             assert_eq!(h.get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*", "{uri}");
-            assert_eq!(h.get(ACCESS_CONTROL_ALLOW_METHODS).unwrap(), "GET, HEAD, POST, OPTIONS");
+            assert_eq!(h.get(ACCESS_CONTROL_ALLOW_METHODS).unwrap(), "GET, HEAD, OPTIONS");
             assert_eq!(h.get(ACCESS_CONTROL_ALLOW_HEADERS).unwrap(), "*");
             assert_eq!(h.get(ACCESS_CONTROL_MAX_AGE).unwrap(), "86400");
             assert!(body_string(resp).await.is_empty());
@@ -746,7 +801,58 @@ mod tests {
         let body = body_string(resp).await;
         let build = format!("subtitles_build_info{{version=\"{}\"}} 1\n", env!("CARGO_PKG_VERSION"));
         assert!(body.contains(&build), "no build_info line in:\n{body}");
-        assert!(body.contains("\nsubtitles_opensubtitles_consecutive_failures 0\n"), "{body}");
+        assert!(body.contains("\nsubtitles_consecutive_failures{kind=\"opensubtitles\"} 0\n"), "{body}");
         assert!(body.contains("# TYPE subtitles_cache_disk_write_failures_total counter\n"), "{body}");
+    }
+
+    /// Every route is a read; anything else is refused before it can reach a handler that spends a
+    /// metered download or an LLM bill.
+    #[tokio::test]
+    async fn a_write_method_is_a_json_405() {
+        for method in [hyper::Method::POST, hyper::Method::PUT, hyper::Method::DELETE] {
+            let resp = handle_request(test_state(""), request(method.clone(), "/manifest.json")).await;
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), "no-store", "{method}");
+            assert_eq!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*", "{method}");
+            assert_eq!(body_string(resp).await, r#"{"error":"method_not_allowed"}"#, "{method}");
+        }
+    }
+
+    /// An error is the fleet's JSON shape, not a text body.
+    #[tokio::test]
+    async fn an_error_reply_is_json() {
+        let resp = handle_request(test_state(""), request(hyper::Method::GET, "/cfg/subtitle/abc.srt")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(body_string(resp).await, r#"{"error":"bad_file_id"}"#);
+    }
+
+    #[tokio::test]
+    async fn static_routes_carry_the_fleet_cache_policy() {
+        let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-test"}"#);
+        let cases = [
+            ("/manifest.json".to_string(), STATIC_CACHE),
+            (format!("/{seg}/manifest.json"), STATIC_CACHE),
+            ("/configure".to_string(), STATIC_CACHE),
+            ("/config-key".to_string(), KEY_CACHE),
+        ];
+        for (uri, want) in cases {
+            let resp = handle_request(test_state(VEC_PRIV_B64), request(hyper::Method::GET, &uri)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), want, "{uri}");
+        }
+        assert_eq!(STATIC_CACHE, "public, max-age=3600, stale-while-revalidate=600");
+        assert_eq!(KEY_CACHE, "public, max-age=300");
+    }
+
+    /// Tenths of a millisecond, the format every den addon's `total` uses.
+    #[tokio::test]
+    async fn server_timing_total_has_tenths_of_a_millisecond() {
+        let uri = format!("/{}/subtitles/movie/tt0000001.json", os_only_segment());
+        let resp = handle_request(test_state(""), request(hyper::Method::GET, &uri)).await;
+        let timing = server_timing(&resp);
+        let total = timing.rsplit("total;dur=").next().unwrap();
+        assert!(total.contains('.') && total.split('.').nth(1).unwrap().len() == 1, "{timing}");
     }
 }

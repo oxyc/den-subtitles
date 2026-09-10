@@ -64,10 +64,11 @@ fn render(state: &AppState) -> String {
     );
     series(
         &mut out,
-        "subtitles_opensubtitles_consecutive_failures",
+        "subtitles_consecutive_failures",
         "gauge",
-        "OpenSubtitles subtitle searches failed in a row; /health reports degraded from 3.",
-        "",
+        "Upstream calls failed in a row, by kind; opensubtitles is the search streak /health reports \
+         degraded from at 3.",
+        "kind=\"opensubtitles\"",
         state.os_fails.load(Ordering::Relaxed),
     );
     series(

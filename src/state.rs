@@ -47,7 +47,7 @@ impl AppState {
         // forever. The connect bound is tight; the overall bound is generous because a translation
         // batch on a slow model is legitimately slow (per-request LLM calls override it upward).
         let http = match reqwest::Client::builder()
-            .user_agent("den-subtitles/0.1")
+            .user_agent(concat!("den-subtitles/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build()
