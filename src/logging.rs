@@ -25,6 +25,26 @@ pub fn redact_path(path: &str) -> String {
     }
 }
 
+/// The caller's `X-Request-Id`, fit for the log: only `[A-Za-z0-9_-]`, at most 32 characters. It is
+/// what joins this line to the app's own log line for the same request. Anything else in the header is
+/// dropped rather than escaped, so a caller cannot forge a second field or a second line; nothing left
+/// means no id.
+pub fn request_id(headers: &hyper::HeaderMap) -> Option<String> {
+    let raw = headers.get("x-request-id")?.to_str().ok()?;
+    let id: String =
+        raw.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(32).collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// One request log line: `<METHOD> <redacted path> <status> <ms>ms[ rid=<id>]`.
+pub fn request_line(method: &str, path: &str, status: u16, ms: u128, rid: Option<&str>) -> String {
+    let line = format!("{method} {} {status} {ms}ms", redact_path(path));
+    match rid {
+        Some(rid) => format!("{line} rid={rid}"),
+        None => line,
+    }
+}
+
 /// How often one kind of recurring failure may reach the log.
 const LOG_EVERY_SECS: u64 = 60;
 
@@ -79,6 +99,35 @@ mod tests {
         for path in FIXED_ROUTES {
             assert_eq!(redact_path(path), path);
         }
+    }
+
+    fn rid(value: &str) -> Option<String> {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-request-id", hyper::header::HeaderValue::from_str(value).unwrap());
+        request_id(&headers)
+    }
+
+    #[test]
+    fn a_request_line_carries_the_caller_s_id() {
+        let id = rid("a1B2-c3_d4");
+        assert_eq!(
+            request_line("GET", "/Ac3WWHz/subtitle/42.srt", 200, 7, id.as_deref()),
+            "GET /<config>/subtitle/42.srt 200 7ms rid=a1B2-c3_d4"
+        );
+    }
+
+    #[test]
+    fn a_hostile_request_id_is_stripped_and_truncated() {
+        // Spaces and `=` would forge a field; only the safe characters survive, in order.
+        assert_eq!(rid("ab cd=ef"), Some("abcdef".to_string()));
+        assert_eq!(rid(&"x".repeat(100)), Some("x".repeat(32)));
+        assert_eq!(rid("!!!"), None, "nothing safe left means no id");
+    }
+
+    #[test]
+    fn without_a_request_id_the_line_is_unchanged() {
+        assert_eq!(request_id(&hyper::HeaderMap::new()), None);
+        assert_eq!(request_line("GET", "/health", 200, 0, None), "GET /health 200 0ms");
     }
 
     #[test]

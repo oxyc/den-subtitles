@@ -107,14 +107,18 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         .insert("access-control-expose-headers", HeaderValue::from_static("Server-Timing, X-Den-Degraded"));
     resp.headers_mut().insert("timing-allow-origin", HeaderValue::from_static("*"));
     // Off by default, and then this bool is the whole cost. The path is redacted and the query left
-    // out: a config segment is an install's credentials, and `?resync=` carries a stream URL.
+    // out: a config segment is an install's credentials, and `?resync=` carries a stream URL. The
+    // caller's X-Request-Id rides along so the line can be matched to the app's.
     if state.cfg.log_requests {
         eprintln!(
-            "{} {} {} {}ms",
-            parts.method,
-            logging::redact_path(parts.uri.path()),
-            resp.status().as_u16(),
-            started.elapsed().as_millis()
+            "{}",
+            logging::request_line(
+                parts.method.as_str(),
+                parts.uri.path(),
+                resp.status().as_u16(),
+                started.elapsed().as_millis(),
+                logging::request_id(&parts.headers).as_deref(),
+            )
         );
     }
     resp
