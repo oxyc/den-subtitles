@@ -58,7 +58,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
   non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon runs `alass`
   against the stream audio server-side and the app swaps in the re-synced track. The stream URL has
-  to be den-scout's play route (`<origin>/<config>/play/<token>`) at an origin listed in
+  to be one of den-scout's play routes — `<origin>/<config>/play/<token>`, or the ticket form
+  `<origin>/p/<ticket>` (one base64url segment) — at an origin listed in
   `SCOUT_ORIGINS`; any other target, or any target when that is unset, is ignored and the sub is
   served unaligned. alass never gets the URL itself: it reads a relay on 127.0.0.1 that follows
   scout's redirect to the debrid CDN, refuses a hop that is neither a listed origin nor a public

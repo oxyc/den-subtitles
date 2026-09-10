@@ -6,10 +6,12 @@
 //! reach — every LAN host, and `den-embed:8080` on the container network — plus attacker-chosen
 //! media fed to ffmpeg's parsers. Two rules close it:
 //!
-//!   * **Only den-scout's play route at an operator-listed origin.** A target must be
-//!     `<origin>/<config>/play/<token>` with `<origin>` in `SCOUT_ORIGINS`. That is the URL the Den
-//!     app sends (the playing source's scout link), and scout answers it only for a valid install
-//!     config — so a caller without one cannot make scout redirect anywhere. With `SCOUT_ORIGINS`
+//!   * **Only den-scout's play routes at an operator-listed origin.** A target must be
+//!     `<origin>/<config>/play/<token>` or `<origin>/p/<ticket>`, with `<origin>` in `SCOUT_ORIGINS`.
+//!     Those are the URLs the Den app sends (the playing source's scout link: the legacy form
+//!     carries the install config, the ticket form a short-lived play ticket), and scout answers
+//!     them only for a valid install config or ticket — so a caller without one cannot make scout
+//!     redirect anywhere. With `SCOUT_ORIGINS`
 //!     unset, Tier 2 is off. A "public addresses only" fallback was the obvious alternative and is
 //!     not safe: an attacker's public server can answer with an HLS playlist, and ffmpeg opens every
 //!     segment URL in it itself — `http://192.168.x.y/…` included — without this process ever
@@ -105,8 +107,14 @@ fn origin_of(url: &Url) -> Option<Origin> {
     })
 }
 
-/// The resync target, normalized, if it is den-scout's play route at a listed origin; `None` for
-/// anything else, and for everything when no origin is listed.
+/// The longest `/p/<ticket>` segment accepted. A ticket seals a handful of fields (the debrid
+/// accounts, the release, an expiry, the install id) and comes to well under a kilobyte; this is
+/// several times that, and still a bound that means something.
+const MAX_TICKET_LEN: usize = 4096;
+
+/// The resync target, normalized, if it is one of den-scout's play routes at a listed origin —
+/// `/<config>/play/<token>`, or `/p/<ticket>` — and `None` for anything else, and for everything
+/// when no origin is listed.
 ///
 /// No DNS here. A listed origin is trusted by name because the operator named it; where the
 /// redirect chain after it leads is `Relay::open`'s question, asked once per hop.
@@ -118,8 +126,17 @@ pub fn vet(raw: &str, origins: &[Origin]) -> Option<Url> {
     let segments: Vec<&str> = url.path_segments()?.collect();
     match segments.as_slice() {
         [config, "play", token] if !config.is_empty() && !token.is_empty() => Some(url),
+        ["p", ticket] if is_ticket(ticket) => Some(url),
         _ => None,
     }
+}
+
+/// A play ticket as scout mints it: one base64url segment, unpadded. Opaque here — whether it is
+/// valid is scout's call — so this only holds the shape exact: nothing percent-encoded, no padding,
+/// nothing that could turn into a second segment.
+fn is_ticket(s: &str) -> bool {
+    (1..=MAX_TICKET_LEN).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// An address on the public internet: not loopback, private (RFC 1918), CGNAT (100.64/10, where a
@@ -371,6 +388,9 @@ mod tests {
             "https://scout.example.com/cfg/play/tok",
             "https://scout.example.com:443/cfg/play/tok", // the default port, written out
             "https://SCOUT.example.com/cfg/play/tok",     // hosts compare case-insensitively
+            // The ticket form: one base64url segment under /p/.
+            "http://192.168.86.193:8080/p/AbC-_09xyz",
+            "https://scout.example.com/p/tkt",
         ];
         for u in ok {
             assert!(vet(u, &list).is_some(), "refused {u}");
@@ -407,6 +427,26 @@ mod tests {
             "file:///etc/passwd",
             "ftp://192.168.86.193:8080/cfg/play/tok",
             "",
+            // The ticket form in any shape but exactly /p/<one base64url segment>.
+            "http://192.168.86.193:8080/p",
+            "http://192.168.86.193:8080/p/",
+            "http://192.168.86.193:8080/p/tkt/extra",
+            "http://192.168.86.193:8080/p/tkt?probe=1",
+            "http://192.168.86.193:8080/p/tkt#x",
+            "http://192.168.86.193:8080/p/tk%2Ft", // percent-encoded
+            "http://192.168.86.193:8080/p/tkt=",   // padded
+            "http://192.168.86.193:8080/p/tk.t",
+            "http://192.168.86.193:8080/p/tk+t",
+            "http://192.168.86.193:8080/P/tkt",
+            "http://192.168.86.193:8080/pp/tkt",
+            "http://192.168.86.193:8080/cfg/p/tkt",
+            "http://192.168.86.193:8080//p/tkt",
+            // The ticket form anywhere else, or with credentials.
+            "http://192.168.86.193:8081/p/tkt",
+            "http://10.0.0.1/p/tkt",
+            "http://127.0.0.1:8080/p/tkt",
+            "http://user@192.168.86.193:8080/p/tkt",
+            "http://192.168.86.193:8080@evil.tld/p/tkt",
         ];
         for u in refused {
             assert!(vet(u, &list).is_none(), "accepted {u}");
@@ -414,9 +454,18 @@ mod tests {
     }
 
     #[test]
+    fn a_ticket_is_bounded() {
+        let list = origins("http://192.168.86.193:8080");
+        let ticket = |n: usize| format!("http://192.168.86.193:8080/p/{}", "A".repeat(n));
+        assert!(vet(&ticket(MAX_TICKET_LEN), &list).is_some());
+        assert!(vet(&ticket(MAX_TICKET_LEN + 1), &list).is_none());
+    }
+
+    #[test]
     fn with_no_origin_listed_nothing_passes() {
         assert!(vet("http://192.168.86.193:8080/cfg/play/tok", &[]).is_none());
         assert!(vet("https://scout.example.com/cfg/play/tok", &[]).is_none());
+        assert!(vet("http://192.168.86.193:8080/p/tkt", &[]).is_none());
     }
 
     #[test]
@@ -582,6 +631,22 @@ mod tests {
         drop(relay);
         tokio::task::yield_now().await;
         assert!(client().get(addr).send().await.is_err(), "the relay outlived its handle");
+    }
+
+    /// A ticket URL is followed through scout's redirect exactly like the legacy play route.
+    #[tokio::test]
+    async fn the_relay_follows_a_ticket_url() {
+        const MEDIA: &[u8] = b"ticketed";
+        let (scout, _) = server(|req, _| match req.uri().path() {
+            "/p/AbC-_09" => redirect("/cdn/film.mkv".into()),
+            _ => ranged(req, MEDIA),
+        })
+        .await;
+        let list = origins(&format!("http://{scout}"));
+        let target = vet(&format!("http://{scout}/p/AbC-_09"), &list).expect("a ticket URL was refused");
+        let relay = Relay::open(target.as_str(), &list).await.expect("a ticket target was not relayed");
+        let whole = client().get(relay.url()).send().await.unwrap();
+        assert_eq!(whole.bytes().await.unwrap(), MEDIA);
     }
 
     /// The target can change its answer after it was vetted. A redirect then reaches the relay, not

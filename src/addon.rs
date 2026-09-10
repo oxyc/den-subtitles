@@ -479,7 +479,7 @@ pub async fn handle_subtitle_file(
         // Never the URL itself: a stream target carries the provider's token.
         None => {
             if UNSAFE_RESYNC.allow() {
-                eprintln!("subtitle: refusing resync target for {file_id} (not scout /play at a SCOUT_ORIGINS origin)");
+                eprintln!("subtitle: refusing resync target for {file_id} (not a scout play URL at a SCOUT_ORIGINS origin)");
             }
             None
         }
