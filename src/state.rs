@@ -1,7 +1,7 @@
 //! Shared application state: one pooled HTTP client, the artifact cache, and the sync tools, wired
 //! from `Config` and cloned (behind `Arc`) into every connection.
 
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,5 +90,28 @@ impl AppState {
     /// slot are not counted — they have not spawned anything.
     pub fn syncs_running(&self) -> usize {
         MAX_CONCURRENT_SYNCS - self.sync_slots.available_permits()
+    }
+
+    /// Record a successful OpenSubtitles search. Logs, and returns true, only when it recovers
+    /// /health: that is the state change, and the successes around it are not news.
+    pub fn search_succeeded(&self) -> bool {
+        let recovered = self.os_fails.swap(0, Ordering::Relaxed) >= crate::HEALTH_FAIL_THRESHOLD;
+        if recovered {
+            eprintln!("opensubtitles: searching again — /health ok");
+        }
+        recovered
+    }
+
+    /// Record a failed OpenSubtitles search. Logs, and returns true, only for the failure that turns
+    /// /health degraded; the ones after it are the same state.
+    pub fn search_failed(&self) -> bool {
+        let fails = self.os_fails.fetch_add(1, Ordering::Relaxed) + 1;
+        let flipped = fails == crate::HEALTH_FAIL_THRESHOLD;
+        if flipped {
+            eprintln!(
+                "opensubtitles: {fails} searches failed in a row — /health degraded (upstream_unavailable)"
+            );
+        }
+        flipped
     }
 }

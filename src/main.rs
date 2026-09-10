@@ -15,6 +15,7 @@ mod config;
 mod fetch;
 mod httputil;
 mod inflight;
+mod logging;
 mod metrics;
 mod opensubtitles;
 mod seal;
@@ -27,7 +28,7 @@ mod userconfig;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
 use hyper::service::service_fn;
@@ -59,6 +60,7 @@ fn health_body(os_fails: u32) -> serde_json::Value {
 // Generic over the request body: this handler routes on path/query only and discards the body, so tests
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
+    let started = Instant::now();
     let (parts, _body) = req.into_parts();
     let mut resp = match parts.method {
         // A CORS preflight is answered for any path, before routing.
@@ -80,6 +82,17 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // an install's credentials are in its path — so a wildcard origin grants a page nothing it could
     // not already fetch. Added here, last, so the 304 and VTT paths that rebuild a response keep it.
     resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    // Off by default, and then this bool is the whole cost. The path is redacted and the query left
+    // out: a config segment is an install's credentials, and `?resync=` carries a stream URL.
+    if state.cfg.log_requests {
+        eprintln!(
+            "{} {} {} {}ms",
+            parts.method,
+            logging::redact_path(parts.uri.path()),
+            resp.status().as_u16(),
+            started.elapsed().as_millis()
+        );
+    }
     resp
 }
 
@@ -238,7 +251,20 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let port = cfg.port;
     let state = AppState::new(cfg);
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    eprintln!("listening on :{port} (keys are per-install; build one at /configure)");
+    // What this process is running with, minus anything secret: the key and the token appear only as
+    // on/off, and the origin is one the addon hands to every client anyway.
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    eprintln!(
+        "den-subtitles {} listening on :{port} — cache {} ({} MiB), public origin {}, sealed configs {}, \
+         metrics {}, request log {} (keys are per-install; build one at /configure)",
+        env!("CARGO_PKG_VERSION"),
+        state.cfg.cache_dir.display(),
+        state.cfg.cache_max_bytes / (1024 * 1024),
+        state.cfg.public_base_url.as_deref().unwrap_or("from Host"),
+        on_off(state.config_keyring.is_some()),
+        on_off(!state.cfg.metrics_token.is_empty()),
+        on_off(state.cfg.log_requests),
+    );
 
     // Reclaim the disk cache hourly. `Cache::new` sweeps at boot, which bounds the store across
     // restarts but not within one — a container that stays up keeps writing entries that only a
@@ -280,6 +306,8 @@ async fn run(cfg: Config) -> std::io::Result<()> {
 /// has reached the box.
 const DRAIN_GRACE: Duration = Duration::from_secs(8);
 
+static ACCEPT_FAILED: logging::LogGate = logging::LogGate::new();
+
 /// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`. Without
 /// it a redeploy killed the process outright, cutting every fetch and translation mid-response.
 ///
@@ -299,7 +327,10 @@ async fn serve_until(
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
                 Err(e) => {
-                    eprintln!("accept: {e}");
+                    // Out of file descriptors fails every accept in a row; say so once a minute.
+                    if ACCEPT_FAILED.allow() {
+                        eprintln!("accept: {e}");
+                    }
                     continue;
                 }
             },
@@ -378,6 +409,7 @@ mod tests {
             config_key: config_key.to_string(),
             config_keys_prev: String::new(),
             metrics_token: metrics_token.to_string(),
+            log_requests: false,
             // Never the live API from a test: port 1 refuses instantly.
             os_api_base: "http://127.0.0.1:1".to_string(),
         };
@@ -549,6 +581,20 @@ mod tests {
             assert_eq!(body["reason"], "upstream_unavailable");
             assert_eq!(body["detail"], "OpenSubtitles has been failing");
         }
+    }
+
+    /// /health changing state is logged once each way, not once per search.
+    #[test]
+    fn a_health_flip_is_reported_once_each_way() {
+        let state = test_state("");
+        for _ in 1..HEALTH_FAIL_THRESHOLD {
+            assert!(!state.search_failed(), "still ok below the threshold");
+        }
+        assert!(state.search_failed(), "the failure that crosses the threshold flips /health");
+        assert!(!state.search_failed(), "staying degraded is not a change");
+        assert!(state.search_succeeded(), "the first success recovers /health");
+        assert!(!state.search_succeeded(), "staying ok is not a change");
+        assert!(!state.search_failed(), "one failure after a recovery does not flip it back");
     }
 
     fn metrics_request(auth: Option<&str>) -> Request<()> {

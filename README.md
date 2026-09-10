@@ -119,6 +119,7 @@ it optional (`.env.example` lists the same):
 | `CONFIG_KEY` | unset (sealing off) | Base64 X25519 private key `/configure` seals configs to; back it up. |
 | `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working. |
 | `METRICS_TOKEN` | unset (`/metrics` 404s) | Bearer token for `/metrics`. |
+| `LOG_REQUESTS` | unset (off; `0` is off too) | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, with the config segment as `<config>` and no query string. |
 | `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-2 audio sync. |
 | `FFSUBSYNC_PATH` | `ffsubsync` (image: `/usr/local/bin/ffsubsync`) | The `ffsubsync` binary for Tier-1 reference sync. |
 

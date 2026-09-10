@@ -39,6 +39,7 @@ use futures_util::stream::{self, StreamExt};
 
 use serde_json::{json, Value};
 
+use crate::logging::LogGate;
 use crate::srt::Cue;
 use crate::userconfig::{LlmConfig, Provider};
 
@@ -106,6 +107,10 @@ const MAX_GLOSSARY_TERM: usize = 40;
 
 /// Spreads retries that would otherwise fire in the same instant. Only ever incremented.
 static RETRY_TICK: AtomicU64 = AtomicU64::new(0);
+
+/// A failed glossary pass happens once per run, and a provider that is failing fails every run the
+/// same way; one line a minute says so.
+static GLOSSARY_FAILED: LogGate = LogGate::new();
 
 /// Why a run did not finish, and whether the CREDENTIAL is why.
 ///
@@ -822,11 +827,15 @@ impl BatchCall for Upstream<'_> {
                 // safety-filtered film is exactly this, and it is the one whose batches then fail
                 // the same way. `Upstream` is a refusal, or a transport error, and costs nothing.
                 Err(CallError::Contract(m)) => {
-                    eprintln!("translate: no glossary ({m}) — continuing without one");
+                    if GLOSSARY_FAILED.allow() {
+                        eprintln!("translate: no glossary ({m}) — continuing without one");
+                    }
                     Some(Vec::new())
                 }
                 Err(e) => {
-                    eprintln!("translate: no glossary ({}) — continuing without one", e.into_message());
+                    if GLOSSARY_FAILED.allow() {
+                        eprintln!("translate: no glossary ({}) — continuing without one", e.into_message());
+                    }
                     None
                 }
             }

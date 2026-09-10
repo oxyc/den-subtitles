@@ -21,6 +21,9 @@ pub struct Config {
     pub config_keys_prev: String,
     /// Bearer token for `/metrics`. Empty → the route answers 404, like any unknown path.
     pub metrics_token: String,
+    /// One stderr line per request (`LOG_REQUESTS`), off by default. Read once here so that, off, the
+    /// request path pays a single bool check.
+    pub log_requests: bool,
     /// OpenSubtitles API root. A field so tests can point the request path at a local server instead
     /// of the live API — several of them reach `handle_translate`, which searches before it can do
     /// anything else, and without this they made a real request to api.opensubtitles.com on every
@@ -52,6 +55,7 @@ impl Config {
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
             metrics_token: env_opt("METRICS_TOKEN").unwrap_or_default(),
+            log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v != "0"),
             os_api_base: crate::opensubtitles::API.to_string(),
         }
     }

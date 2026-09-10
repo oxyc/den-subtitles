@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 
 use crate::cache;
 use crate::httputil::{self, Body};
+use crate::logging::LogGate;
 use crate::opensubtitles;
 use crate::state::AppState;
 use crate::userconfig::{self, LlmConfig, UserConfig};
@@ -65,6 +66,16 @@ const SOURCE_PIN_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 180);
 
 /// Monotonic counter making sync scratch-file names unique per invocation.
 static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+// One line a minute for each kind of failure that can repeat on every request while an upstream is
+// down or a client keeps retrying (see `LogGate`).
+static SEARCH_FAILED: LogGate = LogGate::new();
+static DOWNLOAD_FAILED: LogGate = LogGate::new();
+static SYNC_FAILED: LogGate = LogGate::new();
+static UNSAFE_RESYNC: LogGate = LogGate::new();
+static ALLOWANCE_REFUSED: LogGate = LogGate::new();
+static CREDENTIAL_REFUSED: LogGate = LogGate::new();
+static TRANSLATE_FAILED: LogGate = LogGate::new();
 
 pub fn manifest(configured: bool) -> Value {
     json!({
@@ -191,8 +202,8 @@ pub async fn handle_subtitles(
     let Some((imdb, season, episode)) = parse_id(id) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_id"}), "no-store");
     };
+    // A missing client was logged once, at boot; repeating it per request says nothing new.
     let Some(http) = state.http.as_ref() else {
-        eprintln!("subtitles: http client unavailable");
         return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
     };
 
@@ -346,18 +357,21 @@ async fn cached_search(
     }
     match client.search(imdb, season, episode, "all", hash).await {
         Ok(s) => {
-            state.os_fails.store(0, Ordering::Relaxed);
+            state.search_succeeded();
             if let Ok(json) = serde_json::to_string(&s) {
                 state.cache.put(search_key, json, SEARCH_TTL);
             }
             Ok(s)
         }
-        // Log the cause (our error strings carry no key) and count it so /health can report
-        // `degraded` (ADDON-02). Counted HERE rather than at one call site, so a translation that
-        // cannot reach OpenSubtitles is visible on /health too — it was not before.
+        // Count it so /health can report `degraded` (ADDON-02). Counted HERE rather than at one call
+        // site, so a translation that cannot reach OpenSubtitles is visible on /health too — it was
+        // not before. The cause is logged at most once a minute (our error strings carry no key):
+        // during an outage every request fails the same way.
         Err(e) => {
-            eprintln!("search: opensubtitles failed for {imdb}: {e}");
-            state.os_fails.fetch_add(1, Ordering::Relaxed);
+            state.search_failed();
+            if SEARCH_FAILED.allow() {
+                eprintln!("search: opensubtitles failed for {imdb}: {e}");
+            }
             state.cache.put_mem(fail_key, "1".into(), SEARCH_FAIL_TTL);
             Err(e)
         }
@@ -429,7 +443,9 @@ pub async fn handle_subtitle_file(
         Some(u) if is_safe_resync_url(&u).await => Some(u),
         // Never the URL itself: a stream target carries the provider's token.
         Some(_) => {
-            eprintln!("subtitle: refusing unsafe resync target for {file_id}");
+            if UNSAFE_RESYNC.allow() {
+                eprintln!("subtitle: refusing unsafe resync target for {file_id}");
+            }
             None
         }
         None => None,
@@ -448,7 +464,9 @@ pub async fn handle_subtitle_file(
     let target = match subtitle_srt(state, &client, file_id).await {
         Ok(body) => body,
         Err(e) => {
-            eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
+            if DOWNLOAD_FAILED.allow() {
+                eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
+            }
             return httputil::text(StatusCode::BAD_GATEWAY, "upstream subtitle fetch failed");
         }
     };
@@ -562,7 +580,9 @@ async fn sync_and_cache(
         match state.sync.sync_to_audio(&target, &url, &tag).await {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("sync: resync of {what} failed: {e}");
+                if SYNC_FAILED.allow() {
+                    eprintln!("sync: resync of {what} failed: {e}");
+                }
                 None
             }
         }
@@ -579,7 +599,9 @@ async fn sync_and_cache(
                 match aligned {
                     Ok(s) => Some(s),
                     Err(e) => {
-                        eprintln!("sync: aligning {what} to {r} failed: {e}");
+                        if SYNC_FAILED.allow() {
+                            eprintln!("sync: aligning {what} to {r} failed: {e}");
+                        }
                         None
                     }
                 }
@@ -588,7 +610,9 @@ async fn sync_and_cache(
                 // `Unavailable` is this credential's own trouble — quota gone, key revoked, its own
                 // rate limit. `Gone` and `Suspect` are about the file, so they stay shared.
                 mine_only = matches!(e, opensubtitles::DownloadError::Unavailable(_));
-                eprintln!("sync: reference {r} for {what} unavailable: {}", e.message());
+                if DOWNLOAD_FAILED.allow() {
+                    eprintln!("sync: reference {r} for {what} unavailable: {}", e.message());
+                }
                 None
             }
         }
@@ -1378,7 +1402,9 @@ pub async fn handle_translate(
         Some(u) if is_safe_resync_url(&u).await => Some(u),
         // Never the URL itself: a stream target carries the provider's token.
         Some(_) => {
-            eprintln!("translate: refusing unsafe resync target for {imdb}");
+            if UNSAFE_RESYNC.allow() {
+                eprintln!("translate: refusing unsafe resync target for {imdb}");
+            }
             None
         }
         None => None,
@@ -1435,9 +1461,11 @@ pub async fn handle_translate(
                         // charge itself still happens after the download, so a source that will not
                         // fetch continues to cost no slot.
                         if allowance_used_up(state, config) {
-                            eprintln!(
-                                "translate: {imdb} → {lang} refused, install is over its daily allowance"
-                            );
+                            if ALLOWANCE_REFUSED.allow() {
+                                eprintln!(
+                                    "translate: {imdb} → {lang} refused, install is over its daily allowance"
+                                );
+                            }
                             return httputil::text(
                                 StatusCode::TOO_MANY_REQUESTS,
                                 "translation allowance for today is used up",
@@ -1541,9 +1569,11 @@ pub async fn handle_translate(
                             // Nothing was spent — the allowance was checked at the last moment before
                             // the first token, so this costs neither a slot nor a backoff marker.
                             Err(TranslationFailure::Allowance) => {
-                                eprintln!(
-                                    "translate: {imdb} → {lang} refused, install is over its daily allowance"
-                                );
+                                if ALLOWANCE_REFUSED.allow() {
+                                    eprintln!(
+                                        "translate: {imdb} → {lang} refused, install is over its daily allowance"
+                                    );
+                                }
                                 return httputil::text(
                                     StatusCode::TOO_MANY_REQUESTS,
                                     "translation allowance for today is used up",
@@ -1553,7 +1583,11 @@ pub async fn handle_translate(
                             // per title, because that is the scope of the fact — and no per-title
                             // marker, since the title is innocent and will work once the key does.
                             Err(TranslationFailure::Credential { message, key_certain, spent }) => {
-                                eprintln!("translate: provider refused this install's credential: {message}");
+                                if CREDENTIAL_REFUSED.allow() {
+                                    eprintln!(
+                                        "translate: provider refused this install's credential: {message}"
+                                    );
+                                }
                                 // The install-wide block only when the status can ONLY mean the key.
                                 // A 400 or a 403 might be this film's dialogue tripping a content
                                 // filter, and blocking the install on that lets one series take every
@@ -1608,7 +1642,9 @@ pub async fn handle_translate(
                             Err(e) => {
                                 // Log the detail (no key in these strings); hand the client a generic
                                 // message rather than echoing a raw upstream error body.
-                                eprintln!("translate: {imdb} → {lang} failed: {}", e.message());
+                                if TRANSLATE_FAILED.allow() {
+                                    eprintln!("translate: {imdb} → {lang} failed: {}", e.message());
+                                }
                                 state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
                                 // Unpin ONLY when the source is what failed. A pin naming a file that
                                 // holds no cues would otherwise be honoured forever — the marker expires
@@ -2337,6 +2373,7 @@ mod translate_retry_tests {
             config_key: String::new(),
             config_keys_prev: String::new(),
             metrics_token: String::new(),
+            log_requests: false,
             // Port 1 refuses instantly. These cases are about the handler's own guards — the marker,
             // the language bound, the allowance — and every one of them has to get past a search
             // first. Pointed at the real API root they made a live request to api.opensubtitles.com
