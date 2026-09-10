@@ -25,7 +25,7 @@ use crate::state::AppState;
 
 pub fn handle(state: &AppState, headers: &HeaderMap) -> Response<Body> {
     if !authorized(headers, &state.cfg.metrics_token) {
-        return httputil::text(StatusCode::NOT_FOUND, "not found");
+        return httputil::not_found();
     }
     Response::builder()
         .status(StatusCode::OK)

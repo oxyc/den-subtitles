@@ -2,7 +2,10 @@
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::header::{HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use hyper::header::{
+    HeaderMap, HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_MAX_AGE, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+};
 use hyper::{Response, StatusCode};
 use serde::Serialize;
 
@@ -46,6 +49,25 @@ pub fn text(status: StatusCode, body: &str) -> Response<Body> {
         .header(CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(CACHE_CONTROL, "no-store")
         .body(Full::new(Bytes::from(body.to_owned())))
+        .unwrap()
+}
+
+/// The 404 every den addon answers for a path it does not serve. A refused /metrics answers the same,
+/// so a box with no token configured does not advertise that the route exists.
+pub fn not_found() -> Response<Body> {
+    json(StatusCode::NOT_FOUND, &serde_json::json!({"error": "not_found"}), "no-store")
+}
+
+/// The CORS preflight answer, for any path. `handle_request` adds the allow-origin header to it along
+/// with every other reply; the max-age lets a browser cache the preflight for a day instead of
+/// repeating it before every request.
+pub fn preflight() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(ACCESS_CONTROL_ALLOW_METHODS, "GET, HEAD, POST, OPTIONS")
+        .header(ACCESS_CONTROL_ALLOW_HEADERS, "*")
+        .header(ACCESS_CONTROL_MAX_AGE, "86400")
+        .body(Full::new(Bytes::new()))
         .unwrap()
 }
 

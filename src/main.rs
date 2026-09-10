@@ -29,6 +29,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -59,20 +60,27 @@ fn health_body(os_fails: u32) -> serde_json::Value {
 // can drive it with a `Request<()>` while `run()` passes the real `Request<Incoming>`.
 pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
-    let resp = route(&state, &parts).await;
-    // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
-    // collapses to a 304. Unsafe methods (none served today) keep their full response.
-    if matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD) {
-        let resp = httputil::apply_conditional(resp, &parts.headers);
-        // HEAD must not carry a body (the router builds one regardless of method).
-        if parts.method == hyper::Method::HEAD {
-            httputil::strip_body(resp)
-        } else {
-            resp
+    let mut resp = match parts.method {
+        // A CORS preflight is answered for any path, before routing.
+        hyper::Method::OPTIONS => httputil::preflight(),
+        // Honor conditional GET/HEAD: any cacheable 200 carries an ETag, so an `If-None-Match` hit
+        // collapses to a 304. Unsafe methods (none served today) keep their full response.
+        hyper::Method::GET | hyper::Method::HEAD => {
+            let resp = httputil::apply_conditional(route(&state, &parts).await, &parts.headers);
+            // HEAD must not carry a body (the router builds one regardless of method).
+            if parts.method == hyper::Method::HEAD {
+                httputil::strip_body(resp)
+            } else {
+                resp
+            }
         }
-    } else {
-        resp
-    }
+        _ => route(&state, &parts).await,
+    };
+    // Every reply is readable from a browser-based Stremio client. Nothing here rides on a cookie —
+    // an install's credentials are in its path — so a wildcard origin grants a page nothing it could
+    // not already fetch. Added here, last, so the 304 and VTT paths that rebuild a response keep it.
+    resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp
 }
 
 async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Response<Body> {
@@ -128,7 +136,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             let (id_seg, extra) = match segs.len() {
                 5 => (segs[3], segs[4]),
                 4 => (segs[3], ""),
-                _ => return httputil::text(StatusCode::NOT_FOUND, "not found"),
+                _ => return httputil::not_found(),
             };
             let id = strip_json(id_seg).unwrap_or(id_seg);
             let extra = strip_json(extra).unwrap_or(extra);
@@ -162,7 +170,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             let (id, extra, last) = match segs.len() {
                 6 => (segs[3], segs[4], segs[5]),
                 5 => (segs[3], "", segs[4]),
-                _ => return httputil::text(StatusCode::NOT_FOUND, "not found"),
+                _ => return httputil::not_found(),
             };
             // `.status` is answered from the request alone, so it is dispatched before anything that
             // could make a poll expensive.
@@ -176,7 +184,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             } else if let Some(l) = last.strip_suffix(".vtt") {
                 (l, false, true)
             } else {
-                return httputil::text(StatusCode::NOT_FOUND, "not found");
+                return httputil::not_found();
             };
             let resync = query_get(parts.uri.query().unwrap_or(""), "resync");
             let resp =
@@ -188,7 +196,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                 resp
             }
         }
-        _ => httputil::text(StatusCode::NOT_FOUND, "not found"),
+        _ => httputil::not_found(),
     }
 }
 
@@ -569,6 +577,66 @@ mod tests {
         for auth in [None, Some("Bearer wrong"), Some("Bearer s3cre"), Some("s3cret")] {
             let resp = handle_request(test_state_with("", "s3cret"), metrics_request(auth)).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "auth {auth:?} was let in");
+        }
+    }
+
+    fn request(method: hyper::Method, uri: &str) -> Request<()> {
+        Request::builder().method(method).uri(uri).body(()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn options_is_a_preflight_on_any_path() {
+        use hyper::header::{
+            ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_MAX_AGE,
+        };
+        for uri in ["/manifest.json", "/no/such/path", "/cfg/subtitle/1.srt"] {
+            let resp = handle_request(test_state(""), request(hyper::Method::OPTIONS, uri)).await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{uri}");
+            let h = resp.headers();
+            assert_eq!(h.get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*", "{uri}");
+            assert_eq!(h.get(ACCESS_CONTROL_ALLOW_METHODS).unwrap(), "GET, HEAD, POST, OPTIONS");
+            assert_eq!(h.get(ACCESS_CONTROL_ALLOW_HEADERS).unwrap(), "*");
+            assert_eq!(h.get(ACCESS_CONTROL_MAX_AGE).unwrap(), "86400");
+            assert!(body_string(resp).await.is_empty());
+        }
+    }
+
+    /// The header is added after every path that rebuilds a response — a 304, a HEAD, an error —
+    /// so none of them can drop it.
+    #[tokio::test]
+    async fn every_reply_carries_the_wildcard_origin() {
+        use hyper::header::{ETAG, IF_NONE_MATCH};
+        let ok = handle_request(test_state(""), request(hyper::Method::GET, "/manifest.json")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
+        let etag = ok.headers().get(ETAG).unwrap().clone();
+
+        let not_modified = handle_request(
+            test_state(""),
+            Request::builder().uri("/manifest.json").header(IF_NONE_MATCH, etag).body(()).unwrap(),
+        )
+        .await;
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+
+        let head = handle_request(test_state(""), request(hyper::Method::HEAD, "/health")).await;
+        let missing = handle_request(test_state(""), request(hyper::Method::GET, "/no/such/path")).await;
+        for resp in [not_modified, head, missing] {
+            assert_eq!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*", "{}", resp.status());
+        }
+    }
+
+    /// An unknown path, a known resource with the wrong shape, and a refused /metrics all give the
+    /// same JSON 404.
+    #[tokio::test]
+    async fn an_unknown_path_is_a_json_404() {
+        for uri in
+            ["/no/such/path", "/cfg/subtitles/movie", "/cfg/translate/movie/tt1/Swedish.txt", "/metrics"]
+        {
+            let resp = handle_request(test_state(""), request(hyper::Method::GET, uri)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(), "application/json", "{uri}");
+            assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), "no-store", "{uri}");
+            assert_eq!(body_string(resp).await, r#"{"error":"not_found"}"#, "{uri}");
         }
     }
 
