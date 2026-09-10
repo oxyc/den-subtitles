@@ -15,14 +15,19 @@ RUN touch src/main.rs && cargo build --release --locked
 
 # ---- build alass (static Rust CLI) ----------------------------------------
 FROM rust:1-bookworm AS alass
-RUN cargo install alass-cli --root /alass --locked
+# Pinned, like ffsubsync below: unpinned, every rebuild shipped whatever the registry served that day,
+# and nothing tells you when an aligner's behaviour changed. These are the versions the image ran when
+# they were pinned; bump them deliberately.
+ARG ALASS_VERSION=2.0.0
+RUN cargo install alass-cli --version ${ALASS_VERSION} --root /alass --locked
 
 # ---- runtime --------------------------------------------------------------
 FROM debian:bookworm-slim
 # ffmpeg (audio decode for alass/ffsubsync) + python for ffsubsync + ca-certs for outbound TLS.
+ARG FFSUBSYNC_VERSION=0.5.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg python3 python3-pip ca-certificates \
-    && pip3 install --no-cache-dir --break-system-packages ffsubsync \
+    && pip3 install --no-cache-dir --break-system-packages ffsubsync==${FFSUBSYNC_VERSION} \
     && apt-get purge -y python3-pip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
