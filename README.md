@@ -47,39 +47,6 @@ carrying `alass`/`ffsubsync`/`ffmpeg`.
   contract; a length mismatch splits the batch and retries down to a single cue; a rolling window of
   prior (source→translation) pairs keeps names/tone consistent across the film.
 
-## Config
-
-Per-install config is base64url-encoded in the addon URL (den-scout / Torrentio style), a bearer
-secret the app stores in the Keychain. The **OpenSubtitles key** (subtitle source) is required; the
-**LLM key** (translation) is **optional** — omit it for a fetch + auto-sync-only install with no AI.
-Build it at `/configure`. No user credential lives in the environment; `.env.example` is addon infra
-(port, cache, origin, the sealing key `CONFIG_KEY`/`CONFIG_KEYS_PREV`, and `METRICS_TOKEN`).
-
-Supported providers: OpenAI, Google, Anthropic, xAI, OpenRouter (chat) and DeepL (MT). Default model
-is the cheap/fast/decent tier per provider; step up to a bigger model to re-translate a title that
-reads badly (the cache is keyed by provider+model, so it just overwrites).
-
-## Run
-
-```sh
-cp .env.example .env          # infra only — keys are entered at /configure
-cargo run                     # local (needs alass/ffsubsync on PATH for the sync tiers)
-# or
-docker build -t den-subtitles . && docker run -p 8093:8093 --env-file .env den-subtitles
-```
-
-`cargo test` covers the SRT round-trip, config decode/validate, the JSON-array parse, the
-OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` SSRF guard, and the
-sync subprocess orchestration (spawn → arg contract → read-back → cleanup, against fake binaries).
-
-## Metrics
-
-`GET /metrics` serves Prometheus text when called with `Authorization: Bearer <METRICS_TOKEN>`, and
-404s when `METRICS_TOKEN` is unset or the token is wrong. It publishes what the addon already keeps —
-`subtitles_build_info`, the OpenSubtitles failure streak behind `/health`, the memory cache's bytes
-and entries, whether the disk tier is on and how many of its writes failed, and the sync jobs and
-translations running now — computed per scrape, with nothing per-install in the labels.
-
 ## Status
 
 Working: manifest + `/configure`, OpenSubtitles hash-matched search, cached subtitle proxy, the full
@@ -96,19 +63,93 @@ Known gap: Tier 1 needs a hash-matched anchor in the results. When the search re
 match — the common out-of-sync case — there is no trusted reference, so Tier 1 stays off and the sub
 is served as-is; only the Tier-2 resync closes it. See the ticket.
 
+## Routes
+
+Every reply carries `Access-Control-Allow-Origin: *`, and `OPTIONS` on any path answers a 204 CORS
+preflight. A path the router does not serve answers 404 `{"error":"not_found"}`. `<config>` is the
+per-install config segment built at `/configure`.
+
+- `GET /health` — liveness, always 200: `{"status":"ok"}`, or `{"status":"degraded",…}` with reason
+  `upstream_unavailable` after three OpenSubtitles failures in a row.
+- `GET /metrics` — Prometheus text for `Authorization: Bearer <METRICS_TOKEN>`; the unknown-path 404
+  when the token is unset or wrong. It publishes what the addon already keeps — `subtitles_build_info`,
+  the OpenSubtitles failure streak behind `/health`, the memory cache's bytes and entries, whether the
+  disk tier is on and how many of its writes failed, and the sync jobs and translations running now —
+  computed per scrape, with nothing per-install in the labels.
+- `GET /`, `GET /configure` — the install page that builds (and, with `CONFIG_KEY` set, seals) the
+  config segment.
+- `GET /config-key` — `{"key":"<base64 X25519 public key>"}` for `/configure` to seal to; 404
+  `{"error":"no_key"}` when sealing is off.
+- `GET /manifest.json` — the unconfigured manifest (`configurationRequired`), what a client sees
+  before installing.
+- `GET /<config>/manifest.json` — the configured manifest; 400 `{"error":"bad_config"}` for a segment
+  that does not decode.
+- `GET /<config>/subtitles/<type>/<id>[/<extra>].json` — the Stremio subtitles resource:
+  hash-matched-first OpenSubtitles results, each `url` pointing at `/subtitle` below.
+- `GET /<config>/subtitle/<file_id>.srt` (or `.vtt`) — one subtitle, proxied and cached; `.vtt` is
+  the same document as WebVTT. `?ref=<file_id>` reference-aligns it to a hash-matched anchor (Tier 1);
+  `?resync=<stream-url>` aligns it to the stream's audio with `alass` (Tier 2).
+- `GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.json` — runs (or finds cached) the
+  translation and answers `{"url":"…/<lang>.srt"}`.
+- `GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.srt` (or `.vtt`) — the translated subtitle,
+  through the same sync ladder; `?resync=<stream-url>` applies here too.
+- `GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.status` — how far a running translation has
+  got (`working`/`idle`/`done`/`failed`), answered without any upstream call.
+
+## Configuration
+
+Per-install config is base64url-encoded in the addon URL (den-scout / Torrentio style), a bearer
+secret the app stores in the Keychain. The **OpenSubtitles key** (subtitle source) is required; the
+**LLM key** (translation) is **optional** — omit it for a fetch + auto-sync-only install with no AI.
+Build it at `/configure`.
+
+Supported providers: OpenAI, Google, Anthropic, xAI, OpenRouter (chat) and DeepL (MT). Default model
+is the cheap/fast/decent tier per provider; step up to a bigger model to re-translate a title that
+reads badly (the cache is keyed by provider+model, so it just overwrites).
+
+No user credential lives in the environment. The environment is addon infrastructure only, all of
+it optional (`.env.example` lists the same):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `8093` | HTTP listen port. |
+| `CACHE_DIR` | `$TMPDIR/den-subtitles-cache` (image: `/cache`) | Disk cache tier and the sync scratch dir. |
+| `CACHE_MAX_BYTES` | `268435456` (256 MiB) | Cache byte budget. |
+| `PUBLIC_BASE_URL` | unset (derived from `Host`) | Fixed origin for the `/subtitle` and `/translate` URLs handed back to the app. |
+| `CONFIG_KEY` | unset (sealing off) | Base64 X25519 private key `/configure` seals configs to; back it up. |
+| `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working. |
+| `METRICS_TOKEN` | unset (`/metrics` 404s) | Bearer token for `/metrics`. |
+| `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-2 audio sync. |
+| `FFSUBSYNC_PATH` | `ffsubsync` (image: `/usr/local/bin/ffsubsync`) | The `ffsubsync` binary for Tier-1 reference sync. |
+
+On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host` header is fine —
+leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients (i.e. exposed
+publicly), set it to the real origin: a client controls its own `Host` header, so an unset origin
+lets a forged header steer those URLs at an attacker's server.
+
+## Run
+
+```sh
+cp .env.example .env          # infra only — keys are entered at /configure
+cargo run                     # local (needs alass/ffsubsync on PATH for the sync tiers)
+# or
+docker build -t den-subtitles . && docker run -p 8093:8093 --env-file .env den-subtitles
+
+cargo test --locked           # what CI runs, with cargo fmt --check and clippy -D warnings
+OPENSUBTITLES_KEY=… ./scripts/smoke.sh   # live smoke test against the real OpenSubtitles API
+```
+
+`cargo test` covers the SRT round-trip, config decode/validate, the JSON-array parse, the
+OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` SSRF guard, the
+router's status codes and headers, and the sync subprocess orchestration (spawn → arg contract →
+read-back → cleanup, against fake binaries).
+
 ## Deploy
 
 The live deploy is Podman Quadlet on the homelab box, from the den repo's `deploy/` — its
 `deploy/README.md` covers the stack mechanics. The unit, `den-subtitles.container`, publishes LAN host
-port 8093, drops every capability, sets no-new-privileges, caps memory at 512 MiB, and bind-mounts the
-cache from `/var/lib/den/subtitles-cache` (owned by uid 65532, the image's non-root user). Updates go
-through the health-gated `den-update` script, which proves a new image answers `/health` and
-`/manifest.json` before pinning its digest; the image carries no HEALTHCHECK, so nothing probes an
-idle box.
-
-The addon builds the `/subtitle` and `/translate` URLs it hands back to the app from
-its own origin. On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host`
-header is fine — leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients
-(i.e. exposed publicly), set `PUBLIC_BASE_URL` to the real origin (see `.env.example`): a client
-controls its own `Host` header, so an unset origin lets a forged header steer those URLs at an
-attacker's server.
+port 8093, drops every capability, sets no-new-privileges, caps memory at 512 MiB, runs as uid 65532
+(the image's non-root user), and bind-mounts the cache from `/var/lib/den/subtitles-cache` (owned by
+that uid). Updates go through the health-gated `den-update` script, which proves a new image answers
+`/health` and `/manifest.json` before pinning its digest; the image carries no HEALTHCHECK, so
+nothing probes an idle box.

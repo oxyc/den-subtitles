@@ -33,7 +33,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --locked --release
+        run: cargo test --locked
 
   # The image carries the sync toolchain (alass, ffsubsync, ffmpeg) on top of the binary, so it builds
   # differently from `cargo build`. Catching a Dockerfile break on the PR rather than at `git tag`
