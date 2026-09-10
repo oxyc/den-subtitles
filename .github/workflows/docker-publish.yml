@@ -7,6 +7,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -27,7 +29,7 @@ jobs:
   build:
     needs: test
     # Publish only on a v* tag (a deliberate release) or a manual run — NOT every main push. `test`
-    # still runs on every push; the box updates only when you cut a tag.
+    # still runs on every push and PR; the box updates only when you cut a tag.
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
