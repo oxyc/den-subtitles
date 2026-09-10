@@ -107,10 +107,10 @@ fn origin_of(url: &Url) -> Option<Origin> {
     })
 }
 
-/// The longest `/p/<ticket>` segment accepted. A ticket seals a handful of fields (the debrid
-/// accounts, the release, an expiry, the install id) and comes to well under a kilobyte; this is
-/// several times that, and still a bound that means something.
-const MAX_TICKET_LEN: usize = 4096;
+/// The longest `/p/<ticket>` segment accepted. A ticket seals every debrid account on the install
+/// (so scout's multi-account logic still works), and the largest config scout admits comes to about
+/// 5.9 KB; scout caps a path segment at 8 KiB, so this matches that cap rather than cutting under it.
+const MAX_TICKET_LEN: usize = 8192;
 
 /// The resync target, normalized, if it is one of den-scout's play routes at a listed origin —
 /// `/<config>/play/<token>`, or `/p/<ticket>` — and `None` for anything else, and for everything
