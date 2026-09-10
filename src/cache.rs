@@ -48,7 +48,29 @@ struct Inner {
     tick: u64,
 }
 
+/// Failed disk-tier writes, process-wide. The log warns on the first only, so this count is where
+/// the rest show up (`/metrics`).
+static DISK_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// The cache as `/metrics` reports it.
+pub struct Stats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub disk: bool,
+    pub disk_write_failures: u64,
+}
+
 impl Cache {
+    pub fn stats(&self) -> Stats {
+        let g = self.inner.lock().unwrap();
+        Stats {
+            entries: g.map.len(),
+            bytes: g.bytes,
+            disk: self.dir.is_some(),
+            disk_write_failures: DISK_WRITE_FAILURES.load(Ordering::Relaxed),
+        }
+    }
+
     /// `dir = Some` enables the disk tier (created if missing; falls back to memory-only on failure).
     pub fn new(max_bytes: usize, dir: Option<PathBuf>) -> Cache {
         let dir = dir.and_then(|d| match std::fs::create_dir_all(&d) {
@@ -415,8 +437,7 @@ impl Cache {
         if let Err(e) = wrote {
             // Once per process: a full or read-only volume degrades the cache to memory-only, which
             // survives a restart as a cold cache and used to say nothing at all.
-            static WARNED: AtomicU64 = AtomicU64::new(0);
-            if WARNED.fetch_add(1, Ordering::Relaxed) == 0 {
+            if DISK_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) == 0 {
                 eprintln!("warning: cache store write failed ({e}) — persistence degraded");
             }
             let _ = std::fs::remove_file(&tmp);

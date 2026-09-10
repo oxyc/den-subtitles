@@ -18,6 +18,8 @@ pub struct Config {
     /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
     pub config_key: String,
     pub config_keys_prev: String,
+    /// Bearer token for `/metrics`. Empty → the route answers 404, like any unknown path.
+    pub metrics_token: String,
     /// OpenSubtitles API root. A field so tests can point the request path at a local server instead
     /// of the live API — several of them reach `handle_translate`, which searches before it can do
     /// anything else, and without this they made a real request to api.opensubtitles.com on every
@@ -48,6 +50,7 @@ impl Config {
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
+            metrics_token: env_opt("METRICS_TOKEN").unwrap_or_default(),
             os_api_base: crate::opensubtitles::API.to_string(),
         }
     }

@@ -104,8 +104,9 @@ impl Progress {
         self.jobs.lock().unwrap().get(key).copied()
     }
 
-    #[cfg(test)]
-    fn tracked(&self) -> usize {
+    /// Jobs reporting right now — which, since a reporter clears its entry however the job ends, is
+    /// the number running.
+    pub fn tracked(&self) -> usize {
         self.jobs.lock().unwrap().len()
     }
 }

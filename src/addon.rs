@@ -2336,6 +2336,7 @@ mod translate_retry_tests {
             alass: "alass".into(),
             config_key: String::new(),
             config_keys_prev: String::new(),
+            metrics_token: String::new(),
             // Port 1 refuses instantly. These cases are about the handler's own guards — the marker,
             // the language bound, the allowance — and every one of them has to get past a search
             // first. Pointed at the real API root they made a live request to api.opensubtitles.com

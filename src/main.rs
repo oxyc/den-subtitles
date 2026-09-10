@@ -15,6 +15,7 @@ mod config;
 mod fetch;
 mod httputil;
 mod inflight;
+mod metrics;
 mod opensubtitles;
 mod seal;
 mod srt;
@@ -84,6 +85,8 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             let body = health_body(state.os_fails.load(std::sync::atomic::Ordering::Relaxed));
             return httputil::json(StatusCode::OK, &body, "no-store");
         }
+        // Prometheus text behind `METRICS_TOKEN`; 404 without it (see metrics.rs).
+        "/metrics" => return metrics::handle(state, &parts.headers),
         "/manifest.json" => {
             return httputil::json(StatusCode::OK, &addon::manifest(false), "public, max-age=3600")
         }
@@ -353,6 +356,10 @@ mod tests {
     const JS_SEG: &str = "Ac3WWHzRZKV9OjdSgIPaNFFhaE9UY0vwxgSO6F5Ghug1nyjlKUodEQmhhlPhX-j1KffJnpj58HPhlpePWcbnuX9GL9rGMsdki1hGXSzRG94ON_aYocvFkl9bSU2QZa8o3waeHHm9wmjLQg";
 
     fn test_state(config_key: &str) -> Arc<AppState> {
+        test_state_with(config_key, "")
+    }
+
+    fn test_state_with(config_key: &str, metrics_token: &str) -> Arc<AppState> {
         let cfg = Config {
             port: 0,
             cache_dir: std::env::temp_dir().join("den-subtitles-test-cache"),
@@ -362,6 +369,7 @@ mod tests {
             alass: "alass".to_string(),
             config_key: config_key.to_string(),
             config_keys_prev: String::new(),
+            metrics_token: metrics_token.to_string(),
             // Never the live API from a test: port 1 refuses instantly.
             os_api_base: "http://127.0.0.1:1".to_string(),
         };
@@ -533,5 +541,50 @@ mod tests {
             assert_eq!(body["reason"], "upstream_unavailable");
             assert_eq!(body["detail"], "OpenSubtitles has been failing");
         }
+    }
+
+    fn metrics_request(auth: Option<&str>) -> Request<()> {
+        let mut b = Request::builder().uri("/metrics");
+        if let Some(a) = auth {
+            b = b.header(hyper::header::AUTHORIZATION, a);
+        }
+        b.body(()).unwrap()
+    }
+
+    /// Unset means off: not an empty 200, and not a route an empty bearer header can open.
+    #[tokio::test]
+    async fn metrics_is_404_without_a_configured_token() {
+        for auth in [None, Some("Bearer "), Some("Bearer anything")] {
+            let resp = handle_request(test_state(""), metrics_request(auth)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "auth {auth:?} reached an unconfigured /metrics"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_is_404_for_a_wrong_or_missing_token() {
+        for auth in [None, Some("Bearer wrong"), Some("Bearer s3cre"), Some("s3cret")] {
+            let resp = handle_request(test_state_with("", "s3cret"), metrics_request(auth)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "auth {auth:?} was let in");
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_serves_prometheus_text_for_the_right_token() {
+        let resp =
+            handle_request(test_state_with("", "s3cret"), metrics_request(Some("Bearer s3cret"))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = body_string(resp).await;
+        let build = format!("subtitles_build_info{{version=\"{}\"}} 1\n", env!("CARGO_PKG_VERSION"));
+        assert!(body.contains(&build), "no build_info line in:\n{body}");
+        assert!(body.contains("\nsubtitles_opensubtitles_consecutive_failures 0\n"), "{body}");
+        assert!(body.contains("# TYPE subtitles_cache_disk_write_failures_total counter\n"), "{body}");
     }
 }

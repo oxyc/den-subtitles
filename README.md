@@ -72,6 +72,14 @@ docker build -t den-subtitles . && docker run -p 8093:8093 --env-file .env den-s
 OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` SSRF guard, and the
 sync subprocess orchestration (spawn → arg contract → read-back → cleanup, against fake binaries).
 
+## Metrics
+
+`GET /metrics` serves Prometheus text when called with `Authorization: Bearer <METRICS_TOKEN>`, and
+404s when `METRICS_TOKEN` is unset or the token is wrong. It publishes what the addon already keeps —
+`subtitles_build_info`, the OpenSubtitles failure streak behind `/health`, the memory cache's bytes
+and entries, whether the disk tier is on and how many of its writes failed, and the sync jobs and
+translations running now — computed per scrape, with nothing per-install in the labels.
+
 ## Status
 
 Working: manifest + `/configure`, OpenSubtitles hash-matched search, cached subtitle proxy, the full

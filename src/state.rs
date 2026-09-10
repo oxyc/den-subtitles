@@ -85,4 +85,10 @@ impl AppState {
             os_fails: AtomicU32::new(0),
         })
     }
+
+    /// Tier binaries running now: the slots taken out of `sync_slots`. Callers still waiting for a
+    /// slot are not counted — they have not spawned anything.
+    pub fn syncs_running(&self) -> usize {
+        MAX_CONCURRENT_SYNCS - self.sync_slots.available_permits()
+    }
 }
