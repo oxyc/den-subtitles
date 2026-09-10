@@ -57,7 +57,12 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   with `?ref=<id>` and reference-aligned to that anchor on fetch (`ffsubsync`, no audio).
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
   non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon runs `alass`
-  against the stream audio server-side and the app swaps in the re-synced track.
+  against the stream audio server-side and the app swaps in the re-synced track. The stream URL has
+  to be den-scout's play route (`<origin>/<config>/play/<token>`) at an origin listed in
+  `SCOUT_ORIGINS`; any other target, or any target when that is unset, is ignored and the sub is
+  served unaligned. alass never gets the URL itself: it reads a relay on 127.0.0.1 that follows
+  scout's redirect to the debrid CDN, refuses a hop that is neither a listed origin nor a public
+  address, pins the address it checked, and never passes a redirect on to ffmpeg.
 
 Known gap: Tier 1 needs a hash-matched anchor in the results. When the search returns *no* hash
 match — the common out-of-sync case — there is no trusted reference, so Tier 1 stays off and the sub
@@ -131,6 +136,7 @@ it optional (`.env.example` lists the same):
 | `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working. |
 | `METRICS_TOKEN` | unset (`/metrics` 404s) | Bearer token for `/metrics`. |
 | `LOG_REQUESTS` | unset (off; `0` is off too) | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, with the config segment as `<config>` and no query string. |
+| `SCOUT_ORIGINS` | unset (Tier 2 off) | Comma-separated den-scout origins (`http://192.168.86.193:8080`) a `?resync=` target may be at — the origin of the stream URLs scout hands the app. |
 | `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-2 audio sync. |
 | `FFSUBSYNC_PATH` | `ffsubsync` (image: `/usr/local/bin/ffsubsync`) | The `ffsubsync` binary for Tier-1 reference sync. |
 
@@ -152,7 +158,8 @@ OPENSUBTITLES_KEY=… ./scripts/smoke.sh   # live smoke test against the real Op
 ```
 
 `cargo test` covers the SRT round-trip, subtitle encoding detection, config decode/validate, the JSON-array parse, the
-OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` SSRF guard, the
+OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` target allowlist and
+its relay (a redirect to an internal address is never followed), the
 router's status codes and headers, and the sync subprocess orchestration (spawn → arg contract →
 read-back → cleanup, against fake binaries).
 

@@ -18,6 +18,7 @@ mod inflight;
 mod logging;
 mod metrics;
 mod opensubtitles;
+mod resync;
 mod seal;
 mod srt;
 mod state;
@@ -286,7 +287,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let on_off = |on: bool| if on { "on" } else { "off" };
     eprintln!(
         "den-subtitles {} listening on :{port} — metrics={} log_requests={} sealed={} cache_dir={} \
-         cache_max_mib={} public_base={}",
+         cache_max_mib={} public_base={} resync={}",
         env!("CARGO_PKG_VERSION"),
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
@@ -294,6 +295,11 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         state.cfg.cache_dir.display(),
         state.cfg.cache_max_bytes / (1024 * 1024),
         state.cfg.public_base_url.as_deref().unwrap_or("derived"),
+        // Off says why a resync falls back to the raw sub: no SCOUT_ORIGINS.
+        match state.cfg.scout_origins.is_empty() {
+            true => "off".to_string(),
+            false => state.cfg.scout_origins.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+        },
     );
 
     // Reclaim the disk cache hourly. `Cache::new` sweeps at boot, which bounds the store across
@@ -487,6 +493,7 @@ mod tests {
             log_requests: false,
             // Never the live API from a test: port 1 refuses instantly.
             os_api_base: "http://127.0.0.1:1".to_string(),
+            scout_origins: Vec::new(),
         };
         AppState::new(cfg)
     }

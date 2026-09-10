@@ -29,6 +29,10 @@ pub struct Config {
     /// anything else, and without this they made a real request to api.opensubtitles.com on every
     /// `cargo test`. They passed either way, which is what made it easy to miss.
     pub os_api_base: String,
+    /// Origins a Tier-2 `?resync=` target may be at (`SCOUT_ORIGINS`, comma-separated) — the den-scout
+    /// origin(s) the app's stream URLs carry. Empty → Tier 2 is off. See `resync.rs` for why there is
+    /// no open default.
+    pub scout_origins: Vec<crate::resync::Origin>,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -57,6 +61,7 @@ impl Config {
             metrics_token: env_opt("METRICS_TOKEN").unwrap_or_default(),
             log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v != "0"),
             os_api_base: crate::opensubtitles::API.to_string(),
+            scout_origins: crate::resync::parse_origins(&env_opt("SCOUT_ORIGINS").unwrap_or_default()),
         }
     }
 }

@@ -28,7 +28,7 @@ use crate::logging::LogGate;
 use crate::opensubtitles;
 use crate::state::AppState;
 use crate::userconfig::{self, LlmConfig, UserConfig};
-use crate::{srt, translate};
+use crate::{resync, srt, translate};
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60); // 60 days — mirrors the app cache
 /// How long a raw sub stands in for an alignment that failed. Long enough that a retrying client
@@ -438,7 +438,7 @@ async fn cached_search(
 /// `None` when the search produced no hash match at all. That is the gap behind the out-of-sync
 /// complaint: with no trusted anchor we deliberately do NOT align to an untrusted sub (that could
 /// make timing worse), so those subs are served as-is and only the Tier-2 audio resync — a user
-/// action, see `is_safe_resync_url` — can fix them.
+/// action, see `resync::vet` — can fix them.
 fn tier1_reference(subs: &[opensubtitles::Subtitle]) -> Option<i64> {
     subs.iter()
         .filter(|s| s.hash_match)
@@ -474,17 +474,16 @@ pub async fn handle_subtitle_file(
     // Vet BEFORE keying: a rejected URL changes which tier runs, so keying off the raw one filed a
     // reference-aligned (or raw) body under a `resync` key. Everything downstream reads the VETTED
     // value, so a refused target is simply a request that asked for no sync.
-    let resync_url = match resync_url {
-        Some(u) if is_safe_resync_url(&u).await => Some(u),
+    let resync_url = resync_url.and_then(|u| match resync::vet(&u, &state.cfg.scout_origins) {
+        Some(url) => Some(url.to_string()),
         // Never the URL itself: a stream target carries the provider's token.
-        Some(_) => {
+        None => {
             if UNSAFE_RESYNC.allow() {
-                eprintln!("subtitle: refusing unsafe resync target for {file_id}");
+                eprintln!("subtitle: refusing resync target for {file_id} (not scout /play at a SCOUT_ORIGINS origin)");
             }
             None
         }
-        None => None,
-    };
+    });
     let ref_id = vetted_ref(file_id, ref_id);
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
     let cache_key = sync_cache_key(&os_base_key(file_id), &resync_url, ref_id);
@@ -616,9 +615,18 @@ async fn sync_and_cache(
     // markers above. Only the reference download can set it.
     let mut mine_only = false;
     let synced: Option<String> = if let Some(url) = resync_url {
-        let _slot = state.sync_slots.acquire().await;
         // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
-        match state.sync.sync_to_audio(&target, &url, &tag).await {
+        // alass is handed a loopback relay, never `url`: ffmpeg would re-resolve the name and follow
+        // redirects on its own (see `resync.rs`). The relay follows the redirect chain here, before
+        // the permit, for the reason Tier 1 fetches its reference first — it is network work.
+        let aligned = match resync::Relay::open(&url, &state.cfg.scout_origins).await {
+            Ok(relay) => {
+                let _slot = state.sync_slots.acquire().await;
+                state.sync.sync_to_audio(&target, &relay.url(), &tag).await
+            }
+            Err(e) => Err(e),
+        };
+        match aligned {
             Ok(s) => Some(s),
             Err(e) => {
                 if SYNC_FAILED.allow() {
@@ -747,67 +755,6 @@ async fn subtitle_srt(
     };
     state.cache.put(key, body.clone(), CACHE_TTL);
     Ok(body)
-}
-
-fn is_http_url(u: &str) -> bool {
-    u.starts_with("http://") || u.starts_with("https://")
-}
-
-/// A resync target we're willing to fetch server-side (SSRF guard). The stream lives on the LAN
-/// (den-scout on a private IP), so we can't blanket-deny private ranges — but we DO deny loopback
-/// and link-local, which blocks the cloud-metadata endpoint (169.254.169.254) and localhost probes
-/// while still allowing the user's own 192.168/10/172.16 stream host.
-async fn is_safe_resync_url(u: &str) -> bool {
-    if !is_http_url(u) {
-        return false;
-    }
-    let Some((_, rest)) = u.split_once("://") else { return false };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    // Unwrap the host from an optional `[IPv6]:port` / `host:port`. A bracketed literal must be read
-    // to its closing `]` (an IPv6 address is full of colons); only a bare host/IPv4 splits on `:`.
-    let host = if let Some(rest) = host.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
-    let host_lc = host.to_ascii_lowercase();
-    if host_lc == "localhost" || host_lc.ends_with(".localhost") {
-        return false;
-    }
-    match host_lc.parse::<std::net::IpAddr>() {
-        Ok(ip) => !is_blocked_ip(ip),
-        // A HOSTNAME (not a literal IP): RESOLVE it and refuse if ANY resolved address is internal —
-        // otherwise an attacker-controlled name that resolves to 169.254.169.254 (cloud metadata) or
-        // 127.0.0.1 (DNS rebinding) sails through. Fail closed on a resolve error. (LAN/private ranges stay
-        // allowed — the stream legitimately lives on the LAN; only loopback/link-local/unspecified are refused.)
-        Err(_) => match tokio::net::lookup_host((host_lc.as_str(), 0u16)).await {
-            Ok(addrs) => {
-                let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
-                !ips.is_empty() && !ips.iter().any(|ip| is_blocked_ip(*ip))
-            }
-            Err(_) => false,
-        },
-    }
-}
-
-/// Addresses we refuse to fetch server-side (SSRF): loopback, link-local (incl. the 169.254 cloud-metadata
-/// endpoint), and unspecified — plus their IPv4-mapped-IPv6 forms. Private LAN ranges (RFC1918 / IPv6 ULA)
-/// are DELIBERATELY allowed: Tier-2 resync fetches the user's stream, which lives on the LAN.
-fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_blocked_ip(IpAddr::V4(v4));
-            }
-            v6.segments()[0] & 0xffc0 == 0xfe80 // link-local fe80::/10
-        }
-    }
 }
 
 /// Key of the pinned translation source for one title.
@@ -1443,17 +1390,16 @@ pub async fn handle_translate(
     // Tier 2 is a user action against the track itself, so it is only read on the `.srt` form — the
     // `.json` form's job is to warm and hand back a URL. Vetted before it can reach a cache key, for
     // the reason `handle_subtitle_file` gives.
-    let resync_url = match resync_url.filter(|_| !want_json) {
-        Some(u) if is_safe_resync_url(&u).await => Some(u),
+    let resync_url = resync_url.filter(|_| !want_json).and_then(|u| match resync::vet(&u, &state.cfg.scout_origins) {
+        Some(url) => Some(url.to_string()),
         // Never the URL itself: a stream target carries the provider's token.
-        Some(_) => {
+        None => {
             if UNSAFE_RESYNC.allow() {
-                eprintln!("translate: refusing unsafe resync target for {imdb}");
+                eprintln!("translate: refusing resync target for {imdb} (not scout /play at a SCOUT_ORIGINS origin)");
             }
             None
         }
-        None => None,
-    };
+    });
     // The translated body inherits its source's timing, so it needs the same Tier-1 correction the
     // source itself would get from the picker.
     let ref_id = align_for(pinned);
@@ -2210,39 +2156,6 @@ mod tests {
         let both = sync_cache_key(&os_base_key(5), &Some("http://host/s.mkv".into()), Some(9));
         assert_eq!(both, resynced);
     }
-
-    #[tokio::test]
-    async fn resync_guard_allows_lan_and_public_streams() {
-        // The stream lives on the user's LAN (den-scout on a private IP), so private ranges stay reachable;
-        // a public literal is fine too. (Hostnames are vetted by resolution at runtime, not asserted here.)
-        assert!(is_safe_resync_url("http://192.168.1.10:8080/stream.mkv").await);
-        assert!(is_safe_resync_url("http://10.0.0.5/a.mkv").await);
-        assert!(is_safe_resync_url("http://172.16.3.4/a.mkv").await);
-        assert!(is_safe_resync_url("http://8.8.8.8/a.mkv").await); // public literal
-        assert!(is_safe_resync_url("http://[2001:db8::1]:8080/a.mkv").await);
-        assert!(is_safe_resync_url("http://[fc00::1]/a.mkv").await); // IPv6 ULA = LAN, allowed
-    }
-
-    #[tokio::test]
-    async fn resync_guard_blocks_internal_and_bad_schemes() {
-        // Loopback / localhost / link-local (incl. the 169.254 cloud-metadata endpoint) / unspecified.
-        assert!(!is_safe_resync_url("http://127.0.0.1/a.mkv").await);
-        assert!(!is_safe_resync_url("http://localhost:8080/a.mkv").await);
-        assert!(!is_safe_resync_url("http://sub.localhost/a.mkv").await);
-        assert!(!is_safe_resync_url("http://169.254.169.254/latest/meta-data/").await);
-        assert!(!is_safe_resync_url("http://0.0.0.0/a.mkv").await); // unspecified
-                                                                    // IPv6 loopback / link-local / IPv4-mapped-loopback, bracketed.
-        assert!(!is_safe_resync_url("http://[::1]/a.mkv").await);
-        assert!(!is_safe_resync_url("http://[::1]:8080/a.mkv").await);
-        assert!(!is_safe_resync_url("http://[fe80::1]/a.mkv").await);
-        assert!(!is_safe_resync_url("http://[::ffff:127.0.0.1]/a.mkv").await);
-        // userinfo must not smuggle a blocked host past the check.
-        assert!(!is_safe_resync_url("http://user@127.0.0.1/a.mkv").await);
-        // Only http(s); no file/ftp/empty.
-        assert!(!is_safe_resync_url("file:///etc/passwd").await);
-        assert!(!is_safe_resync_url("ftp://host/a.mkv").await);
-        assert!(!is_safe_resync_url("").await);
-    }
 }
 
 #[cfg(test)]
@@ -2419,6 +2332,7 @@ mod translate_retry_tests {
             // on every `cargo test`, which passed whether it 401'd or the network was down, so the
             // dependency was invisible.
             os_api_base: "http://127.0.0.1:1".into(),
+            scout_origins: Vec::new(),
         })
     }
 

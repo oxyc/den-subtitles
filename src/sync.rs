@@ -72,8 +72,9 @@ impl SyncTools {
         self.finish(run_result, &out, [&target, &reference]).await
     }
 
-    /// Tier 2: align `target_srt` against the media at `media_url` (a stream the addon can reach)
-    /// using alass. `alass` pulls/decodes the audio itself via ffmpeg, so we hand it the URL.
+    /// Tier 2: align `target_srt` against the media at `media_url` using alass. `alass` pulls and
+    /// decodes the audio itself via ffprobe/ffmpeg, so `media_url` must be one they may open: the
+    /// request path passes a `resync::Relay` on loopback, never the caller's URL.
     pub async fn sync_to_audio(
         &self,
         target_srt: &str,
