@@ -25,9 +25,11 @@ RUN cargo install alass-cli --version ${ALASS_VERSION} --root /alass --locked
 FROM debian:trixie-slim
 # ffmpeg (audio decode for alass/ffsubsync) + python for ffsubsync + ca-certs for outbound TLS.
 # No compiler: on trixie's Python 3.13 every ffsubsync dependency is a cp313 manylinux or pure wheel,
-# except auditok and srt, which are pure-Python sdists pip builds without one.
+# except auditok and srt, which are pure-Python sdists pip builds without one. `upgrade` first: the slim
+# base is refreshed only every few weeks, and ffmpeg decodes untrusted media, so every build (the weekly
+# patch rebuild included) takes the current Debian security fixes rather than the base's.
 ARG FFSUBSYNC_VERSION=0.5.1
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
       ffmpeg python3 python3-pip ca-certificates \
     && pip3 install --no-cache-dir --break-system-packages ffsubsync==${FFSUBSYNC_VERSION} \
     && apt-get purge -y python3-pip && apt-get autoremove -y \

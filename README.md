@@ -172,3 +172,20 @@ port 8093, drops every capability, sets no-new-privileges, caps memory at 512 Mi
 that uid). Updates go through the health-gated `den-update` script, which proves a new image answers
 `/health` and `/manifest.json` before pinning its digest; the image carries no HEALTHCHECK, so
 nothing probes an idle box.
+
+**Release images.** `docker-publish` builds on a `v*` tag, and again every Monday: the weekly run
+rebuilds the newest `v*` tag (never `main`) with the base images re-pulled, no build cache and a fresh
+`apt-get upgrade`, and publishes it as `:X.Y.Z-patch.<date>.<run>` and `:latest`. That is how a Debian
+security fix — ffmpeg decodes untrusted media here — reaches the box between releases, through
+`den-update`'s probe and rollback like any release. Trivy scans each image before `:latest` moves: a
+CRITICAL with a fix available fails the run (on the weekly rebuild only in OS packages, the part a
+rebuild can fix), and fixable HIGH and CRITICAL findings go to code scanning. A finding that does not
+apply goes in `.trivyignore` with a reason. Every image carries SLSA provenance and an SBOM and is signed
+keylessly with cosign; verify a digest with:
+
+```sh
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/oxyc/den-subtitles/\.github/workflows/docker-publish\.yml@refs/(heads/main|tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/oxyc/den-subtitles@sha256:<digest>
+```

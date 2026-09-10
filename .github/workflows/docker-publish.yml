@@ -1,28 +1,88 @@
 # Build the den-subtitles image and push it to GitHub Container Registry, on a v* tag (a deliberate
-# release) or a manual run — NOT every main push. The box updates only when you cut a tag. No app release.
+# release) — NOT every main push. No app release.
+#
+# Every Monday, and on a manual run, the NEWEST v* tag is rebuilt instead: released code only, never main,
+# with the base images re-pulled, no build cache and apt run again, so a Debian security fix (ffmpeg parses
+# the media this addon syncs against) reaches the box between releases — through den-update's probe and
+# rollback, like any release.
 name: docker-publish
 
 on:
   push:
     tags: ["v*"]
+  schedule:
+    - cron: "23 3 * * 1"
   workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/den-subtitles
 
+# One publish at a time, never cancelled: a patch rebuild and a release must not race each other to :latest.
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+permissions: {}
+
 jobs:
-  # The whole of ci.yml, against the tagged commit: a tag cannot publish an image CI would reject.
+  # What to build. A tag push builds that tag. A scheduled or manual run rebuilds the newest vX.Y.Z tag,
+  # resolved at run time, so a release cut since the last rebuild is the one that gets patched.
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      version: ${{ steps.pick.outputs.version }}
+      patch: ${{ steps.pick.outputs.patch }}
+      stamp: ${{ steps.pick.outputs.stamp }}
+    steps:
+      - name: Pick the release to build
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = push ]; then
+            ref="$GITHUB_REF_NAME"; patch=false
+          else
+            # The box's cosign check trusts this workflow as it is on main and on release tags, so a run
+            # from any other branch would publish an image the box refuses.
+            test "$GITHUB_REF" = refs/heads/main || { echo "::error::run a patch rebuild from main, not $GITHUB_REF"; exit 1; }
+            ref=$(git ls-remote --tags --refs "https://github.com/$REPO.git" 'v*' \
+              | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+            test -n "$ref" || { echo "::error::no vX.Y.Z tag to rebuild"; exit 1; }
+            patch=true
+          fi
+          echo "building $ref (patch rebuild: $patch)"
+          {
+            echo "ref=$ref"
+            echo "version=${ref#v}"
+            echo "patch=$patch"
+            echo "stamp=$(date -u +%Y%m%d).$GITHUB_RUN_NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+  # The whole of ci.yml, against the tagged commit: a tag cannot publish an image CI would reject. Not on
+  # a patch rebuild: that source passed it when it was tagged, and ci.yml would test main, not the tag.
   ci:
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci.yml
 
   build:
-    needs: ci
+    needs: [source, ci]
+    if: ${{ !cancelled() && needs.source.result == 'success' && (needs.ci.result == 'success' || needs.ci.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write         # keyless cosign: the signing certificate is issued to this workflow's OIDC identity
+      security-events: write  # Trivy's report goes to code scanning
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.source.outputs.ref }}
+          persist-credentials: false
 
       # The manifest reads env!("CARGO_PKG_VERSION") and the image tag is the git tag — so a v* release
       # must equal v<Cargo.toml version> or the reported version would be a lie. Fail fast on a mismatch.
@@ -33,8 +93,12 @@ jobs:
           echo "Cargo.toml=$cargo_v  tag=$GITHUB_REF_NAME"
           test "v$cargo_v" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME != Cargo.toml v$cargo_v — bump Cargo.toml before tagging"; exit 1; }
 
+      - name: Commit being built
+        id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -42,28 +106,102 @@ jobs:
 
       - name: Derive tags
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
-          # a v1.2.3 tag → :1.2.3, :1.2, :1, :latest (+ :sha). Publish runs on tags only, so :latest
-          # is unconditional — the newest release is what the box's :latest pull gets.
+          # A v1.2.3 release → :1.2.3, :1.2, :1 (+ :sha); a patch rebuild → :1.2.3-patch.<date>.<run>, an
+          # immutable name for that one rebuild. :latest is deliberately absent (latest=false stops the
+          # action adding it on a tag): it is the tag the box deploys, so it moves last, below, and only
+          # to an image that passed the scan and was signed.
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha
-            type=raw,value=latest
+            type=sha,enable=${{ github.event_name == 'push' }}
+            type=raw,value=${{ needs.source.outputs.version }}-patch.${{ needs.source.outputs.stamp }},enable=${{ github.event_name != 'push' }}
+          # The source that was built, which on a patch rebuild is the tag, not the main commit this ran on.
+          labels: |
+            org.opencontainers.image.version=${{ needs.source.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       # amd64 only: it is the one arch the box runs.
       - name: Build and push
-        uses: docker/build-push-action@v7
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Re-pull every FROM: a base image served from the build cache is how a release inherits last
+          # month's libc.
+          pull: true
+          # A patch rebuild exists to re-run apt and re-fetch the bases; one reused layer defeats it.
+          no-cache: ${{ needs.source.outputs.patch == 'true' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # SLSA provenance and an SBOM, attached to the image index and so covered by its signature.
+          provenance: mode=max
+          sbom: true
+
+      # Report: fixable HIGH and CRITICAL findings go to the repository's code scanning. Advisory — it
+      # never fails the job.
+      - name: Scan image (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          version: v0.74.0
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          limit-severities-for-sarif: true
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload scan to code scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        # The report is advisory: a code-scanning outage must not hold a release or a security rebuild.
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      # Gate: a CRITICAL with a fixed version available fails here, before anything is signed or :latest
+      # moves. Unfixed CVEs are ignored, so they never block a release. A patch rebuild gates on OS
+      # packages only — the part a rebuild can fix; a vulnerable crate or pip package needs a release, and
+      # holding back an ffmpeg fix until then would leave the box worse off. A finding that does not apply
+      # goes in .trivyignore with a reason.
+      - name: Scan image (gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          version: v0.74.0
+          skip-setup-trivy: true
+          severity: CRITICAL
+          ignore-unfixed: true
+          vuln-type: ${{ needs.source.outputs.patch == 'true' && 'os' || 'os,library' }}
+          exit-code: "1"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless: Fulcio issues a short-lived certificate to this workflow's GitHub OIDC identity and the
+      # signature is recorded in Rekor. The box verifies that identity before deploying (README, Deploy).
+      - name: Sign the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+      # :latest is what den-update deploys, so it moves last, to exactly the digest that was scanned and
+      # signed. imagetools re-tags a single index as-is; the check proves the digest survived the move.
+      - name: Point :latest at the signed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$DIGEST"
+          moved=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -r .digest)
+          test "$moved" = "$DIGEST" || { echo "::error::latest resolved to $moved, not the signed $DIGEST"; exit 1; }
