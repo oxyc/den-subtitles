@@ -11,6 +11,34 @@ use serde::Serialize;
 
 pub type Body = Full<Bytes>;
 
+/// Which phases a resource response spent its time in — `opensubtitles`, `download`, `sync`,
+/// `translate`, or `cache;desc=hit` — and `total`, in milliseconds. Phase names only: never a title,
+/// an install or a URL.
+pub const SERVER_TIMING: &str = "server-timing";
+/// `X-Den-Degraded: <reason>` marks an answer that is a fallback: a list left empty because the search
+/// failed, a subtitle served unaligned because its sync failed. Absent on a normal answer. Reasons are
+/// the /health slugs, so the app can read the header without knowing which addon sent it.
+pub const X_DEN_DEGRADED: &str = "x-den-degraded";
+
+/// Append one `Server-Timing` entry to whatever the response already names.
+pub fn add_timing(mut resp: Response<Body>, entry: &str) -> Response<Body> {
+    let value = match resp.headers().get(SERVER_TIMING).and_then(|v| v.to_str().ok()) {
+        Some(prior) => format!("{prior}, {entry}"),
+        None => entry.to_string(),
+    };
+    if let Ok(v) = HeaderValue::from_str(&value) {
+        resp.headers_mut().insert(SERVER_TIMING, v);
+    }
+    resp
+}
+
+/// Mark a response as a fallback. The first reason stands: it is the one closest to the cause, and a
+/// later layer adding its own would describe a consequence.
+pub fn degraded(mut resp: Response<Body>, reason: &'static str) -> Response<Body> {
+    resp.headers_mut().entry(X_DEN_DEGRADED).or_insert(HeaderValue::from_static(reason));
+    resp
+}
+
 /// A strong, quoted ETag derived from the response body. Non-crypto is plenty — an ETag only needs
 /// to change when the bytes change, not resist an adversary — but it must be `stable_hash` and not
 /// std's `DefaultHasher`, for the reason spelled out below: an ETag outlives the process, in client
@@ -168,7 +196,8 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
         }
     }
     // `Full` is already in memory, so this await resolves immediately and cannot stall the thread.
-    let bytes = match resp.into_body().collect().await {
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return text(StatusCode::INTERNAL_SERVER_ERROR, "subtitle body unavailable"),
     };
@@ -176,13 +205,12 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
         return text(StatusCode::INTERNAL_SERVER_ERROR, "subtitle body was not utf-8");
     };
     let vtt = crate::srt::serialize_vtt(&crate::srt::parse(srt));
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/vtt; charset=utf-8")
-        .header(CACHE_CONTROL, cache_control)
-        .header(ETAG, vtt_etag.unwrap_or_else(|| etag_of(vtt.as_bytes())))
-        .body(Full::new(Bytes::from(vtt)))
-        .unwrap()
+    // The SRT response's own head, so everything else the handler said about this body — its caching
+    // directive, `Server-Timing`, `X-Den-Degraded` — carries over; only the type and validator change.
+    let etag = vtt_etag.unwrap_or_else(|| etag_of(vtt.as_bytes()));
+    parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/vtt; charset=utf-8"));
+    parts.headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
+    Response::from_parts(parts, Full::new(Bytes::from(vtt)))
 }
 
 /// Honor a conditional GET: if the request's `If-None-Match` matches the response's `ETag`,
@@ -321,6 +349,25 @@ mod tests {
         let body = body_of(out).await;
         assert!(body.starts_with("WEBVTT"));
         assert!(body.contains("<i>Hello</i> &amp; goodbye"), "payload not rendered as VTT: {body:?}");
+    }
+
+    /// Re-rendering keeps what the handler said about the body — its timing and whether it is a
+    /// fallback — and not only its caching directive.
+    #[tokio::test]
+    async fn vtt_conversion_keeps_the_handlers_headers() {
+        let resp = degraded(add_timing(srt_provisional(SRT.to_string()), "sync;dur=5"), "sync_failed");
+        let out = to_vtt(resp, &HeaderMap::new()).await;
+        assert_eq!(out.headers().get(CONTENT_TYPE).unwrap(), "text/vtt; charset=utf-8");
+        assert_eq!(out.headers().get(X_DEN_DEGRADED).unwrap(), "sync_failed");
+        assert_eq!(out.headers().get(SERVER_TIMING).unwrap(), "sync;dur=5");
+    }
+
+    #[test]
+    fn the_first_degraded_reason_stands() {
+        let resp = degraded(degraded(text(StatusCode::OK, ""), "sync_failed"), "upstream_unavailable");
+        assert_eq!(resp.headers().get(X_DEN_DEGRADED).unwrap(), "sync_failed");
+        let resp = add_timing(add_timing(text(StatusCode::OK, ""), "download;dur=3"), "total;dur=4");
+        assert_eq!(resp.headers().get(SERVER_TIMING).unwrap(), "download;dur=3, total;dur=4");
     }
 
     /// A provisional body stays provisional through the conversion — `immutable` on a stand-in would

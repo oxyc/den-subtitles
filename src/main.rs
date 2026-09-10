@@ -78,6 +78,10 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
         }
         _ => route(&state, &parts).await,
     };
+    // `total` closes the header on any response whose handler named its phases.
+    if resp.headers().contains_key(httputil::SERVER_TIMING) {
+        resp = httputil::add_timing(resp, &format!("total;dur={}", started.elapsed().as_millis()));
+    }
     // Every reply is readable from a browser-based Stremio client. Nothing here rides on a cookie —
     // an install's credentials are in its path — so a wildcard origin grants a page nothing it could
     // not already fetch. Added here, last, so the 304 and VTT paths that rebuild a response keep it.
@@ -581,6 +585,41 @@ mod tests {
             assert_eq!(body["reason"], "upstream_unavailable");
             assert_eq!(body["detail"], "OpenSubtitles has been failing");
         }
+    }
+
+    /// A plaintext config segment carrying only an OpenSubtitles key, enough for `handle_subtitles`.
+    fn os_only_segment() -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-test"}"#)
+    }
+
+    fn server_timing(resp: &Response<Body>) -> String {
+        resp.headers().get(httputil::SERVER_TIMING).expect("Server-Timing").to_str().unwrap().to_string()
+    }
+
+    /// An empty list because the search failed must not read like a title with no subtitles.
+    #[tokio::test]
+    async fn a_failed_search_is_marked_degraded_and_timed() {
+        let uri = format!("/{}/subtitles/movie/tt0000001.json", os_only_segment());
+        let resp = handle_request(test_state(""), request(hyper::Method::GET, &uri)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(httputil::X_DEN_DEGRADED).unwrap(), "upstream_unavailable");
+        let timing = server_timing(&resp);
+        assert!(timing.starts_with("opensubtitles;dur="), "{timing}");
+        assert!(timing.contains(", total;dur="), "{timing}");
+        assert_eq!(body_string(resp).await, r#"{"subtitles":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn a_cached_search_is_timed_as_a_hit_and_not_degraded() {
+        let state = test_state("");
+        let key = format!("{}tt0000002:0:0:", crate::cache::SEARCH_NS);
+        state.cache.put(key, "[]".into(), Duration::from_secs(60));
+        let uri = format!("/{}/subtitles/movie/tt0000002.json", os_only_segment());
+        let resp = handle_request(state, request(hyper::Method::GET, &uri)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(httputil::X_DEN_DEGRADED).is_none(), "a normal answer is not degraded");
+        let timing = server_timing(&resp);
+        assert!(timing.starts_with("cache;desc=hit, total;dur="), "{timing}");
     }
 
     /// /health changing state is logged once each way, not once per search.

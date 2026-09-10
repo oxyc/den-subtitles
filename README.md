@@ -69,6 +69,14 @@ Every reply carries `Access-Control-Allow-Origin: *`, and `OPTIONS` on any path 
 preflight. A path the router does not serve answers 404 `{"error":"not_found"}`. `<config>` is the
 per-install config segment built at `/configure`.
 
+The subtitles, subtitle and translate responses carry `Server-Timing`, naming where the time went —
+`opensubtitles;dur=`, `download;dur=`, `sync;dur=` (when a sync tier ran), `translate;dur=`, or
+`cache;desc=hit` — and `total;dur=`, in milliseconds. An answer that is a fallback carries
+`X-Den-Degraded: <reason>`: `upstream_unavailable` for a subtitles list left empty because the
+OpenSubtitles search failed (or a translation served unaligned because its anchor search failed), and
+`sync_failed` for a subtitle served unaligned because its sync failed. A normal answer carries neither
+reason.
+
 - `GET /health` — liveness, always 200: `{"status":"ok"}`, or `{"status":"degraded",…}` with reason
   `upstream_unavailable` after three OpenSubtitles failures in a row.
 - `GET /metrics` — Prometheus text for `Authorization: Bearer <METRICS_TOKEN>`; the unknown-path 404

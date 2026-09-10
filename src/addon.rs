@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
@@ -63,6 +63,9 @@ const DEAD_FILE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 /// value did not change: `translate_body_key` names the title, so a lost pin costs a download and
 /// nothing more. Kept long anyway; the pin is fifty bytes and the download is metered.
 const SOURCE_PIN_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 180);
+
+/// The `Server-Timing` entry for an answer that came out of the cache rather than out of work.
+const CACHE_HIT: &str = "cache;desc=hit";
 
 /// Monotonic counter making sync scratch-file names unique per invocation.
 static SYNC_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -202,9 +205,13 @@ pub async fn handle_subtitles(
     let Some((imdb, season, episode)) = parse_id(id) else {
         return httputil::json(StatusCode::BAD_REQUEST, &json!({"error": "bad_id"}), "no-store");
     };
-    // A missing client was logged once, at boot; repeating it per request says nothing new.
+    // A missing client was logged once, at boot; repeating it per request says nothing new. The empty
+    // list is a stand-in, not an answer, and says so.
     let Some(http) = state.http.as_ref() else {
-        return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
+        return httputil::degraded(
+            httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store"),
+            "upstream_unavailable",
+        );
     };
 
     // An OSHash is 16 hex digits. Anything else is not one, and this value goes into a cache key
@@ -213,12 +220,21 @@ pub async fn handle_subtitles(
     let hash = search_hash(extra);
     let filename = search_filename(extra);
     let client = os_client(state, http, &cfg);
-    let mut subs = match cached_search(state, &client, config, &imdb, season, episode, hash.as_deref()).await
-    {
-        Ok(s) => s,
+    let started = Instant::now();
+    let searched = cached_search(state, &client, config, &imdb, season, episode, hash.as_deref()).await;
+    let timing = match &searched {
+        Ok((_, true)) => CACHE_HIT.to_string(),
+        _ => format!("opensubtitles;dur={}", started.elapsed().as_millis()),
+    };
+    let mut subs = match searched {
+        Ok((s, _)) => s,
         // Empty-200 is the correct Stremio shape for "nothing"; `cached_search` has already logged
-        // the cause and counted it for /health.
-        Err(_) => return httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store"),
+        // the cause and counted it for /health. The header is what tells this "nothing" apart from a
+        // title that has no subtitles.
+        Err(_) => {
+            let empty = httputil::json(StatusCode::OK, &json!({"subtitles": []}), "no-store");
+            return httputil::add_timing(httputil::degraded(empty, "upstream_unavailable"), &timing);
+        }
     };
 
     // Rank for THIS stream: hash-match, then release/filename fit, then quality; grouped by language
@@ -259,11 +275,12 @@ pub async fn handle_subtitles(
         .collect();
     // A strong ETag (hash of this serialized ranked list) is attached by `json()`; add
     // stale-while-revalidate so a client can serve the last list instantly while refreshing.
-    httputil::json(
+    let resp = httputil::json(
         StatusCode::OK,
         &json!({"subtitles": out}),
         "public, max-age=3600, stale-while-revalidate=3600",
-    )
+    );
+    httputil::add_timing(resp, &timing)
 }
 
 /// The OpenSubtitles client for one request, from that install's BYOK credentials.
@@ -296,6 +313,10 @@ fn os_client<'a>(
 ///
 /// Returned UNRANKED, and cached that way: ranking is filename-specific, so each caller ranks the
 /// list for its own request.
+///
+/// The flag is true when the list came straight out of the cache, for `Server-Timing`. A list read
+/// from the cache after waiting on another request's search counts as a search: that is where the
+/// wait went.
 #[allow(clippy::too_many_arguments)]
 async fn cached_search(
     state: &Arc<AppState>,
@@ -305,7 +326,7 @@ async fn cached_search(
     season: Option<i64>,
     episode: Option<i64>,
     hash: Option<&str>,
-) -> Result<Vec<opensubtitles::Subtitle>, String> {
+) -> Result<(Vec<opensubtitles::Subtitle>, bool), String> {
     let search_key = format!(
         "{}{imdb}:{}:{}:{}",
         cache::SEARCH_NS,
@@ -314,7 +335,7 @@ async fn cached_search(
         hash.unwrap_or("")
     );
     if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
-        return Ok(hit);
+        return Ok((hit, true));
     }
     // Single-flighted. Two requests arriving on a cold entry would each run a live search, and
     // OpenSubtitles returns one ordered page — so the two lists can differ and `translation_source`
@@ -338,7 +359,7 @@ async fn cached_search(
     // a film's LLM bill, which is no longer what is at stake.
     let _flight = state.inflight.acquire(&search_key).await;
     if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
-        return Ok(hit);
+        return Ok((hit, false));
     }
     // The flight ahead of us may have failed. Nothing caches a failed search, so without this the
     // queue behind one miss ran a live search EACH, one after another, at up to the client timeout
@@ -361,7 +382,7 @@ async fn cached_search(
             if let Ok(json) = serde_json::to_string(&s) {
                 state.cache.put(search_key, json, SEARCH_TTL);
             }
-            Ok(s)
+            Ok((s, false))
         }
         // Count it so /health can report `degraded` (ADDON-02). Counted HERE rather than at one call
         // site, so a translation that cannot reach OpenSubtitles is visible on /health too — it was
@@ -454,13 +475,14 @@ pub async fn handle_subtitle_file(
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
     let cache_key = sync_cache_key(&os_base_key(file_id), &resync_url, ref_id);
     if let Some(hit) = state.cache.get(&cache_key) {
-        return httputil::srt(hit);
+        return httputil::add_timing(httputil::srt(hit), CACHE_HIT);
     }
     let Some(http) = state.http.as_ref() else {
         return httputil::text(StatusCode::SERVICE_UNAVAILABLE, "subtitle service unavailable");
     };
     let client = os_client(state, http, &cfg);
 
+    let started = Instant::now();
     let target = match subtitle_srt(state, &client, file_id).await {
         Ok(body) => body,
         Err(e) => {
@@ -473,8 +495,10 @@ pub async fn handle_subtitle_file(
 
     // Settled: this handler is told which reference to use, so "no ref" here means none was asked
     // for, never that we failed to find out.
+    let download = format!("download;dur={}", started.elapsed().as_millis());
     let what = format!("subtitle {file_id}");
-    sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &what, true).await
+    let resp = sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &what, true).await;
+    httputil::add_timing(resp, &download)
 }
 
 /// A cache key turned into one safe filename component, plus a per-invocation sequence number.
@@ -540,8 +564,9 @@ async fn sync_and_cache(
     let shared_marker = format!("{SYNCFAIL}{cache_key}");
     let mine_marker = format!("{SYNCFAIL}{:016x}:{cache_key}", short_hash(client.api_key));
     let backed_off = || state.cache.get(&shared_marker).is_some() || state.cache.get(&mine_marker).is_some();
+    // The unaligned body standing in for a sync that failed moments ago is a fallback, and says so.
     if wanted_sync && backed_off() {
-        return httputil::srt_provisional(target);
+        return httputil::degraded(httputil::srt_provisional(target), "sync_failed");
     }
 
     // One tier binary per key at a time. Concurrent requests for the same alignment were each
@@ -551,18 +576,20 @@ async fn sync_and_cache(
         let guard = state.inflight.acquire(&cache_key).await;
         // Settled while we waited: the alignment we were about to run has already been run.
         if let Some(hit) = state.cache.get(&cache_key) {
-            return httputil::srt(hit);
+            return httputil::add_timing(httputil::srt(hit), CACHE_HIT);
         }
         // And it may have failed while we waited, in which case re-running it now is the retry the
         // marker exists to prevent.
         if backed_off() {
-            return httputil::srt_provisional(target);
+            return httputil::degraded(httputil::srt_provisional(target), "sync_failed");
         }
         Some(guard)
     } else {
         None
     };
 
+    let started = Instant::now();
+    let sync_timing = || format!("sync;dur={}", started.elapsed().as_millis());
     let tag = scratch_tag(&cache_key, SYNC_SEQ.fetch_add(1, Ordering::Relaxed));
     // A permit, held only around work that actually spawns a binary.
     //
@@ -628,7 +655,7 @@ async fn sync_and_cache(
         // The alignment happened: this body IS the answer to this key.
         Some(body) => {
             state.cache.put(cache_key, body.clone(), CACHE_TTL);
-            httputil::srt(body)
+            httputil::add_timing(httputil::srt(body), &sync_timing())
         }
         // Asked for and didn't happen. The unaligned body stands in, and is NOT written to
         // `cache_key` — caching it there made one broken afternoon permanent, since the URL is
@@ -641,7 +668,8 @@ async fn sync_and_cache(
                 false => shared_marker,
             };
             state.cache.put(marker, "1".into(), SYNC_RETRY_TTL);
-            httputil::srt_provisional(target)
+            let resp = httputil::add_timing(httputil::srt_provisional(target), &sync_timing());
+            httputil::degraded(resp, "sync_failed")
         }
         // No sync was asked for, so the body we have is the answer, and it is already cached —
         // unless the caller could not determine whether an alignment was owed at all, in which case
@@ -1368,7 +1396,7 @@ pub async fn handle_translate(
     let mut anchor_unknown = false;
     let anchored = match hash.as_deref().filter(|_| cfg.auto_sync) {
         Some(h) => match cached_search(state, &client, config, &imdb, season, episode, Some(h)).await {
-            Ok(subs) => subs,
+            Ok((subs, _)) => subs,
             Err(_) => {
                 anchor_unknown = true;
                 Vec::new()
@@ -1417,20 +1445,24 @@ pub async fn handle_translate(
     // Read once, not twice. Asking again on the settled path could miss what the first read saw —
     // LRU eviction and TTL expiry both happen between two reads — and answer "not translated" for a
     // translation that exists and had just been confirmed.
-    if let Some(settled) = state.cache.get(&cache_key) {
+    // The `Server-Timing` phase for the translated text: `cache;desc=hit`, or how long the run took.
+    let phase = if let Some(settled) = state.cache.get(&cache_key) {
         if !want_json {
             // `immutable` only when this really is the answer. With the anchor merely unknown the
             // body may well be superseded within the thirty seconds the search marker lasts, and a
             // client told `immutable` will not come back for a year.
-            return match anchor_unknown {
-                true => httputil::srt_provisional(settled),
+            let resp = match anchor_unknown {
+                true => httputil::degraded(httputil::srt_provisional(settled), "upstream_unavailable"),
                 false => httputil::srt(settled),
             };
+            return httputil::add_timing(resp, CACHE_HIT);
         }
+        CACHE_HIT.to_string()
     } else {
         // The expensive half: the translated text. `used_source` carries back which file it came
         // from, so the alignment decision can be re-answered from a source that is actually known.
         let mut used_source = pinned;
+        let mut phase = CACHE_HIT.to_string();
         let translated = match state.cache.get(&body_key) {
             Some(body) => body,
             None => {
@@ -1506,7 +1538,7 @@ pub async fn handle_translate(
                                 // A failed search does NOT set the failure marker: a search costs
                                 // nothing, and marking it made a blip outlive itself by ten minutes
                                 // across every language the viewer tried.
-                                let Ok(candidates) =
+                                let Ok((candidates, _)) =
                                     cached_search(state, &client, config, &imdb, season, episode, None).await
                                 else {
                                     return httputil::text(StatusCode::BAD_GATEWAY, "translation failed");
@@ -1550,12 +1582,14 @@ pub async fn handle_translate(
                             state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
                             return httputil::text(StatusCode::BAD_GATEWAY, "translation source unavailable");
                         }
+                        let started = Instant::now();
                         match produce_translation(
                             state, &client, llm, config, source_id, &lang, &body_key, &job_key,
                         )
                         .await
                         {
                             Ok(body) => {
+                                phase = format!("translate;dur={}", started.elapsed().as_millis());
                                 // Refresh the pin on the path that actually produced a translation, so
                                 // its lifetime and mtime do not stay frozen at the first one. Losing it
                                 // is no longer expensive — the body is keyed by title, so a re-pick
@@ -1689,12 +1723,18 @@ pub async fn handle_translate(
             !anchor_unknown,
         )
         .await;
+        let resp = httputil::add_timing(resp, &phase);
         if !want_json {
-            return resp;
+            // Served unaligned because the anchor search failed, not because there is no anchor.
+            return match anchor_unknown {
+                true => httputil::degraded(resp, "upstream_unavailable"),
+                false => resp,
+            };
         }
-    }
+        phase
+    };
 
-    translate_url_response(state, headers, config, season, id, extra, lang_seg)
+    httputil::add_timing(translate_url_response(state, headers, config, season, id, extra, lang_seg), &phase)
 }
 
 /// The `.json` form's answer: the `.srt` URL the engine should fetch.
