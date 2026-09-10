@@ -230,7 +230,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let port = cfg.port;
     let state = AppState::new(cfg);
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
-    eprintln!("den-subtitles on :{port} (keys are per-install; build one at /configure)");
+    eprintln!("listening on :{port} (keys are per-install; build one at /configure)");
 
     // Reclaim the disk cache hourly. `Cache::new` sweeps at boot, which bounds the store across
     // restarts but not within one — a container that stays up keeps writing entries that only a
