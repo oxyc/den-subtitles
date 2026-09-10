@@ -12,9 +12,10 @@ path = "src/main.rs"
 [dependencies]
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
 # alass/ffsubsync/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+# server-graceful: stop accepting on SIGTERM and let in-flight requests finish (see serve_until).
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful"] }
 http-body-util = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -30,7 +31,7 @@ base64 = "0.23"
 crypto_box = { version = "0.9", features = ["seal"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
 
 # Self-contained binary for a resource-constrained homelab. panic=unwind (default): a panic in one
 # request task unwinds just that connection (tokio catches it) instead of aborting the whole server.

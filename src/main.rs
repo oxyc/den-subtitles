@@ -24,11 +24,14 @@ mod translate;
 mod userconfig;
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
 use crate::config::Config;
@@ -257,23 +260,74 @@ async fn run(cfg: Config) -> std::io::Result<()> {
         });
     }
 
+    serve_until(listener, state, shutdown_signal(), DRAIN_GRACE).await;
+    Ok(())
+}
+
+/// How long in-flight requests get to finish after SIGTERM. Under podman's default 10s stop timeout,
+/// as den-atlas's and den-embed's are, so the drain works whether or not the Quadlet's --stop-timeout
+/// has reached the box.
+const DRAIN_GRACE: Duration = Duration::from_secs(8);
+
+/// Serve until `shutdown` resolves, then let in-flight requests finish for at most `grace`. Without
+/// it a redeploy killed the process outright, cutting every fetch and translation mid-response.
+///
+/// The bound is the point: a graceful shutdown waits for every connection, and a client that sends
+/// half a request head and stops would otherwise decide how long a restart takes. Sync subprocesses
+/// are `kill_on_drop`, so any still running at the deadline die with their tasks.
+async fn serve_until(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    shutdown: impl Future<Output = ()>,
+    grace: Duration,
+) {
+    let graceful = GracefulShutdown::new();
+    tokio::pin!(shutdown);
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("accept: {e}");
-                continue;
-            }
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("accept: {e}");
+                    continue;
+                }
+            },
+            _ = &mut shutdown => break,
         };
         let state = state.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req| {
-                let state = state.clone();
-                async move { Ok::<_, Infallible>(handle_request(state, req).await) }
-            });
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await;
+        let service = service_fn(move |req| {
+            let state = state.clone();
+            async move { Ok::<_, Infallible>(handle_request(state, req).await) }
         });
+        let conn = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+    drop(listener);
+    eprintln!("den-subtitles: shutting down — draining in-flight requests");
+    tokio::select! {
+        _ = graceful.shutdown() => {}
+        _ = tokio::time::sleep(grace) => {
+            eprintln!("den-subtitles: drain deadline ({grace:?}) reached with requests still in flight");
+        }
+    }
+}
+
+/// Resolves on SIGTERM (a redeploy) or SIGINT (a terminal).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot listen for SIGTERM ({e}); a redeploy will cut in-flight requests");
+            return std::future::pending().await;
+        }
+    };
+    tokio::select! {
+        _ = term.recv() => {},
+        _ = tokio::signal::ctrl_c() => {},
     }
 }
 
@@ -329,6 +383,42 @@ mod tests {
         use http_body_util::BodyExt;
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// `serve_until` on a loopback port, stopped by the returned sender instead of a signal.
+    async fn start_serve(
+        grace: Duration,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let stop = async move {
+            let _ = rx.await;
+        };
+        (addr, tx, tokio::spawn(serve_until(listener, test_state(""), stop, grace)))
+    }
+
+    #[tokio::test]
+    async fn an_idle_server_stops_at_once() {
+        let (_, stop, server) = start_serve(Duration::from_secs(5)).await;
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("an idle server waited out the grace instead of stopping")
+            .unwrap();
+    }
+
+    /// A graceful shutdown waits for every connection, so without a deadline a client that sends half
+    /// a request head and goes quiet would hold the stop open for as long as it liked.
+    #[tokio::test]
+    async fn a_half_sent_request_cannot_hold_the_stop_open() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, stop, server) = start_serve(Duration::from_millis(300)).await;
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n").await.unwrap(); // no terminating blank line
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the server accept it first
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server).await.expect("the drain is unbounded").unwrap();
     }
 
     // The HTTP-level mirror of den-scout's TestRoutesSealedConfig: drive the real router so a future
