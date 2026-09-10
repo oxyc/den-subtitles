@@ -34,6 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=alass /alass/bin/alass-cli /usr/local/bin/alass
 COPY --from=build /src/target/release/den-subtitles /usr/local/bin/den-subtitles
 
+# Non-root, with the uid every den addon image uses (distroless's `nonroot`, 65532), so the box chowns
+# one uid for every writable host dir. A real account with a home: ffsubsync is Python, and Python
+# tooling reaches for $HOME. /cache is created owned by it, so a fresh volume mounted there is writable.
+RUN useradd --system --uid 65532 --user-group --create-home --home-dir /home/nonroot nonroot \
+    && mkdir -p /cache && chown nonroot:nonroot /cache
+
 WORKDIR /app
 ENV PORT=8093 \
     CACHE_DIR=/cache \
@@ -42,6 +48,7 @@ ENV PORT=8093 \
 VOLUME ["/cache"]
 EXPOSE 8093
 
-# The binary self-checks (no curl on the health path). start-period covers cold start.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s CMD ["den-subtitles", "healthcheck"]
+# No HEALTHCHECK, deliberately: a periodic probe keeps an idle box awake. Health is checked when it
+# matters — by the deploy (den/deploy/den-update.sh), against /health and /manifest.json over HTTP.
+USER 65532:65532
 CMD ["den-subtitles"]

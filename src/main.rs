@@ -331,21 +331,10 @@ async fn shutdown_signal() {
     }
 }
 
-/// `den-subtitles healthcheck` — used by the container HEALTHCHECK so the slim image needs no curl.
-async fn healthcheck(port: u16) -> i32 {
-    match reqwest::get(format!("http://127.0.0.1:{port}/health")).await {
-        Ok(r) if r.status().is_success() => 0,
-        _ => 1,
-    }
-}
-
 fn main() {
     let cfg = Config::from_env();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
 
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        std::process::exit(rt.block_on(healthcheck(cfg.port)));
-    }
     if let Err(e) = rt.block_on(run(cfg)) {
         eprintln!("fatal: {e}");
         std::process::exit(1);
