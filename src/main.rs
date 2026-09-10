@@ -86,6 +86,11 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // an install's credentials are in its path — so a wildcard origin grants a page nothing it could
     // not already fetch. Added here, last, so the 304 and VTT paths that rebuild a response keep it.
     resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
+    // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
+    resp.headers_mut()
+        .insert("access-control-expose-headers", HeaderValue::from_static("Server-Timing, X-Den-Degraded"));
+    resp.headers_mut().insert("timing-allow-origin", HeaderValue::from_static("*"));
     // Off by default, and then this bool is the whole cost. The path is redacted and the query left
     // out: a config segment is an install's credentials, and `?resync=` carries a stream URL.
     if state.cfg.log_requests {
