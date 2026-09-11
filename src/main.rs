@@ -137,7 +137,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         }
         // Prometheus text behind `METRICS_TOKEN`; 404 without it (see metrics.rs).
         "/metrics" => return metrics::handle(state, &parts.headers),
-        "/manifest.json" => return httputil::json(StatusCode::OK, &addon::manifest(false), STATIC_CACHE),
+        "/manifest.json" => return httputil::json(StatusCode::OK, &addon::manifest(None), STATIC_CACHE),
         "/" | "/configure" | "/configure/" => {
             return httputil::html(StatusCode::OK, CONFIGURE_PAGE, STATIC_CACHE)
         }
@@ -169,7 +169,9 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
 
     match resource {
         "manifest.json" => match state.decode_config(config) {
-            Some(_) => httputil::json(StatusCode::OK, &addon::manifest(true), STATIC_CACHE),
+            // The ETag is over the body, and the body names the install, so one install's cached
+            // copy never answers another's If-None-Match.
+            Some(cfg) => httputil::json(StatusCode::OK, &addon::manifest(Some(&cfg)), STATIC_CACHE),
             None => httputil::json(
                 StatusCode::BAD_REQUEST,
                 &serde_json::json!({"error": "bad_config"}),
@@ -654,6 +656,59 @@ mod tests {
         assert!(page.contains("iid: mintInstallId(), ep: configEpoch"), "the link is not stamped");
         assert!(page.contains("toSegment(install)"), "the stamped config is not what gets sealed");
         assert!(page.contains("configEpoch = j.epoch"), "the epoch is not read from /config-key");
+    }
+
+    /// The configured manifest names its install as `REVOKED_INSTALLS` spells it; a config without an
+    /// id, and the unconfigured manifest, carry no such field. One install's ETag never earns another
+    /// install a 304.
+    #[tokio::test]
+    async fn the_configured_manifest_names_its_install() {
+        use hyper::header::{ETAG, IF_NONE_MATCH};
+        const OTHER_IID: &str = "BAECAwQFBgcICQoLDA0ODw";
+        let manifest = |uri: String, inm: Option<HeaderValue>| async move {
+            let mut req = Request::builder().uri(uri);
+            if let Some(etag) = inm {
+                req = req.header(IF_NONE_MATCH, etag);
+            }
+            handle_request(test_state(""), req.body(()).unwrap()).await
+        };
+        let with_id =
+            format!("/{}/manifest.json", plain_segment(&format!(r#"{{"osKey":"o","iid":"{IID}"}}"#)));
+        let first = manifest(with_id, None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first.headers().get(ETAG).expect("an ETag").clone();
+        let body: serde_json::Value = serde_json::from_str(&body_string(first).await).unwrap();
+        assert_eq!(body["denInstallId"], IID, "{body}");
+
+        let without = format!("/{}/manifest.json", plain_segment(r#"{"osKey":"o"}"#));
+        for uri in [without, "/manifest.json".to_string()] {
+            let resp = manifest(uri.clone(), None).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = body_string(resp).await;
+            assert!(!body.contains("denInstallId"), "{uri}: {body}");
+        }
+
+        let other =
+            format!("/{}/manifest.json", plain_segment(&format!(r#"{{"osKey":"o","iid":"{OTHER_IID}"}}"#)));
+        let resp = manifest(other, Some(etag)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "another install's ETag must not 304");
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["denInstallId"], OTHER_IID, "{body}");
+    }
+
+    /// The page shows the id of the link it just built, with the variable that revokes it.
+    #[tokio::test]
+    async fn configure_page_shows_the_install_id() {
+        let page =
+            body_string(handle_request(test_state(""), request(hyper::Method::GET, "/configure")).await)
+                .await;
+        for want in [
+            r#"<code id="installId"></code>"#,
+            r#"$("installId").textContent = install.iid;"#,
+            "<code>REVOKED_INSTALLS</code> to revoke just this link",
+        ] {
+            assert!(page.contains(want), "configure page lacks {want:?}");
+        }
     }
 
     async fn body_string(resp: Response<Body>) -> String {

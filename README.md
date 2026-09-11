@@ -96,7 +96,8 @@ reason.
   to seal to; 404 `{"error":"no_key","epoch":<CONFIG_EPOCH>}` when sealing is off.
 - `GET /manifest.json` — the unconfigured manifest (`configurationRequired`), what a client sees
   before installing.
-- `GET /<config>/manifest.json` — the configured manifest; 400 `{"error":"bad_config"}` for a segment
+- `GET /<config>/manifest.json` — the configured manifest, carrying the install's id as the top-level
+  `denInstallId` (absent for a link without one); 400 `{"error":"bad_config"}` for a segment
   that does not decode, or whose install is revoked (see Configuration). Every `/<config>/…` route
   gives a revoked install that same answer.
 - `GET /<config>/subtitles/<type>/<id>[/<extra>].json` — the Stremio subtitles resource:
@@ -129,6 +130,11 @@ every `/subtitle` and `/translate` URL the addon hands out, so a revocation reac
 rotation is not revocation:** `CONFIG_KEYS_PREV` keeps links sealed to an old key opening, so
 rotating `CONFIG_KEY` does nothing to a leaked link — revoke it instead. A refused install is logged
 as `bad_config: install revoked (iid=<first 6 chars>…)` or `bad_config: install epoch too old`.
+
+A link's id is shown in two places, spelled as `REVOKED_INSTALLS` takes it: `/configure` prints it
+under the link it just built, and the install's manifest carries it as `denInstallId`, so a client
+holding the link can show it (Den: Settings › Plugins). That is how to revoke one leaked link without
+raising the epoch for all of them.
 
 Supported providers: OpenAI, Google, Anthropic, xAI, OpenRouter (chat) and DeepL (MT). Default model
 is the cheap/fast/decent tier per provider; step up to a bigger model to re-translate a title that

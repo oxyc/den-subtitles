@@ -80,8 +80,12 @@ static ALLOWANCE_REFUSED: LogGate = LogGate::new();
 static CREDENTIAL_REFUSED: LogGate = LogGate::new();
 static TRANSLATE_FAILED: LogGate = LogGate::new();
 
-pub fn manifest(configured: bool) -> Value {
-    json!({
+/// The manifest for an install (`None` = unconfigured). A configured install's id rides along as
+/// `denInstallId`, spelled as `REVOKED_INSTALLS` takes it, so the owner can revoke one link from what
+/// the app shows; a config without an id gets no such field.
+pub fn manifest(install: Option<&crate::userconfig::UserConfig>) -> Value {
+    let configured = install.is_some();
+    let mut manifest = json!({
         "id": "com.den.subtitles",
         // Single source of truth: the Cargo package version (CI asserts it == the v* tag). So the
         // manifest can't drift from Cargo.toml, nor the tag from either.
@@ -97,7 +101,11 @@ pub fn manifest(configured: bool) -> Value {
         "idPrefixes": ["tt"],
         "catalogs": [],
         "behaviorHints": { "configurable": true, "configurationRequired": !configured },
-    })
+    });
+    if let Some(iid) = install.and_then(|cfg| cfg.iid.as_deref()) {
+        manifest["denInstallId"] = json!(iid);
+    }
+    manifest
 }
 
 /// The base URL this server is reachable at (for the `url` we hand back to the client/app).
