@@ -191,8 +191,15 @@ impl Revocation {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Rejected {
     Undecodable,
-    Revoked { iid_prefix: String },
-    EpochTooOld { ep: u64, epoch: u64 },
+    /// A plaintext config while sealing is on: every install `/configure` issues is sealed then.
+    Plaintext,
+    Revoked {
+        iid_prefix: String,
+    },
+    EpochTooOld {
+        ep: u64,
+        epoch: u64,
+    },
     NoInstallId,
 }
 
@@ -200,6 +207,7 @@ impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Rejected::Undecodable => f.write_str("config does not decode"),
+            Rejected::Plaintext => f.write_str("plaintext config while sealing is on"),
             Rejected::Revoked { iid_prefix } => write!(f, "install revoked (iid={iid_prefix}…)"),
             Rejected::EpochTooOld { ep, epoch } => {
                 write!(f, "install epoch too old (ep={ep} < CONFIG_EPOCH={epoch})")
@@ -215,21 +223,36 @@ pub fn decode_checked(
     revocation: &Revocation,
     blob: &str,
 ) -> Result<UserConfig, Rejected> {
-    let cfg = decode(keyring, blob).ok_or(Rejected::Undecodable)?;
+    let cfg = decode(keyring, blob).ok_or_else(|| match keyring {
+        Some(_) if is_plaintext(blob) => Rejected::Plaintext,
+        _ => Rejected::Undecodable,
+    })?;
     revocation.check(&cfg)?;
     Ok(cfg)
 }
 
+/// Does `blob` decode to a plaintext (unsealed) segment?
+fn is_plaintext(blob: &str) -> bool {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(blob)
+        .is_ok_and(|d| d.first().is_some_and(|b| *b != crate::seal::SEALED_VERSION))
+}
+
 /// Decode the config path segment into a validated config, or `None` (→ 400). The decoded bytes are
-/// either a SEALED blob (first byte == `SEALED_VERSION` → decrypt with the keyring) or a legacy plaintext
-/// JSON config (first byte `{`). Sealed with no keyring, or a decrypt failure, fails CLOSED — never a
-/// partial/empty config. Mirrors den-scout (den-scout/docs/SEALED-CONFIG.md).
+/// either a SEALED blob (first byte == `SEALED_VERSION` → decrypt with the keyring) or a plaintext JSON
+/// config (first byte `{`). Sealed with no keyring, or a decrypt failure, fails CLOSED — never a
+/// partial/empty config. Plaintext decodes only with no keyring: with one, every install `/configure`
+/// issues is sealed, and `/config-key` is public, so a plaintext config is one anyone could have minted —
+/// sealing hides the keys, and this is what makes an install one we issued. Mirrors den-scout
+/// (den-scout/docs/SEALED-CONFIG.md).
 pub fn decode(keyring: Option<&crate::seal::Keyring>, blob: &str) -> Option<UserConfig> {
     let data = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(blob).ok()?;
     let data = if data.first() == Some(&crate::seal::SEALED_VERSION) {
         keyring?.open(&data[1..])? // sealed but no key, or decrypt fail → None
+    } else if keyring.is_some() {
+        return None; // plaintext while sealing is on
     } else {
-        data // legacy plaintext
+        data
     };
     let raw: RawConfig = serde_json::from_slice(&data).ok()?;
     validate(raw)
@@ -348,8 +371,11 @@ mod tests {
 
         // Fail CLOSED: a sealed segment with no keyring configured.
         assert!(decode(None, JS_SEG).is_none());
-        // Back-compat: legacy plaintext still decodes with a keyring present.
-        assert!(decode(Some(&kr), &encode(r#"{"osKey":"os-legacy"}"#)).is_some());
+        // With a keyring, plaintext is refused; with none it is the only form, and decodes.
+        let plain = encode(r#"{"osKey":"os-plain"}"#);
+        assert!(decode(Some(&kr), &plain).is_none());
+        assert!(decode(None, &plain).is_some());
+        assert!(is_plaintext(&plain) && !is_plaintext(JS_SEG));
     }
 
     /// Bytes 0..16 as an install id, and a second one that uses both url-safe characters.

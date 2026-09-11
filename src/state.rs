@@ -22,6 +22,7 @@ use crate::userconfig::{self, Rejected, UserConfig};
 static INSTALL_REVOKED: LogGate = LogGate::new();
 static INSTALL_TOO_OLD: LogGate = LogGate::new();
 static INSTALL_NO_IID: LogGate = LogGate::new();
+static PLAINTEXT_REFUSED: LogGate = LogGate::new();
 
 pub struct AppState {
     pub cfg: Config,
@@ -104,6 +105,7 @@ impl AppState {
         };
         let gate = match why {
             Rejected::Undecodable => return None,
+            Rejected::Plaintext => &PLAINTEXT_REFUSED,
             Rejected::Revoked { .. } => &INSTALL_REVOKED,
             Rejected::EpochTooOld { .. } => &INSTALL_TOO_OLD,
             Rejected::NoInstallId => &INSTALL_NO_IID,

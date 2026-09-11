@@ -736,12 +736,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_plaintext_manifest_still_resolves_with_a_keyring_present() {
-        let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-legacy"}"#);
+    async fn a_plaintext_config_is_refused_while_sealing_is_on() {
+        // Every install /configure issues is sealed once a key is set, and /config-key is public: a
+        // plaintext segment is one anyone could have minted.
+        let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-plain"}"#);
         let uri = format!("/{seg}/manifest.json");
         let resp =
             handle_request(test_state(VEC_PRIV_B64), Request::builder().uri(uri).body(()).unwrap()).await;
-        assert_eq!(resp.status(), StatusCode::OK, "legacy plaintext config must still resolve (back-compat)");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a plaintext config must be refused with a key set"
+        );
     }
 
     #[tokio::test]
@@ -1002,14 +1008,15 @@ mod tests {
     #[tokio::test]
     async fn static_routes_carry_the_fleet_cache_policy() {
         let seg = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"osKey":"os-test"}"#);
+        // The configured manifest runs with sealing off: with it on, only a sealed segment is an install.
         let cases = [
-            ("/manifest.json".to_string(), STATIC_CACHE),
-            (format!("/{seg}/manifest.json"), STATIC_CACHE),
-            ("/configure".to_string(), STATIC_CACHE),
-            ("/config-key".to_string(), KEY_CACHE),
+            ("/manifest.json".to_string(), STATIC_CACHE, VEC_PRIV_B64),
+            (format!("/{seg}/manifest.json"), STATIC_CACHE, ""),
+            ("/configure".to_string(), STATIC_CACHE, VEC_PRIV_B64),
+            ("/config-key".to_string(), KEY_CACHE, VEC_PRIV_B64),
         ];
-        for (uri, want) in cases {
-            let resp = handle_request(test_state(VEC_PRIV_B64), request(hyper::Method::GET, &uri)).await;
+        for (uri, want, key) in cases {
+            let resp = handle_request(test_state(key), request(hyper::Method::GET, &uri)).await;
             assert_eq!(resp.status(), StatusCode::OK, "{uri}");
             assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), want, "{uri}");
         }
