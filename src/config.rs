@@ -64,7 +64,8 @@ impl Config {
             revocation: crate::userconfig::Revocation::from_env(
                 &env_opt("REVOKED_INSTALLS").unwrap_or_default(),
                 env_opt("CONFIG_EPOCH").as_deref(),
-            ),
+            )
+            .requiring_install_id(env_opt("REQUIRE_INSTALL_ID").is_some_and(|v| v != "0")),
             metrics_token: env_opt("METRICS_TOKEN").unwrap_or_default(),
             log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v != "0"),
             os_api_base: crate::opensubtitles::API.to_string(),

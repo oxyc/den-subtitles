@@ -294,13 +294,14 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     let on_off = |on: bool| if on { "on" } else { "off" };
     eprintln!(
         "den-subtitles {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
-         cache_dir={} cache_max_mib={} public_base={} resync={}",
+         require_iid={} cache_dir={} cache_max_mib={} public_base={} resync={}",
         env!("CARGO_PKG_VERSION"),
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
         on_off(state.config_keyring.is_some()),
         state.cfg.revocation.revoked_count(),
         state.cfg.revocation.epoch(),
+        on_off(state.cfg.revocation.requires_install_id()),
         state.cfg.cache_dir.display(),
         state.cfg.cache_max_bytes / (1024 * 1024),
         state.cfg.public_base_url.as_deref().unwrap_or("derived"),

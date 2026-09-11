@@ -121,6 +121,10 @@ fn is_install_id(s: &str) -> bool {
 pub struct Revocation {
     revoked: HashSet<String>,
     epoch: u64,
+    /// `REQUIRE_INSTALL_ID`: refuse a config with no install id — every link built before ids
+    /// existed. Those can't be named, and raising the epoch would also refuse the links minted since,
+    /// which carry the same epoch.
+    require_iid: bool,
 }
 
 impl Revocation {
@@ -144,11 +148,21 @@ impl Revocation {
                 0
             }),
         };
-        Revocation { revoked: ids, epoch }
+        Revocation { revoked: ids, epoch, require_iid: false }
+    }
+
+    /// Also refuse configs that carry no install id (`REQUIRE_INSTALL_ID`).
+    pub fn requiring_install_id(mut self, on: bool) -> Revocation {
+        self.require_iid = on;
+        self
     }
 
     pub fn revoked_count(&self) -> usize {
         self.revoked.len()
+    }
+
+    pub fn requires_install_id(&self) -> bool {
+        self.require_iid
     }
 
     /// The oldest epoch still admitted — what /configure stamps into a new link.
@@ -164,6 +178,9 @@ impl Revocation {
         if cfg.ep < self.epoch {
             return Err(Rejected::EpochTooOld { ep: cfg.ep, epoch: self.epoch });
         }
+        if self.require_iid && cfg.iid.is_none() {
+            return Err(Rejected::NoInstallId);
+        }
         Ok(())
     }
 }
@@ -176,6 +193,7 @@ pub enum Rejected {
     Undecodable,
     Revoked { iid_prefix: String },
     EpochTooOld { ep: u64, epoch: u64 },
+    NoInstallId,
 }
 
 impl std::fmt::Display for Rejected {
@@ -186,6 +204,7 @@ impl std::fmt::Display for Rejected {
             Rejected::EpochTooOld { ep, epoch } => {
                 write!(f, "install epoch too old (ep={ep} < CONFIG_EPOCH={epoch})")
             }
+            Rejected::NoInstallId => f.write_str("no install id (REQUIRE_INSTALL_ID is on)"),
         }
     }
 }
@@ -409,6 +428,18 @@ mod tests {
             Rejected::EpochTooOld { ep: 1, epoch: 2 }.to_string(),
             "install epoch too old (ep=1 < CONFIG_EPOCH=2)"
         );
+    }
+
+    #[test]
+    fn requiring_ids_refuses_only_links_without_one() {
+        let revocation = Revocation::from_env("", None).requiring_install_id(true);
+        assert!(revocation.requires_install_id());
+        let check = |json: &str| decode_checked(None, &revocation, &encode(json));
+        assert_eq!(check(r#"{"osKey":"o"}"#).unwrap_err(), Rejected::NoInstallId);
+        assert!(check(&format!(r#"{{"osKey":"o","iid":"{IID}","ep":0}}"#)).is_ok());
+        assert_eq!(Rejected::NoInstallId.to_string(), "no install id (REQUIRE_INSTALL_ID is on)");
+        // Off by default: links from before ids keep working until the operator turns it on.
+        assert!(!Revocation::from_env("", None).requires_install_id());
     }
 
     #[test]

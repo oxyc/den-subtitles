@@ -21,6 +21,7 @@ use crate::userconfig::{self, Rejected, UserConfig};
 
 static INSTALL_REVOKED: LogGate = LogGate::new();
 static INSTALL_TOO_OLD: LogGate = LogGate::new();
+static INSTALL_NO_IID: LogGate = LogGate::new();
 
 pub struct AppState {
     pub cfg: Config,
@@ -105,6 +106,7 @@ impl AppState {
             Rejected::Undecodable => return None,
             Rejected::Revoked { .. } => &INSTALL_REVOKED,
             Rejected::EpochTooOld { .. } => &INSTALL_TOO_OLD,
+            Rejected::NoInstallId => &INSTALL_NO_IID,
         };
         if gate.allow() {
             eprintln!("bad_config: {why}");
