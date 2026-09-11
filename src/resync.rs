@@ -82,16 +82,55 @@ pub fn parse_origins(raw: &str) -> Vec<Origin> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|s| {
-            let origin = Url::parse(s)
-                .ok()
-                .filter(|u| u.path() == "/" && u.query().is_none() && u.fragment().is_none())
-                .and_then(|u| origin_of(&u));
+            let origin = parse_origin(s);
             if origin.is_none() {
                 eprintln!("warning: SCOUT_ORIGINS entry {s:?} is not an http(s) origin — ignored");
             }
             origin
         })
         .collect()
+}
+
+fn parse_origin(s: &str) -> Option<Origin> {
+    Url::parse(s)
+        .ok()
+        .filter(|u| u.path() == "/" && u.query().is_none() && u.fragment().is_none())
+        .and_then(|u| origin_of(&u))
+}
+
+/// `SCOUT_ALIASES`: comma-separated `<public origin>=<LAN origin>` pairs, such as
+/// `https://d-play.oxy.fi=http://192.168.86.193:8080`. A resync target on a public name is fetched at
+/// its LAN address instead: scout is on this box, and two services on one box must not need the WAN,
+/// Cloudflare and the tunnel to reach each other (oxyc/den#15). Both sides still have to be in
+/// `SCOUT_ORIGINS` — the public one for `vet`, the LAN one for the hop it becomes.
+pub fn parse_aliases(raw: &str) -> Vec<(Origin, Origin)> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|pair| {
+            let parsed = pair
+                .split_once('=')
+                .and_then(|(p, l)| Some((parse_origin(p.trim())?, parse_origin(l.trim())?)));
+            if parsed.is_none() {
+                eprintln!(
+                    "warning: SCOUT_ALIASES entry {pair:?} is not <public origin>=<LAN origin> — ignored"
+                );
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// `url` at its LAN address when its origin is a public name in `aliases`; anything else as it is.
+pub fn local(mut url: Url, aliases: &[(Origin, Origin)]) -> Url {
+    let Some(origin) = origin_of(&url) else { return url };
+    if let Some((_, lan)) = aliases.iter().find(|(public, _)| *public == origin) {
+        // Scheme first: setting a port the old scheme treats as its default would otherwise be dropped.
+        let _ = url.set_scheme(&lan.scheme);
+        let _ = url.set_host(Some(&lan.host));
+        let _ = url.set_port(Some(lan.port));
+    }
+    url
 }
 
 /// The origin of a plain http(s) URL. A URL carrying credentials has none: `http://ok-host@evil/` is
@@ -277,9 +316,15 @@ impl Drop for Relay {
 }
 
 impl Relay {
-    /// Resolve `target` (already passed through `vet`) to the bytes and start relaying them.
-    pub async fn open(target: &str, origins: &[Origin]) -> Result<Relay, String> {
+    /// Resolve `target` (already passed through `vet`) to the bytes and start relaying them. A target on
+    /// a public name in `aliases` starts at its LAN address; the hops after it are the debrid's.
+    pub async fn open(
+        target: &str,
+        origins: &[Origin],
+        aliases: &[(Origin, Origin)],
+    ) -> Result<Relay, String> {
         let start = Url::parse(target).map_err(|_| "resync target is not a URL".to_string())?;
+        let start = local(start, aliases);
         let (client, target) = follow(start, origins).await?;
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.map_err(|e| format!("relay bind: {e}"))?;
@@ -596,7 +641,7 @@ mod tests {
             let (scout, _) = server(move |_, _| redirect(location.clone())).await;
             let list = origins(&format!("http://{scout}"));
             let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-            let err = Relay::open(target.as_str(), &list).await.err();
+            let err = Relay::open(target.as_str(), &list, &[]).await.err();
             assert!(err.is_some(), "followed a redirect to an internal address");
         }
         assert_eq!(victim_hits.load(Ordering::SeqCst), 0, "the internal address was contacted");
@@ -615,7 +660,7 @@ mod tests {
         .await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-        let relay = Relay::open(target.as_str(), &list).await.expect("a legitimate target was refused");
+        let relay = Relay::open(target.as_str(), &list, &[]).await.expect("a legitimate target was refused");
         assert!(relay.url().starts_with("http://127.0.0.1:"), "{}", relay.url());
 
         let resp = client().get(relay.url()).header(RANGE, "bytes=2-5").send().await.unwrap();
@@ -644,9 +689,35 @@ mod tests {
         .await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/p/AbC-_09"), &list).expect("a ticket URL was refused");
-        let relay = Relay::open(target.as_str(), &list).await.expect("a ticket target was not relayed");
+        let relay = Relay::open(target.as_str(), &list, &[]).await.expect("a ticket target was not relayed");
         let whole = client().get(relay.url()).send().await.unwrap();
         assert_eq!(whole.bytes().await.unwrap(), MEDIA);
+    }
+
+    /// A ticket on a public name (`SCOUT_ALIASES`) is fetched at scout's LAN address: the public name
+    /// would only lead back to this box through the tunnel, so it is never contacted.
+    #[tokio::test]
+    async fn a_public_ticket_url_is_fetched_at_its_lan_address() {
+        const MEDIA: &[u8] = b"aliased";
+        let (scout, hits) = server(|req, _| match req.uri().path() {
+            "/p/AbC-_09" => redirect("/cdn/film.mkv".into()),
+            _ => ranged(req, MEDIA),
+        })
+        .await;
+        let lan = format!("http://{scout}");
+        let list = origins(&format!("https://d-play.invalid,{lan}"));
+        let aliases = parse_aliases(&format!("https://d-play.invalid={lan}, not-a-pair"));
+        assert_eq!(aliases.len(), 1);
+        let target =
+            vet("https://d-play.invalid/p/AbC-_09", &list).expect("the public ticket URL was refused");
+        let relay =
+            Relay::open(target.as_str(), &list, &aliases).await.expect("the aliased ticket was not relayed");
+        assert_eq!(client().get(relay.url()).send().await.unwrap().bytes().await.unwrap(), MEDIA);
+        assert!(hits.load(Ordering::SeqCst) >= 2, "scout's LAN address served the ticket and the bytes");
+        let moved = local(Url::parse("https://d-play.invalid/p/x?q=1").unwrap(), &aliases);
+        assert_eq!(moved.as_str(), format!("{lan}/p/x?q=1"));
+        let kept = local(Url::parse("https://cdn.example/f.mkv").unwrap(), &aliases);
+        assert_eq!(kept.as_str(), "https://cdn.example/f.mkv");
     }
 
     /// The target can change its answer after it was vetted. A redirect then reaches the relay, not
@@ -661,7 +732,7 @@ mod tests {
         .await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-        let relay = Relay::open(target.as_str(), &list).await.unwrap();
+        let relay = Relay::open(target.as_str(), &list, &[]).await.unwrap();
 
         let resp = client().get(relay.url()).send().await.unwrap();
         assert_eq!(resp.status(), 502);
@@ -674,7 +745,7 @@ mod tests {
         let (scout, hits) = server(|_, n| redirect(format!("/cfg/play/tok{n}"))).await;
         let list = origins(&format!("http://{scout}"));
         let target = vet(&format!("http://{scout}/cfg/play/tok"), &list).unwrap();
-        assert!(Relay::open(target.as_str(), &list).await.is_err());
+        assert!(Relay::open(target.as_str(), &list, &[]).await.is_err());
         assert_eq!(hits.load(Ordering::SeqCst), MAX_HOPS + 1);
     }
 }

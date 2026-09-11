@@ -508,6 +508,7 @@ mod tests {
             // Never the live API from a test: port 1 refuses instantly.
             os_api_base: "http://127.0.0.1:1".to_string(),
             scout_origins: Vec::new(),
+            scout_aliases: Vec::new(),
             revocation: Default::default(),
         }
     }

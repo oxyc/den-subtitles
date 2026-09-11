@@ -36,6 +36,8 @@ pub struct Config {
     /// origin(s) the app's stream URLs carry. Empty → Tier 2 is off. See `resync.rs` for why there is
     /// no open default.
     pub scout_origins: Vec<crate::resync::Origin>,
+    /// Public scout names fetched at their LAN address (`SCOUT_ALIASES`, `resync::parse_aliases`).
+    pub scout_aliases: Vec<(crate::resync::Origin, crate::resync::Origin)>,
 }
 
 fn env_opt(key: &str) -> Option<String> {
@@ -70,6 +72,7 @@ impl Config {
             log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v != "0"),
             os_api_base: crate::opensubtitles::API.to_string(),
             scout_origins: crate::resync::parse_origins(&env_opt("SCOUT_ORIGINS").unwrap_or_default()),
+            scout_aliases: crate::resync::parse_aliases(&env_opt("SCOUT_ALIASES").unwrap_or_default()),
         }
     }
 }

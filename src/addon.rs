@@ -619,13 +619,14 @@ async fn sync_and_cache(
         // alass is handed a loopback relay, never `url`: ffmpeg would re-resolve the name and follow
         // redirects on its own (see `resync.rs`). The relay follows the redirect chain here, before
         // the permit, for the reason Tier 1 fetches its reference first — it is network work.
-        let aligned = match resync::Relay::open(&url, &state.cfg.scout_origins).await {
-            Ok(relay) => {
-                let _slot = state.sync_slots.acquire().await;
-                state.sync.sync_to_audio(&target, &relay.url(), &tag).await
-            }
-            Err(e) => Err(e),
-        };
+        let aligned =
+            match resync::Relay::open(&url, &state.cfg.scout_origins, &state.cfg.scout_aliases).await {
+                Ok(relay) => {
+                    let _slot = state.sync_slots.acquire().await;
+                    state.sync.sync_to_audio(&target, &relay.url(), &tag).await
+                }
+                Err(e) => Err(e),
+            };
         match aligned {
             Ok(s) => Some(s),
             Err(e) => {
@@ -2335,6 +2336,7 @@ mod translate_retry_tests {
             // dependency was invisible.
             os_api_base: "http://127.0.0.1:1".into(),
             scout_origins: Vec::new(),
+            scout_aliases: Vec::new(),
             revocation: Default::default(),
         })
     }
