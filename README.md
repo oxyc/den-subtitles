@@ -140,6 +140,14 @@ Supported providers: OpenAI, Google, Anthropic, xAI, OpenRouter (chat) and DeepL
 is the cheap/fast/decent tier per provider; step up to a bigger model to re-translate a title that
 reads badly (the cache is keyed by provider+model, so it just overwrites).
 
+DeepL API Free and Pro keys both work; the key's `:fx` suffix selects the Free endpoint. Paid
+translations retain their original source file ID with the SRT, so replacing a title's source for a
+new language cannot make an existing translation inherit the replacement's timing. Older cached
+SRTs remain usable and are aligned conservatively when a hash-matched reference is available.
+New translation cache entries store a JSON envelope containing both source and SRT. Upgrades read
+existing plain-SRT entries; downgrades need a pre-upgrade cache snapshot because older binaries do
+not understand the new envelopes.
+
 No user credential lives in the environment. The environment is addon infrastructure only, all of
 it optional (`.env.example` lists the same):
 

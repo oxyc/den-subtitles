@@ -998,6 +998,22 @@ fn translate_body_key(
     )
 }
 
+/// Keep timing provenance in the same cache entry as the paid text. The title's source pin may
+/// change when another language is added; it says nothing about an existing translation's timings.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TranslatedBody {
+    source: Option<i64>,
+    srt: String,
+}
+
+fn cached_translation(state: &AppState, key: &str) -> Option<TranslatedBody> {
+    state.cache.get(key).map(|raw| {
+        // Existing plain-SRT entries remain usable, but their source is unknown. Align them when
+        // an anchor exists instead of guessing from the mutable title pin or buying them again.
+        serde_json::from_str(&raw).unwrap_or(TranslatedBody { source: None, srt: raw })
+    })
+}
+
 /// The subtitle to translate FROM: English for preference, best-quality otherwise.
 ///
 /// Judged as text, so the pick does not depend on which encode is playing — see
@@ -1349,6 +1365,7 @@ pub async fn handle_translate(
     let pin_key = source_pin_key(&imdb, season, episode);
     let pinned = state.cache.get(&pin_key).and_then(|v| v.parse::<i64>().ok());
     let body_key = translate_body_key(&imdb, season, episode, &lang_key, llm);
+    let cached_body = cached_translation(state, &body_key);
 
     // The hashed list is only worth asking for when there is a hash AND auto-sync is on: without
     // either there is no anchor to find, and the answer would be the list we already have.
@@ -1411,14 +1428,19 @@ pub async fn handle_translate(
     });
     // The translated body inherits its source's timing, so it needs the same Tier-1 correction the
     // source itself would get from the picker.
-    let ref_id = align_for(pinned);
+    let ref_id = align_for(cached_body.as_ref().and_then(|body| body.source));
     let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
 
     // Read once, not twice. Asking again on the settled path could miss what the first read saw —
     // LRU eviction and TTL expiry both happen between two reads — and answer "not translated" for a
     // translation that exists and had just been confirmed.
     // The `Server-Timing` phase for the translated text: `cache;desc=hit`, or how long the run took.
-    let phase = if let Some(settled) = state.cache.get(&cache_key) {
+    let settled = if cache_key == body_key {
+        cached_body.as_ref().map(|body| body.srt.clone())
+    } else {
+        state.cache.get(&cache_key)
+    };
+    let phase = if let Some(settled) = settled {
         if !want_json {
             // `immutable` only when this really is the answer. With the anchor merely unknown the
             // body may well be superseded within the thirty seconds the search marker lasts, and a
@@ -1433,10 +1455,10 @@ pub async fn handle_translate(
     } else {
         // The expensive half: the translated text. `used_source` carries back which file it came
         // from, so the alignment decision can be re-answered from a source that is actually known.
-        let mut used_source = pinned;
+        let mut used_source = cached_body.as_ref().and_then(|body| body.source);
         let mut phase = CACHE_HIT.to_string();
-        let translated = match state.cache.get(&body_key) {
-            Some(body) => body,
+        let translated = match cached_body {
+            Some(body) => body.srt,
             None => {
                 // One film, one bill. Two devices on the same title — or a second tap during a run
                 // that legitimately takes minutes — each used to start their own full translation,
@@ -1450,9 +1472,12 @@ pub async fn handle_translate(
                 if state.cache.get(&failed_recently).is_some() {
                     return httputil::error(StatusCode::BAD_GATEWAY, "translation_backoff");
                 }
-                match state.cache.get(&body_key) {
+                match cached_translation(state, &body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
-                    Some(body) => body,
+                    Some(body) => {
+                        used_source = body.source;
+                        body.srt
+                    }
                     // Only here, with every cache read behind us, is a source actually needed — so
                     // only here is one resolved. A pin miss costs a live search, a probe per
                     // candidate and a blocking pin write, and none of that belongs on a request whose
@@ -1980,7 +2005,12 @@ async fn produce_translation(
         }
     })?;
     let body = srt::serialize(&translated);
-    state.cache.put(body_key.to_string(), body.clone(), CACHE_TTL);
+    let stored = TranslatedBody { source: Some(source_file_id), srt: body.clone() };
+    state.cache.put(
+        body_key.to_string(),
+        serde_json::to_string(&stored).expect("translation serializes"),
+        CACHE_TTL,
+    );
     Ok(body)
 }
 
@@ -2354,6 +2384,65 @@ mod translate_retry_tests {
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(r#"{"osKey":"os-test","provider":"openai","apiKey":"llm-test","model":"m"}"#)
+    }
+
+    #[tokio::test]
+    async fn cached_translation_alignment_uses_its_own_source_after_a_repick() {
+        const RAW: &str = "1\n00:00:01,000 --> 00:00:02,000\nBonjour\n";
+        const ALIGNED: &str = "1\n00:00:50,000 --> 00:00:51,000\nBonjour\n";
+        // An old plain-SRT entry has unknown provenance; an entry actually made from the new
+        // hash-matched source is already aligned. Neither case should require another LLM call.
+        for (name, source, legacy, want) in [
+            ("old-source", Some(1), false, ALIGNED),
+            ("legacy-source", None, true, ALIGNED),
+            ("current-source", Some(2), false, RAW),
+        ] {
+            let state = state(name);
+            let config = config_segment();
+            let cfg = state.decode_config(&config).unwrap();
+            let key = translate_body_key("tt123", None, None, "FR", cfg.llm.as_ref().unwrap());
+            let stored = if legacy {
+                RAW.to_string()
+            } else {
+                serde_json::to_string(&TranslatedBody { source, srt: RAW.into() }).unwrap()
+            };
+            state.cache.put(key.clone(), stored, CACHE_TTL);
+            state.cache.put(source_pin_key("tt123", None, None), "2".into(), SOURCE_PIN_TTL);
+            let anchor = opensubtitles::Subtitle {
+                file_id: 2,
+                lang: "en".into(),
+                hash_match: true,
+                downloads: 10,
+                release: String::new(),
+                hd: false,
+                fps: 24.0,
+                from_trusted: true,
+                machine_translated: false,
+                ai_translated: false,
+                ratings: 8.0,
+            };
+            state.cache.put(
+                "search:tt123:0:0:1111111111111111".into(),
+                serde_json::to_string(&vec![anchor]).unwrap(),
+                SEARCH_TTL,
+            );
+            state.cache.put(sync_cache_key(&key, &None, Some(2)), ALIGNED.into(), CACHE_TTL);
+            let resp = handle_translate(
+                &state,
+                &HeaderMap::new(),
+                &config,
+                "tt123",
+                "videoHash=1111111111111111",
+                "French",
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            use http_body_util::BodyExt;
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], want.as_bytes(), "{name}");
+        }
     }
 
     /// A film's LLM bill must not be re-paid on every tap. The `.json` and `.srt` forms are two
