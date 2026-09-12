@@ -1129,13 +1129,21 @@ enum Auth {
 /// mis-classifying it there is what killed whole films twice.
 /// DeepL's root, a function for the same reason `chat_base` is: the reply handling below had no
 /// test at all, and that is where these bugs live.
+fn deepl_endpoint(api_key: &str) -> &'static str {
+    if api_key.ends_with(":fx") {
+        "https://api-free.deepl.com"
+    } else {
+        "https://api.deepl.com"
+    }
+}
+
 #[cfg(not(test))]
-fn deepl_base() -> String {
-    "https://api-free.deepl.com".to_string()
+fn deepl_base(api_key: &str) -> String {
+    deepl_endpoint(api_key).to_string()
 }
 
 #[cfg(test)]
-fn deepl_base() -> String {
+fn deepl_base(_api_key: &str) -> String {
     DEEPL_BASE.with(|b| b.borrow().clone()).unwrap_or_else(|| "http://127.0.0.1:1".to_string())
 }
 
@@ -1210,7 +1218,7 @@ async fn deepl_translate(
     };
     let body = json!({ "text": sources, "target_lang": code });
     let resp = client
-        .post(format!("{}/v2/translate", deepl_base()))
+        .post(format!("{}/v2/translate", deepl_base(&llm.api_key)))
         .timeout(LLM_TIMEOUT)
         .header("Authorization", format!("DeepL-Auth-Key {}", llm.api_key))
         .json(&body)
@@ -2868,6 +2876,12 @@ mod provider_reply_tests {
 #[cfg(test)]
 mod deepl_tests {
     use super::*;
+
+    #[test]
+    fn free_and_pro_keys_select_their_own_endpoint() {
+        assert_eq!(deepl_endpoint("test-free-key:fx"), "https://api-free.deepl.com");
+        assert_eq!(deepl_endpoint("test-pro-key"), "https://api.deepl.com");
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn deepl(body: &'static str) -> Result<Vec<String>, CallError> {
