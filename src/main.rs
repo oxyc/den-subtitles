@@ -684,6 +684,7 @@ mod tests {
         let etag = first.headers().get(ETAG).expect("an ETag").clone();
         let body: serde_json::Value = serde_json::from_str(&body_string(first).await).unwrap();
         assert_eq!(body["denInstallId"], IID, "{body}");
+        assert_eq!(body["denAttribution"][0]["link"], "OpenSubtitles.com", "{body}");
 
         let without = format!("/{}/manifest.json", plain_segment(r#"{"osKey":"o"}"#));
         for uri in [without, "/manifest.json".to_string()] {

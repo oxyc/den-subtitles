@@ -102,6 +102,12 @@ pub fn manifest(install: Option<&crate::userconfig::UserConfig>) -> Value {
         "idPrefixes": ["tt"],
         "catalogs": [],
         "behaviorHints": { "configurable": true, "configurationRequired": !configured },
+        // The source this addon's subtitles come from, for the client's credits (den-spec attribution-v1).
+        "denAttribution": [{
+            "text": "Subtitles from OpenSubtitles.com.",
+            "link": "OpenSubtitles.com",
+            "url": "https://www.opensubtitles.com",
+        }],
     });
     if let Some(iid) = install.and_then(|cfg| cfg.iid.as_deref()) {
         manifest["denInstallId"] = json!(iid);
