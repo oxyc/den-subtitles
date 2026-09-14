@@ -126,15 +126,21 @@ pub fn json<T: Serialize>(status: StatusCode, value: &T, cache_control: &str) ->
     b.body(Full::new(Bytes::from(bytes))).unwrap()
 }
 
-/// A settled subtitle: this file_id/sync variant is byte-stable forever, so `immutable` and a year.
+/// The caching directive of a settled subtitle: this file_id/sync variant is byte-stable forever, so
+/// `immutable` and a year. `private` because it is served under an install's config segment, which
+/// is that install's credentials — a shared cache keyed on the URL would be holding them.
+pub const SETTLED_SRT: &str = "private, max-age=31536000, immutable";
+
+/// A settled subtitle (see `SETTLED_SRT`).
 pub fn srt(body: String) -> Response<Body> {
-    srt_cached(body, "public, max-age=31536000, immutable")
+    srt_cached(body, SETTLED_SRT)
 }
 
 /// A subtitle we may yet serve differently — the requested alignment failed and this is the raw
-/// fallback. `immutable` would pin the client to it for a year, so it must revalidate instead.
+/// fallback. `immutable` would pin the client to it for a year, so it is stored but revalidated on
+/// every use; the ETag makes that revalidation a 304 while the body has not changed.
 pub fn srt_provisional(body: String) -> Response<Body> {
-    srt_cached(body, "public, max-age=60, must-revalidate")
+    srt_cached(body, "private, no-cache")
 }
 
 fn srt_cached(body: String, cache_control: &str) -> Response<Body> {
@@ -146,6 +152,48 @@ fn srt_cached(body: String, cache_control: &str) -> Response<Body> {
         .header(ETAG, etag)
         .body(Full::new(Bytes::from(body)))
         .unwrap()
+}
+
+/// A strong ETag naming WHAT a body is rather than hashing its bytes, for a response whose bytes
+/// are fixed by its identity. It can be computed before the body exists, so a conditional request
+/// is answered without fetching anything. The `-id` suffix is outside the hex alphabet `etag_of`
+/// ends in, so the two kinds can never be equal.
+pub fn identity_etag(identity: &str) -> String {
+    format!("\"{:016x}-id\"", stable_hash(identity.as_bytes()))
+}
+
+/// Whether a request's `If-None-Match` matches `etag`.
+pub fn if_none_match(req_headers: &HeaderMap, etag: &str) -> bool {
+    let Ok(etag) = HeaderValue::from_str(etag) else { return false };
+    req_headers.get(IF_NONE_MATCH).is_some_and(|inm| if_none_match_matches(inm, &etag))
+}
+
+/// A bodiless `304 Not Modified` carrying the validator and the caching directive it revalidated.
+pub fn not_modified(etag: &str, cache_control: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(CACHE_CONTROL, cache_control)
+        .header(ETAG, etag)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+/// The ETag of the WebVTT rendering of an SRT whose ETag is `srt_etag`.
+///
+/// Derived from the SRT one rather than from the converted bytes, so a conditional request can be
+/// answered WITHOUT converting. Conversion is a full parse and re-serialize of the whole document,
+/// and `apply_conditional` runs after the router — so every `If-None-Match` hit was paying for a body
+/// it then threw away, on the one runtime thread. Derived, not invented: the SRT ETag already changes
+/// whenever the bytes do.
+pub fn vtt_etag(srt_etag: &str) -> String {
+    /// Bumped whenever `serialize_vtt` changes what it emits. The validator is derived from the SRT
+    /// ETag, which does not move when the CONVERTER moves — so without this, changing the rendering
+    /// (as escaping the payload did) leaves every revalidating client and proxy on the old output.
+    const RENDERING: u32 = 2;
+
+    let mut seed = srt_etag.as_bytes().to_vec();
+    seed.extend_from_slice(&RENDERING.to_le_bytes());
+    format!("\"{:016x}-vtt\"", stable_hash(&seed))
 }
 
 /// Re-render a subtitle response as WebVTT.
@@ -171,32 +219,11 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
     let cache_control =
         resp.headers().get(CACHE_CONTROL).and_then(|v| v.to_str().ok()).unwrap_or("no-store").to_string();
 
-    // The VTT ETag is derived from the SRT one rather than from the converted bytes, so a
-    // conditional request can be answered WITHOUT converting. Conversion is a full parse and
-    // re-serialize of the whole document, and `apply_conditional` runs after the router — so every
-    // `If-None-Match` hit was paying for a body it then threw away, on the one runtime thread.
-    // Derived, not invented: the SRT ETag already changes whenever the bytes do.
-    /// Bumped whenever `serialize_vtt` changes what it emits. The validator is derived from the SRT
-    /// ETag, which does not move when the CONVERTER moves — so without this, changing the rendering
-    /// (as escaping the payload did) leaves every revalidating client and proxy on the old output.
-    const RENDERING: u32 = 2;
-
-    let vtt_etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok()).map(|srt_etag| {
-        let mut seed = srt_etag.as_bytes().to_vec();
-        seed.extend_from_slice(&RENDERING.to_le_bytes());
-        format!("\"{:016x}-vtt\"", stable_hash(&seed))
-    });
-    if let Some(etag) = &vtt_etag {
-        if req_headers
-            .get(IF_NONE_MATCH)
-            .is_some_and(|inm| if_none_match_matches(inm, &HeaderValue::from_str(etag).unwrap()))
-        {
-            return Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(CACHE_CONTROL, cache_control)
-                .header(ETAG, etag)
-                .body(Full::new(Bytes::new()))
-                .unwrap();
+    // See `vtt_etag` for why the validator is derived rather than hashed from the converted bytes.
+    let derived = resp.headers().get(ETAG).and_then(|v| v.to_str().ok()).map(vtt_etag);
+    if let Some(etag) = &derived {
+        if if_none_match(req_headers, etag) {
+            return not_modified(etag, &cache_control);
         }
     }
     // `Full` is already in memory, so this await resolves immediately and cannot stall the thread.
@@ -211,7 +238,7 @@ pub async fn to_vtt(resp: Response<Body>, req_headers: &HeaderMap) -> Response<B
     let vtt = crate::srt::serialize_vtt(&crate::srt::parse(srt));
     // The SRT response's own head, so everything else the handler said about this body — its caching
     // directive, `Server-Timing`, `X-Den-Degraded` — carries over; only the type and validator change.
-    let etag = vtt_etag.unwrap_or_else(|| etag_of(vtt.as_bytes()));
+    let etag = derived.unwrap_or_else(|| etag_of(vtt.as_bytes()));
     parts.headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/vtt; charset=utf-8"));
     parts.headers.insert(ETAG, HeaderValue::from_str(&etag).unwrap());
     Response::from_parts(parts, Full::new(Bytes::from(vtt)))
@@ -381,8 +408,28 @@ mod tests {
     async fn a_provisional_body_is_still_provisional_as_vtt() {
         let out = to_vtt(srt_provisional(SRT.to_string()), &HeaderMap::new()).await;
         let cc = out.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap().to_string();
-        assert!(!cc.contains("immutable"), "a stand-in became immutable: {cc}");
-        assert!(cc.contains("must-revalidate"));
+        assert_eq!(cc, "private, no-cache", "a stand-in is revalidated on every use");
+        assert!(out.headers().get(ETAG).is_some(), "and carries the validator that makes that a 304");
+    }
+
+    /// Subtitle bodies are served under an install's config segment, so no shared cache may keep
+    /// them; a settled one is still a year and `immutable` for the client that fetched it.
+    #[test]
+    fn subtitle_bodies_are_private() {
+        let cc = |r: Response<Body>| r.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap().to_string();
+        assert_eq!(cc(srt(SRT.to_string())), "private, max-age=31536000, immutable");
+        assert_eq!(cc(srt_provisional(SRT.to_string())), "private, no-cache");
+    }
+
+    /// An identity validator can never collide with a body-hash one: a stand-in's ETag must not be
+    /// mistaken for the settled body's by the early 304.
+    #[test]
+    fn an_identity_etag_is_never_a_body_etag() {
+        let id = identity_etag("os:42");
+        assert!(id.starts_with('"') && id.ends_with("-id\""), "{id}");
+        assert_eq!(id, identity_etag("os:42"), "stable for one identity");
+        assert_ne!(id, identity_etag("os:42:ref:7"));
+        assert!(!etag_of(b"os:42").ends_with("-id\""));
     }
 
     /// A conditional request is answered WITHOUT converting. Conversion is a full parse and

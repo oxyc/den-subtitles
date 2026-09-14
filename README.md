@@ -79,15 +79,26 @@ The subtitles, subtitle and translate responses carry `Server-Timing`, naming wh
 `opensubtitles;dur=`, `download;dur=`, `sync;dur=` (when a sync tier ran), `translate;dur=`, or
 `cache;desc=hit` — and `total;dur=`, in milliseconds. An answer that is a fallback carries
 `X-Den-Degraded: <reason>`: `upstream_unavailable` for a subtitles list left empty because the
-OpenSubtitles search failed (or a translation served unaligned because its anchor search failed), and
-`sync_failed` for a subtitle served unaligned because its sync failed. A normal answer carries neither
-reason.
+OpenSubtitles search failed (or a translation served unaligned because its anchor search failed),
+`stale_search` for a subtitles list answered from an earlier search because the live one failed (a
+search stays fresh for six hours and is kept seven days past that for this), and `sync_failed` for a
+subtitle served unaligned because its sync failed. A normal answer carries no reason.
+
+Caching. `/manifest.json`, `/configure` and `/config-key` are `public`. Everything under `/<config>/`
+is `private`, because the segment is the install's credentials: the configured manifest
+(`max-age=3600, stale-while-revalidate=600`), the subtitles list (`max-age=3600,
+stale-while-revalidate=3600, stale-if-error=86400`, or `max-age=60` for a `stale_search` answer), and
+a settled subtitle, proxied or translated (`max-age=31536000, immutable`). A subtitle served unaligned
+because its sync failed is `private, no-cache`. Every cacheable answer carries a strong `ETag` and
+answers a matching `If-None-Match` with a 304. A settled `/subtitle` ETag names the file and its
+alignment rather than hashing the bytes, so that 304 comes back without reading the cache or calling
+OpenSubtitles.
 
 A refusal says when to come back. The translate route's 429 `allowance_exhausted` carries
 `Retry-After` (seconds to the end of the UTC day the allowance is counted in) and the IETF draft's
 `RateLimit-Policy: "daily";q=50;w=86400` and `RateLimit: "daily";r=0;t=<seconds>`; its 502
 `translation_backoff` carries `Retry-After` with the backoff left. All three are exposed to browser
-clients. Upstream, a 429 (or a 503 naming a wait) from OpenSubtitles pauses that API key for every
+clients, as are `ETag`, `Server-Timing` and `X-Den-Degraded`. Upstream, a 429 (or a 503 naming a wait) from OpenSubtitles pauses that API key for every
 title — for its `Retry-After`, capped at an hour, else an exponential backoff — and a 406 pauses its
 downloads until the quota's `reset_time_utc`; a 429 from a translation provider pauses that provider
 key across batches and films. The first successful answer ends a pause.

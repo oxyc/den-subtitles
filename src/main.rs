@@ -50,6 +50,10 @@ const CONFIGURE_PAGE: &str = include_str!("configure.html");
 /// client answer from its copy while it re-checks, the same as every other den addon.
 const STATIC_CACHE: &str = "public, max-age=3600, stale-while-revalidate=600";
 
+/// The configured manifest: the same windows, but `private`. Its URL is the install's config segment
+/// and its body names the install (`denInstallId`), so no shared cache may keep it.
+const INSTALL_CACHE: &str = "private, max-age=3600, stale-while-revalidate=600";
+
 /// The sealing key can rotate, so its freshness window is short; the ETag still busts a stale copy.
 const KEY_CACHE: &str = "public, max-age=300";
 
@@ -106,10 +110,12 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
     // Retry-After and the RateLimit pair are on refusals, and are how a browser client knows when to
-    // come back.
+    // come back. ETag is what a client that keeps its own cache sends back as If-None-Match.
     resp.headers_mut().insert(
         "access-control-expose-headers",
-        HeaderValue::from_static("Server-Timing, X-Den-Degraded, Retry-After, RateLimit, RateLimit-Policy"),
+        HeaderValue::from_static(
+            "Server-Timing, X-Den-Degraded, Retry-After, RateLimit, RateLimit-Policy, ETag",
+        ),
     );
     resp.headers_mut().insert("timing-allow-origin", HeaderValue::from_static("*"));
     // Off by default, and then this bool is the whole cost. The path is redacted and the query left
@@ -176,7 +182,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         "manifest.json" => match state.decode_config(config) {
             // The ETag is over the body, and the body names the install, so one install's cached
             // copy never answers another's If-None-Match.
-            Some(cfg) => httputil::json(StatusCode::OK, &addon::manifest(Some(&cfg)), STATIC_CACHE),
+            Some(cfg) => httputil::json(StatusCode::OK, &addon::manifest(Some(&cfg)), INSTALL_CACHE),
             None => httputil::json(
                 StatusCode::BAD_REQUEST,
                 &serde_json::json!({"error": "bad_config"}),
@@ -204,9 +210,17 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                     let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
                     let resync = query_get(query, "resync");
                     let lang = query_get(query, "lang");
-                    let resp =
-                        addon::handle_subtitle_file(state, config, file_id, ref_id, resync, lang.as_deref())
-                            .await;
+                    let resp = addon::handle_subtitle_file(
+                        state,
+                        &parts.headers,
+                        config,
+                        file_id,
+                        ref_id,
+                        resync,
+                        lang.as_deref(),
+                        want_vtt,
+                    )
+                    .await;
                     if want_vtt {
                         httputil::to_vtt(resp, &parts.headers).await
                     } else {
@@ -921,6 +935,11 @@ mod tests {
         let resp = handle_request(state, request(hyper::Method::GET, &uri)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get(httputil::X_DEN_DEGRADED).is_none(), "a normal answer is not degraded");
+        // Private: the URL is the install's config segment, and so is every `url` in the body.
+        assert_eq!(
+            resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(),
+            "private, max-age=3600, stale-while-revalidate=3600, stale-if-error=86400"
+        );
         let timing = server_timing(&resp);
         assert!(timing.starts_with("cache;desc=hit, total;dur="), "{timing}");
     }
@@ -1013,7 +1032,7 @@ mod tests {
             // A cross-origin client reads only what is exposed, and a refusal's wait is the part it
             // most needs.
             let exposed = resp.headers().get("access-control-expose-headers").unwrap().to_str().unwrap();
-            for name in ["Retry-After", "RateLimit", "RateLimit-Policy"] {
+            for name in ["Retry-After", "RateLimit", "RateLimit-Policy", "ETag"] {
                 assert!(exposed.split(", ").any(|h| h == name), "{name} is not exposed: {exposed}");
             }
         }
@@ -1079,7 +1098,7 @@ mod tests {
         // The configured manifest runs with sealing off: with it on, only a sealed segment is an install.
         let cases = [
             ("/manifest.json".to_string(), STATIC_CACHE, VEC_PRIV_B64),
-            (format!("/{seg}/manifest.json"), STATIC_CACHE, ""),
+            (format!("/{seg}/manifest.json"), INSTALL_CACHE, ""),
             ("/configure".to_string(), STATIC_CACHE, VEC_PRIV_B64),
             ("/config-key".to_string(), KEY_CACHE, VEC_PRIV_B64),
         ];
@@ -1089,7 +1108,99 @@ mod tests {
             assert_eq!(resp.headers().get(hyper::header::CACHE_CONTROL).unwrap(), want, "{uri}");
         }
         assert_eq!(STATIC_CACHE, "public, max-age=3600, stale-while-revalidate=600");
+        assert_eq!(INSTALL_CACHE, "private, max-age=3600, stale-while-revalidate=600");
         assert_eq!(KEY_CACHE, "public, max-age=300");
+    }
+
+    const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+
+    /// A state with a cache directory of its own. `test_config`'s is shared, and its disk tier would
+    /// carry one test's bodies into another's cold cache.
+    fn isolated_state(name: &str) -> Arc<AppState> {
+        let mut cfg = test_config("", "");
+        cfg.cache_dir =
+            std::env::temp_dir().join(format!("den-subtitles-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cfg.cache_dir);
+        AppState::new(cfg)
+    }
+
+    async fn get_with(state: Arc<AppState>, uri: &str, inm: Option<&HeaderValue>) -> Response<Body> {
+        let mut req = Request::builder().uri(uri);
+        if let Some(v) = inm {
+            req = req.header(hyper::header::IF_NONE_MATCH, v);
+        }
+        handle_request(state, req.body(()).unwrap()).await
+    }
+
+    /// A settled subtitle's validator names what it is, so a revalidation is answered before the cache
+    /// is read or anything is downloaded. The upstream here refuses every connection and the cache is
+    /// cold, so a 304 can only have come from that early check.
+    #[tokio::test]
+    async fn a_settled_subtitle_revalidates_without_a_download() {
+        use hyper::header::{CACHE_CONTROL, ETAG};
+        let seg = os_only_segment();
+        let mut srt_etag = None;
+        for ext in ["srt", "vtt"] {
+            // Served once from a warm cache, which is how a client comes to hold the body.
+            let warm = isolated_state(&format!("early-304-warm-{ext}"));
+            warm.cache.put("os:91001".into(), SRT.into(), Duration::from_secs(60));
+            let uri = format!("/{seg}/subtitle/91001.{ext}");
+            let first = get_with(warm, &uri, None).await;
+            assert_eq!(first.status(), StatusCode::OK, "{ext}");
+            assert_eq!(first.headers().get(CACHE_CONTROL).unwrap(), httputil::SETTLED_SRT, "{ext}");
+            let etag = first.headers().get(ETAG).expect("a settled body carries an ETag").clone();
+            if ext == "srt" {
+                srt_etag = Some(etag.clone());
+            }
+
+            let cold = || isolated_state(&format!("early-304-cold-{ext}"));
+            let resp = get_with(cold(), &uri, Some(&etag)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{ext}");
+            assert_eq!(resp.headers().get(ETAG).unwrap(), &etag, "{ext}");
+            assert_eq!(resp.headers().get(CACHE_CONTROL).unwrap(), httputil::SETTLED_SRT, "{ext}");
+            assert!(body_string(resp).await.is_empty(), "{ext}");
+
+            // A validator that does not match still has to fetch — and here the fetch fails.
+            let resp = get_with(cold(), &uri, Some(&HeaderValue::from_static("\"other\""))).await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{ext}");
+        }
+
+        // The SRT and VTT validators differ, so one never answers for the other.
+        let srt_etag = srt_etag.unwrap();
+        let vtt_uri = format!("/{seg}/subtitle/91001.vtt");
+        let resp = get_with(isolated_state("early-304-cross"), &vtt_uri, Some(&srt_etag)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        // Another alignment of the same file is a different body, with a different validator.
+        let ref_uri = format!("/{seg}/subtitle/91001.srt?ref=91009");
+        let resp = get_with(isolated_state("early-304-ref"), &ref_uri, Some(&srt_etag)).await;
+        assert_ne!(resp.status(), StatusCode::NOT_MODIFIED);
+
+        // The config is still checked first: a revoked install gets no 304 for a body it holds.
+        let revoked_seg = plain_segment(&format!(r#"{{"osKey":"os-test","iid":"{IID}"}}"#));
+        let uri = format!("/{revoked_seg}/subtitle/91001.srt");
+        let resp = get_with(revoking_state(IID, "0"), &uri, Some(&srt_etag)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A stand-in's validator hashes its bytes, so it never earns the early 304: the client holding
+    /// an unaligned body has to come back for the aligned one.
+    #[tokio::test]
+    async fn a_stand_in_subtitle_never_revalidates_early() {
+        use hyper::header::{CACHE_CONTROL, ETAG};
+        let seg = os_only_segment();
+        let warm = isolated_state("stand-in-warm");
+        warm.cache.put("os:91002".into(), SRT.into(), Duration::from_secs(60));
+        // The reference cannot be downloaded, so the alignment fails and the raw body stands in.
+        let uri = format!("/{seg}/subtitle/91002.srt?ref=91003");
+        let first = get_with(warm, &uri, None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers().get(httputil::X_DEN_DEGRADED).unwrap(), "sync_failed");
+        assert_eq!(first.headers().get(CACHE_CONTROL).unwrap(), "private, no-cache");
+        let etag = first.headers().get(ETAG).expect("a stand-in keeps its validator").clone();
+
+        let resp = get_with(isolated_state("stand-in-cold"), &uri, Some(&etag)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// Tenths of a millisecond, the format every den addon's `total` uses.

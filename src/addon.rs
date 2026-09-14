@@ -47,6 +47,9 @@ const BODY_PREFIXES: [&str; 3] = [cache::OS_NS, cache::SEARCH_NS, cache::TRANSLA
 // Search results turn over as new subs are uploaded, so a short TTL — enough to spare repeated
 // round-trips when the app reopens a title, not so long that fresh uploads stay hidden.
 const SEARCH_TTL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
+/// How long a search list is kept past `SEARCH_TTL`: not served as fresh, only as the fallback when a
+/// live search fails, which beats an empty list for a title that had subtitles last week.
+const SEARCH_STALE_GRACE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 /// How long a failed search is remembered as failed. Short — this is a blip, not a verdict — but
 /// long enough that the queue behind a single-flighted miss does not run one live search each,
 /// serially, at up to the client timeout apiece.
@@ -238,9 +241,10 @@ pub async fn handle_subtitles(
     let started = Instant::now();
     let searched = cached_search(state, &client, config, &imdb, season, episode, hash.as_deref()).await;
     let timing = match &searched {
-        Ok((_, true)) => CACHE_HIT.to_string(),
+        Ok((_, Searched::Cached)) => CACHE_HIT.to_string(),
         _ => format!("opensubtitles;dur={}", started.elapsed().as_millis()),
     };
+    let stale = matches!(searched, Ok((_, Searched::Stale)));
     let mut subs = match searched {
         Ok((s, _)) => s,
         // Empty-200 is the correct Stremio shape for "nothing"; `cached_search` has already logged
@@ -302,10 +306,17 @@ pub async fn handle_subtitles(
         .collect();
     // A strong ETag (hash of this serialized ranked list) is attached by `json()`; add
     // stale-while-revalidate so a client can serve the last list instantly while refreshing.
+    // `private`: the URL is the install's config segment and every `url` in the body carries it too.
+    if stale {
+        // The last good list, past its freshness, because the live search failed. Worth serving over
+        // an empty one, but only briefly: the client should ask again soon for the real answer.
+        let resp = httputil::json(StatusCode::OK, &json!({"subtitles": out}), "private, max-age=60");
+        return httputil::add_timing(httputil::degraded(resp, "stale_search"), &timing);
+    }
     let resp = httputil::json(
         StatusCode::OK,
         &json!({"subtitles": out}),
-        "public, max-age=3600, stale-while-revalidate=3600, stale-if-error=86400",
+        "private, max-age=3600, stale-while-revalidate=3600, stale-if-error=86400",
     );
     httputil::add_timing(resp, &timing)
 }
@@ -342,9 +353,8 @@ fn os_client<'a>(
 /// Returned UNRANKED, and cached that way: ranking is filename-specific, so each caller ranks the
 /// list for its own request.
 ///
-/// The flag is true when the list came straight out of the cache, for `Server-Timing`. A list read
-/// from the cache after waiting on another request's search counts as a search: that is where the
-/// wait went.
+/// A list past its freshness is kept for `SEARCH_STALE_GRACE` and answered with when the live search
+/// fails, marked `Searched::Stale`; with none to fall back on the failure is an `Err`.
 #[allow(clippy::too_many_arguments)]
 async fn cached_search(
     state: &Arc<AppState>,
@@ -354,7 +364,7 @@ async fn cached_search(
     season: Option<i64>,
     episode: Option<i64>,
     hash: Option<&str>,
-) -> Result<(Vec<opensubtitles::Subtitle>, bool), String> {
+) -> Result<(Vec<opensubtitles::Subtitle>, Searched), String> {
     let search_key = format!(
         "{}{imdb}:{}:{}:{}",
         cache::SEARCH_NS,
@@ -362,8 +372,11 @@ async fn cached_search(
         episode.unwrap_or(0),
         hash.unwrap_or("")
     );
-    if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
-        return Ok((hit, true));
+    let mut stale = None;
+    match read_search(state, &search_key) {
+        Some((hit, true)) => return Ok((hit, Searched::Cached)),
+        Some((old, false)) => stale = Some(old),
+        None => {}
     }
     // Single-flighted. Two requests arriving on a cold entry would each run a live search, and
     // OpenSubtitles returns one ordered page — so the two lists can differ and `translation_source`
@@ -386,8 +399,10 @@ async fn cached_search(
     // it is a closer call than it was, so anyone widening this should re-weigh it rather than cite
     // a film's LLM bill, which is no longer what is at stake.
     let _flight = state.inflight.acquire(&search_key).await;
-    if let Some(hit) = state.cache.get(&search_key).and_then(|h| serde_json::from_str(&h).ok()) {
-        return Ok((hit, false));
+    match read_search(state, &search_key) {
+        Some((hit, true)) => return Ok((hit, Searched::Live)),
+        Some((old, false)) => stale = Some(old),
+        None => {}
     }
     // The flight ahead of us may have failed. Nothing caches a failed search, so without this the
     // queue behind one miss ran a live search EACH, one after another, at up to the client timeout
@@ -402,15 +417,19 @@ async fn cached_search(
     // for a key nothing ever writes to disk — a blocking ENOENT `open` per cache-miss search.
     let fail_key = format!("{SYNCFAIL}{:016x}:{search_key}", short_hash(config));
     if state.cache.get_mem(&fail_key).is_some() {
-        return Err("search failed recently".to_string());
+        return match stale {
+            Some(old) => Ok((old, Searched::Stale)),
+            None => Err("search failed recently".to_string()),
+        };
     }
     match client.search(imdb, season, episode, "all", hash).await {
         Ok(s) => {
             state.search_succeeded();
-            if let Ok(json) = serde_json::to_string(&s) {
-                state.cache.put(search_key, json, SEARCH_TTL);
+            let entry = SearchEntry { fresh_until: unix_seconds() + SEARCH_TTL.as_secs(), subs: s };
+            if let Ok(json) = serde_json::to_string(&entry) {
+                state.cache.put(search_key, json, SEARCH_TTL + SEARCH_STALE_GRACE);
             }
-            Ok((s, false))
+            Ok((entry.subs, Searched::Live))
         }
         // Count it so /health can report `degraded` (ADDON-02). Counted HERE rather than at one call
         // site, so a translation that cannot reach OpenSubtitles is visible on /health too — it was
@@ -422,9 +441,43 @@ async fn cached_search(
                 eprintln!("search: opensubtitles failed for {imdb}: {e}");
             }
             state.cache.put_mem(fail_key, "1".into(), SEARCH_FAIL_TTL);
-            Err(e)
+            match stale {
+                Some(old) => Ok((old, Searched::Stale)),
+                None => Err(e),
+            }
         }
     }
+}
+
+/// Where `cached_search`'s list came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Searched {
+    /// Straight out of the cache, for `Server-Timing`.
+    Cached,
+    /// From a live search — or read from the cache after waiting on another request's search, which
+    /// counts as a search: that is where the wait went.
+    Live,
+    /// Past its freshness, because the live search failed.
+    Stale,
+}
+
+/// A cached search list and the wall-clock second it stops being fresh. The cache entry itself lives
+/// `SEARCH_STALE_GRACE` longer, so the list is still there to fall back on when a search fails.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchEntry {
+    fresh_until: u64,
+    subs: Vec<opensubtitles::Subtitle>,
+}
+
+/// The cached list under `key` and whether it is still fresh.
+fn read_search(state: &AppState, key: &str) -> Option<(Vec<opensubtitles::Subtitle>, bool)> {
+    let raw = state.cache.get(key)?;
+    if let Ok(entry) = serde_json::from_str::<SearchEntry>(&raw) {
+        return Some((entry.subs, entry.fresh_until > unix_seconds()));
+    }
+    // A bare list is what entries were before the stale grace: written with the fresh TTL alone, so
+    // one that is still present is still fresh.
+    serde_json::from_str(&raw).ok().map(|subs| (subs, true))
 }
 
 /// The `file_id` of a trusted timing reference for Tier-1 reference alignment: the BEST hash-matched
@@ -476,13 +529,21 @@ fn tier1_ref_for(s: &opensubtitles::Subtitle, reference: Option<i64>) -> Option<
 /// OpenSubtitles file, optionally auto-sync it (Tier 1 against a reference sub, or Tier 2 against the
 /// stream audio), cache, serve. Any sync failure falls back to the raw sub — a slightly-off sub beats
 /// none. `lang` only hints the encoding detection on a download; it is not part of any cache key.
+///
+/// A settled body's ETag names the vetted cache key rather than hashing the bytes (see
+/// `settled_subtitle_etag`), so an `If-None-Match` for it is answered with a 304 before anything is
+/// read, downloaded or aligned. `want_vtt` only decides which validator that 304 carries; the
+/// router renders the body.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_subtitle_file(
     state: &Arc<AppState>,
+    req_headers: &HeaderMap,
     config: &str,
     file_id: i64,
     ref_id: Option<i64>,
     resync_url: Option<String>,
     lang: Option<&str>,
+    want_vtt: bool,
 ) -> Response<Body> {
     let Some(cfg) = state.decode_config(config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
@@ -503,8 +564,16 @@ pub async fn handle_subtitle_file(
     let ref_id = vetted_ref(file_id, ref_id);
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
     let cache_key = sync_cache_key(&os_base_key(file_id), &resync_url, ref_id);
+    let settled_etag = settled_subtitle_etag(&cache_key);
+    let conditional_etag = match want_vtt {
+        true => httputil::vtt_etag(&settled_etag),
+        false => settled_etag.clone(),
+    };
+    if httputil::if_none_match(req_headers, &conditional_etag) {
+        return httputil::not_modified(&conditional_etag, httputil::SETTLED_SRT);
+    }
     if let Some(hit) = state.cache.get(&cache_key) {
-        return httputil::add_timing(httputil::srt(hit), CACHE_HIT);
+        return with_settled_etag(httputil::add_timing(httputil::srt(hit), CACHE_HIT), &settled_etag);
     }
     let Some(http) = state.http.as_ref() else {
         return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
@@ -527,7 +596,35 @@ pub async fn handle_subtitle_file(
     let download = format!("download;dur={}", started.elapsed().as_millis());
     let what = format!("subtitle {file_id}");
     let resp = sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &what, true).await;
-    httputil::add_timing(resp, &download)
+    with_settled_etag(httputil::add_timing(resp, &download), &settled_etag)
+}
+
+/// Bumped whenever the bytes this service serves for an existing subtitle key change — a decoding or
+/// cleaning change in `subtitle_srt`, an aligner that now produces different timings. The settled
+/// validator names the key, not the bytes, so without a bump a revalidating client keeps the old body.
+const SETTLED_SUBTITLE_BYTES: u32 = 1;
+
+/// The ETag of a settled proxied subtitle, computed from its vetted cache key alone. Sound because
+/// the key fixes the bytes: an OpenSubtitles file id names one immutable upload, and the key names
+/// the alignment applied to it — which is what `immutable` on the same response already promises.
+/// A stand-in (`srt_provisional`) keeps its body-hash ETag, which can never equal this one, so it
+/// never earns the early 304. Translations are not served through here: a re-run can change their
+/// text under the same key.
+fn settled_subtitle_etag(cache_key: &str) -> String {
+    httputil::identity_etag(&format!("{cache_key}#{SETTLED_SUBTITLE_BYTES}"))
+}
+
+/// Give a settled subtitle response the identity validator the early 304 matches; anything else (an
+/// error, a stand-in) passes through untouched.
+fn with_settled_etag(mut resp: Response<Body>, etag: &str) -> Response<Body> {
+    let settled = resp.status() == StatusCode::OK
+        && resp.headers().get(hyper::header::CACHE_CONTROL).is_some_and(|v| v == httputil::SETTLED_SRT);
+    if settled {
+        if let Ok(v) = HeaderValue::from_str(etag) {
+            resp.headers_mut().insert(hyper::header::ETAG, v);
+        }
+    }
+    resp
 }
 
 /// A cache key turned into one safe filename component, plus a per-invocation sequence number.
@@ -2285,7 +2382,7 @@ mod sync_fallback_tests {
         let cc = |r: Response<Body>| r.headers().get(CACHE_CONTROL).unwrap().to_str().unwrap().to_string();
         let provisional = cc(httputil::srt_provisional("x".into()));
         assert!(!provisional.contains("immutable"), "a stand-in must not be immutable: {provisional}");
-        assert!(provisional.contains("must-revalidate"), "the client has to come back: {provisional}");
+        assert!(provisional.contains("no-cache"), "the client has to come back: {provisional}");
         assert!(cc(httputil::srt("x".into())).contains("immutable"));
     }
 
@@ -2488,6 +2585,69 @@ mod translate_retry_tests {
             let body = resp.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], want.as_bytes(), "{name}");
         }
+    }
+
+    fn listed_sub(file_id: i64) -> opensubtitles::Subtitle {
+        opensubtitles::Subtitle {
+            file_id,
+            lang: "en".into(),
+            hash_match: false,
+            downloads: 1,
+            release: String::new(),
+            hd: false,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            ratings: 0.0,
+        }
+    }
+
+    fn store_search(state: &AppState, imdb: &str, file_id: i64, fresh_until: u64) {
+        let entry = SearchEntry { fresh_until, subs: vec![listed_sub(file_id)] };
+        state.cache.put(
+            format!("{}{imdb}:0:0:", cache::SEARCH_NS),
+            serde_json::to_string(&entry).unwrap(),
+            SEARCH_STALE_GRACE,
+        );
+    }
+
+    /// A failed search answers with the last good list rather than an empty one, marked as a fallback
+    /// and cacheable only briefly. The upstream here refuses every connection.
+    #[tokio::test]
+    async fn a_failed_search_serves_the_stale_list() {
+        use hyper::header::CACHE_CONTROL;
+        let state = state("stale-search");
+        store_search(&state, "tt0000094", 4242, unix_seconds() - 1);
+        // Twice: the second request lands inside the failure marker's window, which must not turn the
+        // fallback back into an empty list.
+        for attempt in ["live search failed", "failure marker"] {
+            let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt0000094", "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{attempt}");
+            assert_eq!(resp.headers().get(httputil::X_DEN_DEGRADED).unwrap(), "stale_search", "{attempt}");
+            assert_eq!(resp.headers().get(CACHE_CONTROL).unwrap(), "private, max-age=60", "{attempt}");
+            let timing = resp.headers().get(httputil::SERVER_TIMING).unwrap().to_str().unwrap().to_string();
+            assert!(timing.starts_with("opensubtitles;dur="), "a stale list is not a cache hit: {timing}");
+            use http_body_util::BodyExt;
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert!(String::from_utf8_lossy(&body).contains("\"os-4242\""), "{attempt}");
+        }
+    }
+
+    /// A list inside its freshness is answered from the cache without a search, as a normal answer.
+    #[tokio::test]
+    async fn a_fresh_search_entry_is_a_plain_hit() {
+        use hyper::header::CACHE_CONTROL;
+        let state = state("fresh-search");
+        store_search(&state, "tt0000095", 4243, unix_seconds() + 3600);
+        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt0000095", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(httputil::X_DEN_DEGRADED).is_none());
+        assert_eq!(
+            resp.headers().get(CACHE_CONTROL).unwrap(),
+            "private, max-age=3600, stale-while-revalidate=3600, stale-if-error=86400"
+        );
+        assert_eq!(resp.headers().get(httputil::SERVER_TIMING).unwrap(), CACHE_HIT);
     }
 
     /// A film's LLM bill must not be re-paid on every tap. The `.json` and `.srt` forms are two
