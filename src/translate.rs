@@ -40,6 +40,7 @@ use futures_util::stream::{self, StreamExt};
 use serde_json::{json, Value};
 
 use crate::logging::LogGate;
+use crate::ratelimit::{self, Pauses};
 use crate::srt::Cue;
 use crate::userconfig::{LlmConfig, Provider};
 
@@ -259,6 +260,10 @@ impl Spend {
 /// `spend` is the caller's, written as the run goes so it survives this future being DROPPED. That
 /// is the case it exists for: a client that hangs up mid-run returns no `Err`, so the caller's error
 /// handling never runs on a slot it has already charged.
+///
+/// `pauses` is shared by every run in the process, so a rate limit one film is told about holds the
+/// others on the same provider key.
+#[allow(clippy::too_many_arguments)]
 pub async fn translate(
     client: &reqwest::Client,
     llm: &LlmConfig,
@@ -267,6 +272,7 @@ pub async fn translate(
     store: &dyn BatchStore,
     spend: &Spend,
     progress: &(dyn Fn(usize, usize) + Sync),
+    pauses: &Pauses,
 ) -> Result<Vec<Cue>, TranslateError> {
     if cues.is_empty() {
         return Ok(Vec::new());
@@ -279,7 +285,7 @@ pub async fn translate(
         prefix: format!("{}:{}:{}", llm.provider.tag(), llm.model, canonical_lang(target_lang)),
     };
     run_translation(
-        &Upstream { client, llm, target_lang },
+        &Upstream { client, llm, target_lang, pauses },
         cues,
         RUN_DEADLINE,
         Some(&resume),
@@ -552,11 +558,15 @@ enum CallError {
     /// `fatal` narrows that further: the refusal is about the CREDENTIAL, not the moment, so it will
     /// happen identically for the next film. Worth telling the caller apart from a timeout, which
     /// looks the same from here and is genuinely per-title.
+    ///
+    /// `limited` says the refusal was a rate limit on the KEY — a 429, or a 503 naming a wait — which
+    /// every other batch and film on that key would hit too, so it pauses all of them.
     Upstream {
         message: String,
         retry: Option<Duration>,
         fatal: bool,
         key_certain: bool,
+        limited: bool,
     },
 }
 
@@ -565,7 +575,7 @@ enum CallError {
 /// carries its own retryability.
 impl From<String> for CallError {
     fn from(m: String) -> Self {
-        CallError::Upstream { message: m, retry: None, fatal: false, key_certain: false }
+        CallError::Upstream { message: m, retry: None, fatal: false, key_certain: false, limited: false }
     }
 }
 
@@ -574,7 +584,13 @@ impl CallError {
     /// serve this path at all. Statuses that MIGHT be worth another go are built at the call sites
     /// that have the response in hand, through `retry_after`.
     fn upstream(message: impl Into<String>) -> CallError {
-        CallError::Upstream { message: message.into(), retry: None, fatal: false, key_certain: false }
+        CallError::Upstream {
+            message: message.into(),
+            retry: None,
+            fatal: false,
+            key_certain: false,
+            limited: false,
+        }
     }
 
     fn into_message(self) -> String {
@@ -647,16 +663,24 @@ fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap
     if status.as_u16() != 429 && !status.is_server_error() {
         return None;
     }
-    // The seconds form. The HTTP-date form is legal and rare here; failing to read one just falls
-    // back to our own schedule, which is the safe direction.
-    let stated = headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        // A provider naming an hour is naming a wait longer than the whole run is allowed; the
-        // deadline check below turns that into a clean failure rather than a long doze.
-        .unwrap_or(0);
-    Some(Duration::from_secs(stated))
+    // Seconds or an HTTP-date. Reading only seconds sent a provider that names a date back to 1s/4s,
+    // well inside the window it had just asked for. Failing to read either falls back to our own
+    // schedule, which is the safe direction. A provider naming an hour is naming a wait longer than
+    // the whole run is allowed; the deadline check turns that into a clean failure, not a long doze.
+    Some(ratelimit::retry_after(headers, std::time::SystemTime::now()).unwrap_or(Duration::ZERO))
+}
+
+/// Record what a call's outcome says about the key's shared pause. Any answer ends it — a reply the
+/// contract then rejects was still let through by the provider's limiter; a rate limit starts or
+/// extends it; any other refusal leaves it alone.
+fn record_limit<T>(pauses: &Pauses, key: u64, result: &Result<T, CallError>) {
+    match result {
+        Err(CallError::Upstream { limited: true, retry, .. }) => {
+            pauses.limited(key, retry.filter(|wait| !wait.is_zero()));
+        }
+        Err(CallError::Upstream { .. }) => {}
+        Ok(_) | Err(CallError::Contract(_)) => pauses.answered(key),
+    }
 }
 
 /// Terms the whole film agrees on, as (source → translation) pairs. Deliberately the same shape as
@@ -703,6 +727,12 @@ trait BatchCall: Sync {
     /// it never sent, and would have lost its refund for it.
     fn glossary<'a>(&'a self, _sample: &'a [String], _spend: &'a Spend) -> GlossaryFuture<'a> {
         Box::pin(async { None })
+    }
+
+    /// The pause this upstream's key shares with every other batch and run on it, and the key's hash.
+    /// `None` shares nothing, which is what the contract fakes want.
+    fn pause(&self) -> Option<(&Pauses, u64)> {
+        None
     }
 }
 
@@ -772,9 +802,21 @@ struct Upstream<'a> {
     client: &'a reqwest::Client,
     llm: &'a LlmConfig,
     target_lang: &'a str,
+    pauses: &'a Pauses,
+}
+
+impl Upstream<'_> {
+    /// A provider rate-limits the key, so the key — hashed — is what a pause is filed under.
+    fn pause_key(&self) -> u64 {
+        ratelimit::key(self.llm.provider.tag(), &self.llm.api_key)
+    }
 }
 
 impl BatchCall for Upstream<'_> {
+    fn pause(&self) -> Option<(&Pauses, u64)> {
+        Some((self.pauses, self.pause_key()))
+    }
+
     fn call(
         &self,
         sources: &[String],
@@ -794,9 +836,13 @@ impl BatchCall for Upstream<'_> {
     fn glossary<'a>(&'a self, sample: &'a [String], spend: &'a Spend) -> GlossaryFuture<'a> {
         Box::pin(async move {
             // DeepL has no chat path and ignores context entirely, so there is nothing to give it.
-            // Both of these return without sending anything, which is why dispatch is marked below
-            // rather than on the way in.
-            if self.llm.provider == Provider::DeepL || sample.is_empty() {
+            // Nor to a key that is rate limited: the glossary is optional, and asking now would be
+            // the next refusal. All of these return without sending anything, which is why dispatch
+            // is marked below rather than on the way in.
+            if self.llm.provider == Provider::DeepL
+                || sample.is_empty()
+                || self.pauses.remaining(self.pause_key()).is_some()
+            {
                 return None;
             }
             let system = format!(
@@ -816,7 +862,9 @@ impl BatchCall for Upstream<'_> {
             // Past every early return, so a request is now genuinely going out. Marked before the
             // await: if the client hangs up during it, this call is charged for and we never learn.
             spend.dispatch();
-            match call_chat_typed(self.client, self.llm, &system, &user).await {
+            let result = call_chat_typed(self.client, self.llm, &system, &user).await;
+            record_limit(self.pauses, self.pause_key(), &result);
+            match result {
                 // Accepted, so billed — even when `parse_glossary` keeps nothing out of it.
                 Ok(text) => Some(parse_glossary(&text)),
                 // Never fatal either way. A film translates perfectly well without a glossary; it
@@ -981,25 +1029,44 @@ async fn call_with_retries(
     /// spend the run's deadline waiting.
     const ATTEMPTS: u32 = 3;
 
-    let mut result = upstream.call(sources, context).await;
-    for attempt in 1..ATTEMPTS {
-        let Err(CallError::Upstream { retry: Some(stated), .. }) = &result else { break };
-        // One second, then four, unless the provider named a longer wait of its own — plus a spread
-        // of up to a second. Without it the CONCURRENCY batches in flight are rate-limited together,
-        // sleep in lockstep, and burst again in the same instant, which is what got them refused.
-        //
-        // From a counter, NOT from `sources.len()`. Every batch in the window is BATCH cues long, so
-        // deriving the spread from the length handed all of them the same number and left the
-        // lockstep exactly as it was — a jitter that jittered nothing.
-        let spread = Duration::from_millis((RETRY_TICK.fetch_add(1, Ordering::Relaxed) * 373) % 1000);
-        let wait = (*stated).max(Duration::from_secs(1 << (2 * (attempt - 1)))) + spread;
+    // A spread of up to a second on every wait. Without it the CONCURRENCY batches in flight are
+    // rate-limited together, sleep in lockstep, and burst again in the same instant, which is what
+    // got them refused.
+    //
+    // From a counter, NOT from `sources.len()`. Every batch in the window is BATCH cues long, so
+    // deriving the spread from the length handed all of them the same number and left the lockstep
+    // exactly as it was — a jitter that jittered nothing.
+    let spread = || Duration::from_millis((RETRY_TICK.fetch_add(1, Ordering::Relaxed) * 373) % 1000);
+    let shared = upstream.pause();
+    let mut attempt = 1;
+    loop {
+        // Held by a rate limit that another batch — or another film on the same key — was told
+        // about. Each batch used to wait out only its own 429, so the others kept asking a provider
+        // that had already refused the key. Waited out when the run has time for it; otherwise
+        // refused without a call, since the call would be the next 429.
+        if let Some(left) = shared.and_then(|(pauses, key)| pauses.remaining(key)) {
+            let wait = left + spread();
+            if wait >= budget.remaining() {
+                return Err(CallError::upstream(format!("provider rate limited, {}s left", left.as_secs())));
+            }
+            tokio::time::sleep(wait).await;
+        }
+        let result = upstream.call(sources, context).await;
+        if let Some((pauses, key)) = shared {
+            record_limit(pauses, key, &result);
+        }
+        let Err(CallError::Upstream { retry: Some(stated), .. }) = &result else { return result };
+        if attempt >= ATTEMPTS {
+            return result;
+        }
+        // One second, then four, unless the provider named a longer wait of its own.
+        let wait = (*stated).max(Duration::from_secs(1 << (2 * (attempt - 1)))) + spread();
         if wait >= budget.remaining() {
-            break;
+            return result;
         }
         tokio::time::sleep(wait).await;
-        result = upstream.call(sources, context).await;
+        attempt += 1;
     }
-    result
 }
 
 /// Chat-model path (OpenAI / xAI / OpenRouter / Anthropic / Google). Sends a JSON array, parses a
@@ -1106,6 +1173,7 @@ async fn call_chat_typed(
             retry,
             fatal: is_credential_refusal(code),
             key_certain: is_certainly_the_key(llm.provider, code),
+            limited: ratelimit::throttled(code, resp.headers()),
         });
     }
     let v = provider_json(resp).await?;
@@ -1233,6 +1301,7 @@ async fn deepl_translate(
             retry,
             fatal: is_credential_refusal(code),
             key_certain: is_certainly_the_key(Provider::DeepL, code),
+            limited: ratelimit::throttled(code, resp.headers()),
         });
     }
     let v = provider_json(resp).await?;
@@ -2647,6 +2716,7 @@ mod contract_tests {
                 retry: Some(Duration::ZERO),
                 fatal: false,
                 key_certain: false,
+                limited: true,
             })
         });
         assert!(run_translation_t(&up, &cues(40)).await.is_err());
@@ -2673,6 +2743,7 @@ mod contract_tests {
                     retry: Some(Duration::from_secs(2)),
                     fatal: false,
                     key_certain: false,
+                    limited: true,
                 });
             }
             Ok(src.iter().map(|s| format!("T:{s}")).collect())
@@ -2702,6 +2773,7 @@ mod contract_tests {
                 retry: Some(Duration::ZERO),
                 fatal: false,
                 key_certain: false,
+                limited: false,
             })
         });
         let err = run_translation_t(&up, &cues(40)).await.expect_err("a permanent 503 must fail");
@@ -2720,6 +2792,7 @@ mod contract_tests {
                 retry: Some(Duration::from_secs(3600)),
                 fatal: false,
                 key_certain: false,
+                limited: true,
             })
         });
         let out =
@@ -2727,6 +2800,69 @@ mod contract_tests {
                 .await;
         assert!(out.is_err());
         assert_eq!(*up.calls.lock().unwrap(), 1, "an hour-long backoff was taken inside a ten-minute run");
+    }
+
+    /// A rate limit is the KEY's. Each batch used to wait out only its own 429, so the other batches in
+    /// the window — and every other film on the same key — kept asking a provider that had just
+    /// refused it. One pause, shared, holds them all, and the first answer ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_on_one_batch_holds_the_others_and_the_next_film() {
+        struct Limited {
+            pauses: Pauses,
+            started: tokio::time::Instant,
+            calls: Mutex<Vec<Duration>>,
+        }
+        impl BatchCall for Limited {
+            fn call(
+                &self,
+                sources: &[String],
+                _context: &[(String, String)],
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CallError>> + Send + '_>> {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(self.started.elapsed());
+                let r = match calls.len() {
+                    1 => Err(CallError::Upstream {
+                        message: "provider 429".into(),
+                        retry: Some(Duration::from_secs(30)),
+                        fatal: false,
+                        key_certain: false,
+                        limited: true,
+                    }),
+                    _ => Ok(sources.iter().map(|s| format!("T:{s}")).collect()),
+                };
+                Box::pin(async move { r })
+            }
+            fn pause(&self) -> Option<(&Pauses, u64)> {
+                Some((&self.pauses, 7))
+            }
+        }
+
+        let up = Limited {
+            pauses: Pauses::default(),
+            started: tokio::time::Instant::now(),
+            calls: Mutex::new(Vec::new()),
+        };
+        // Four batches, all in the window at once. The first is refused and names thirty seconds.
+        let out =
+            run_translation_t(&up, &cues(160)).await.expect("a limit that clears must not fail the film");
+        assert_eq!(out.len(), 160);
+        let calls = up.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 5, "four batches and one retry: {calls:?}");
+        assert!(
+            calls[1..].iter().all(|at| *at >= Duration::from_secs(30)),
+            "a batch asked inside another batch's rate limit: {calls:?}"
+        );
+        assert_eq!(up.pauses.remaining(7), None, "the answers did not end the pause");
+
+        // The next film on the key is held by it too — and one longer than its run is refused
+        // without a call at all.
+        up.pauses.limited(7, Some(Duration::from_secs(900)));
+        let err =
+            run_translation(&up, &cues(40), Duration::from_secs(600), None, &Spend::default(), &no_progress)
+                .await
+                .expect_err("a run inside a fifteen-minute pause must not finish");
+        assert!(err.message.contains("rate limited"), "{}", err.message);
+        assert_eq!(up.calls.lock().unwrap().len(), 5, "a paused key was asked anyway");
     }
 
     /// A transport/auth error is not a contract violation: it must surface, not degrade to the source.

@@ -8,8 +8,12 @@
 //! construction. The Den app computes the OSHash of the playing file and sends it as `videoHash`;
 //! we forward it straight through and float the matches to the top.
 
+use std::time::{Duration, SystemTime};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::ratelimit::{self, Pauses};
 
 /// OpenSubtitles asks every API consumer for `User-Agent: <app name> v<version>`, so this one keeps
 /// that form rather than the `den-subtitles/<version>` the shared client sends everywhere else.
@@ -43,15 +47,73 @@ pub struct Subtitle {
 /// the CDN link it hands back — can be driven against a local server in tests.
 pub const API: &str = "https://api.opensubtitles.com/api/v1";
 
+/// Longest a daily download quota is held for. The quota is a day; a reset further out than that is
+/// a misread, not a reason to stop downloading for longer.
+const MAX_QUOTA_PAUSE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// What OpenSubtitles has told us about its limits, per credential, shared by every request.
+#[derive(Default)]
+pub struct Limits {
+    /// A 429 (or a 503 naming a wait), or a window it says is used up. The whole API — every title,
+    /// search and download — for this API key.
+    pub api: Pauses,
+    /// The daily download quota (a 406). Downloads only, for this key and user: searching costs no
+    /// quota and carries on.
+    pub downloads: Pauses,
+}
+
 pub struct Client<'a> {
     pub http: &'a reqwest::Client,
     pub api_key: &'a str,
     /// Optional service-account bearer (raises the download quota above anonymous).
     pub token: Option<&'a str>,
     pub api_base: &'a str,
+    pub limits: &'a Limits,
 }
 
 impl<'a> Client<'a> {
+    /// The rate limit is the API key's.
+    fn api_limit_key(&self) -> u64 {
+        ratelimit::key("opensubtitles", self.api_key)
+    }
+
+    /// The download quota is the user's when a token names one, and the key's otherwise.
+    fn quota_key(&self) -> u64 {
+        ratelimit::key("opensubtitles-downloads", &format!("{}\n{}", self.api_key, self.token.unwrap_or("")))
+    }
+
+    /// Why this credential must not ask for a download right now, or `None`.
+    ///
+    /// Checked by the caller before `download` rather than inside it, because a refusal made without
+    /// asking says nothing about the FILE and must not be remembered against it the way a real
+    /// failure is.
+    pub fn download_paused(&self) -> Option<DownloadError> {
+        if let Some(left) = self.limits.api.remaining(self.api_limit_key()) {
+            return Some(DownloadError::Unavailable(format!(
+                "opensubtitles rate limited, {}s left",
+                left.as_secs()
+            )));
+        }
+        let left = self.limits.downloads.remaining(self.quota_key())?;
+        Some(DownloadError::Unavailable(format!("download quota reached, {}s left", left.as_secs())))
+    }
+
+    /// Record what an API response said about this key's rate limit. Only a success ends a pause;
+    /// any other answer leaves it as it was.
+    fn observe(&self, status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) {
+        let key = self.api_limit_key();
+        let now = SystemTime::now();
+        if ratelimit::throttled(status, headers) {
+            self.limits.api.limited(key, ratelimit::retry_after(headers, now));
+        } else if status.is_success() {
+            self.limits.api.answered(key);
+            // Answered, and told the window is spent: the next call would be the 429.
+            if let Some(wait) = ratelimit::exhausted_for(headers, now) {
+                self.limits.api.hold(key, wait);
+            }
+        }
+    }
+
     /// Search by IMDb id (+ optional episode) and optional file hash. Results are ordered
     /// hash-matches-first, then by download count.
     pub async fn search(
@@ -75,6 +137,10 @@ impl<'a> Client<'a> {
         if let Some(h) = moviehash {
             query.push(("moviehash".into(), h.to_string()));
         }
+        // A rate limit is the key's, so a 429 on one title holds every other title too.
+        if let Some(left) = self.limits.api.remaining(self.api_limit_key()) {
+            return Err(format!("opensubtitles rate limited, {}s left", left.as_secs()));
+        }
 
         let resp = self
             .http
@@ -85,6 +151,7 @@ impl<'a> Client<'a> {
             .send()
             .await
             .map_err(|e| format!("search failed: {e}"))?;
+        self.observe(resp.status(), resp.headers());
         if !resp.status().is_success() {
             return Err(format!("opensubtitles search {}", resp.status()));
         }
@@ -119,8 +186,16 @@ impl<'a> Client<'a> {
             .send()
             .await
             .map_err(|e| DownloadError::Unavailable(format!("download request failed: {e}")))?;
+        self.observe(resp.status(), resp.headers());
         if !resp.status().is_success() {
             let code = resp.status();
+            // The daily quota is spent. Every other file would get the same 406 until it resets, so
+            // downloads stop for the key, until the reset the body names.
+            if code == reqwest::StatusCode::NOT_ACCEPTABLE {
+                let body: Option<Value> = crate::fetch::capped_json(resp, 64 * 1024).await.ok();
+                let wait = quota_wait(body.as_ref(), SystemTime::now());
+                self.limits.downloads.hold(self.quota_key(), wait);
+            }
             return Err(DownloadError::from_status(code, format!("opensubtitles download {code}")));
         }
         let v: Value = crate::fetch::capped_json(resp, crate::fetch::MAX_BODY)
@@ -206,6 +281,17 @@ impl DownloadError {
             DownloadError::Gone(m) | DownloadError::Suspect(m) | DownloadError::Unavailable(m) => m,
         }
     }
+}
+
+/// How long a spent download quota lasts: until the `reset_time_utc` OpenSubtitles names, or, when the
+/// body does not say, the end of the UTC day. Bounded by a day either way.
+fn quota_wait(body: Option<&Value>, now: SystemTime) -> Duration {
+    body.and_then(|v| v["reset_time_utc"].as_str())
+        .and_then(ratelimit::iso_utc)
+        .map(|at| ratelimit::until(at, now))
+        .filter(|wait| !wait.is_zero())
+        .unwrap_or_else(|| ratelimit::until_utc_midnight(now))
+        .min(MAX_QUOTA_PAUSE)
 }
 
 fn parse_search(v: &Value) -> Vec<Subtitle> {
@@ -487,7 +573,113 @@ mod download_tests {
     async fn download_from(status: &'static str, body: &'static str) -> Result<String, DownloadError> {
         let base = upstream(status, body).await;
         let http = reqwest::Client::new();
-        Client { http: &http, api_key: "k", token: None, api_base: &base }.download(1, None).await
+        let limits = Limits::default();
+        Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits }
+            .download(1, None)
+            .await
+    }
+
+    /// A server that answers each connection with the next canned response, counting the requests.
+    async fn scripted(responses: Vec<String>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn reply(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A rate limit is the KEY's. Remembered only per title, a 429 on one film left every other film
+    /// asking an API that had already refused the key — and a success is what lets it ask again.
+    #[tokio::test]
+    async fn a_rate_limit_on_one_title_holds_every_title_until_an_answer() {
+        use std::sync::atomic::Ordering;
+        let (base, seen) = scripted(vec![
+            reply("429 Too Many Requests", "retry-after: 1\r\n", "{}"),
+            reply("200 OK", "content-type: application/json\r\n", r#"{"data":[]}"#),
+        ])
+        .await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client = Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits };
+
+        assert!(client.search("tt0000001", None, None, "all", None).await.is_err());
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+        // Another title, same key: refused without a request, and downloads are held with it.
+        let err = client
+            .search("tt0000002", None, None, "all", None)
+            .await
+            .expect_err("the pause let a search out");
+        assert!(err.contains("rate limited"), "{err}");
+        assert!(matches!(client.download_paused(), Some(DownloadError::Unavailable(_))));
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "a paused key still asked the API");
+        // Another key is not held.
+        let other = Client { api_key: "other", ..client };
+        assert!(other.download_paused().is_none(), "one key's rate limit held another's");
+
+        // Once the stated wait has passed the key asks again, and the answer clears it.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(client.search("tt0000002", None, None, "all", None).await.is_ok());
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
+        assert!(limits.api.remaining(client.api_limit_key()).is_none(), "a success left the key paused");
+    }
+
+    /// A 406 is the day's download quota. Every other file would get the same answer, so downloads
+    /// stop for the key until the reset the body names — and searching, which costs no quota, does not.
+    #[tokio::test]
+    async fn a_spent_download_quota_holds_downloads_until_its_reset() {
+        let (base, _) = scripted(vec![reply(
+            "406 Not Acceptable",
+            "content-type: application/json\r\n",
+            r#"{"remaining":0,"message":"quota","reset_time_utc":"2099-01-01T00:00:00.000Z"}"#,
+        )])
+        .await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client =
+            Client { http: &http, api_key: "k", token: Some("user"), api_base: &base, limits: &limits };
+
+        let err = client.download(1, None).await.expect_err("a 406 must fail");
+        assert!(matches!(err, DownloadError::Unavailable(_)), "the quota was blamed on the file: {err:?}");
+        assert!(
+            matches!(client.download_paused(), Some(DownloadError::Unavailable(_))),
+            "file 2 would still be asked for"
+        );
+        assert!(limits.api.remaining(client.api_limit_key()).is_none(), "a spent quota held searching too");
+        // Another user on the same key has a quota of their own.
+        assert!(Client { token: Some("someone-else"), ..client }.download_paused().is_none());
+
+        // The named reset is honoured, a missing or past one falls back to the end of the UTC day, and
+        // neither holds downloads for more than a day.
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_643_500_000);
+        let named = serde_json::json!({"reset_time_utc": "2022-01-30T06:00:47.000Z"});
+        assert_eq!(quota_wait(Some(&named), now), Duration::from_secs(22_447));
+        let midnight = ratelimit::until_utc_midnight(now);
+        assert_eq!(quota_wait(None, now), midnight);
+        assert_eq!(
+            quota_wait(Some(&serde_json::json!({"reset_time_utc": "1999-01-01T00:00:00Z"})), now),
+            midnight
+        );
+        let far = serde_json::json!({"reset_time_utc": "2099-01-01T00:00:00Z"});
+        assert_eq!(quota_wait(Some(&far), now), MAX_QUOTA_PAUSE);
     }
 
     /// The error has to say whether the FILE or the SERVICE failed, because the pinned translation

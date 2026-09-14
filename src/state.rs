@@ -46,6 +46,11 @@ pub struct AppState {
     pub sync: SyncTools,
     /// Consecutive OpenSubtitles search failures — surfaced as `degraded` on /health (ADDON-02).
     pub os_fails: AtomicU32,
+    /// What OpenSubtitles has said about each credential's rate limit and download quota, so one
+    /// refusal holds every title rather than only the one that heard it.
+    pub os_limits: crate::opensubtitles::Limits,
+    /// The same for translation providers, per provider and key, across batches and runs.
+    pub llm_pauses: crate::ratelimit::Pauses,
 }
 
 impl AppState {
@@ -90,6 +95,8 @@ impl AppState {
             sync_slots: Semaphore::new(MAX_CONCURRENT_SYNCS),
             sync,
             os_fails: AtomicU32::new(0),
+            os_limits: Default::default(),
+            llm_pauses: Default::default(),
         })
     }
 

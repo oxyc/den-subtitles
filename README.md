@@ -83,6 +83,15 @@ OpenSubtitles search failed (or a translation served unaligned because its ancho
 `sync_failed` for a subtitle served unaligned because its sync failed. A normal answer carries neither
 reason.
 
+A refusal says when to come back. The translate route's 429 `allowance_exhausted` carries
+`Retry-After` (seconds to the end of the UTC day the allowance is counted in) and the IETF draft's
+`RateLimit-Policy: "daily";q=50;w=86400` and `RateLimit: "daily";r=0;t=<seconds>`; its 502
+`translation_backoff` carries `Retry-After` with the backoff left. All three are exposed to browser
+clients. Upstream, a 429 (or a 503 naming a wait) from OpenSubtitles pauses that API key for every
+title — for its `Retry-After`, capped at an hour, else an exponential backoff — and a 406 pauses its
+downloads until the quota's `reset_time_utc`; a 429 from a translation provider pauses that provider
+key across batches and films. The first successful answer ends a pause.
+
 - `GET /health` — liveness, always 200: `{"status":"ok"}`, or `{"status":"degraded",…}` with reason
   `upstream_unavailable` after three OpenSubtitles failures in a row.
 - `GET /metrics` — Prometheus text for `Authorization: Bearer <METRICS_TOKEN>`; the unknown-path 404

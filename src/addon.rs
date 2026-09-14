@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hyper::header::HeaderMap;
+use hyper::header::{HeaderMap, HeaderValue};
 use hyper::{Response, StatusCode};
 use serde_json::{json, Value};
 
@@ -26,6 +26,7 @@ use crate::cache;
 use crate::httputil::{self, Body};
 use crate::logging::LogGate;
 use crate::opensubtitles;
+use crate::ratelimit;
 use crate::state::AppState;
 use crate::userconfig::{LlmConfig, UserConfig};
 use crate::{resync, srt, translate};
@@ -314,6 +315,7 @@ fn os_client<'a>(
         api_key: &cfg.opensubtitles_key,
         token: cfg.opensubtitles_token.as_deref(),
         api_base: &state.cfg.os_api_base,
+        limits: &state.os_limits,
     }
 }
 
@@ -736,6 +738,12 @@ async fn subtitle_srt(
     if let Some(e) = remembered_failure(state, client, file_id) {
         return Err(e);
     }
+    // A key that is rate limited or out of today's quota would get the same refusal for this file as
+    // for every other one, so it is not asked. Nor is that refusal remembered against the file: the
+    // file had nothing to do with it.
+    if let Some(e) = client.download_paused() {
+        return Err(e);
+    }
     let _flight = state.inflight.acquire(&key).await;
     if let Some(hit) = state.cache.get(&key) {
         return Ok(hit);
@@ -745,7 +753,7 @@ async fn subtitle_srt(
     // twenty call this for the SAME reference — they clear the check above together, queue on
     // `os:R`, and then every one of them re-issues the download on release. Twenty metered credits
     // out of a daily handful, for a file already known to be failing.
-    if let Some(e) = remembered_failure(state, client, file_id) {
+    if let Some(e) = remembered_failure(state, client, file_id).or_else(|| client.download_paused()) {
         return Err(e);
     }
     let body = match client.download(file_id, lang).await {
@@ -758,7 +766,11 @@ async fn subtitle_srt(
             body
         }
         Err(e) => {
-            remember_failure(state, client, file_id, &e);
+            // A failure that paused the key — a 429, a spent quota — is remembered by that pause, for
+            // as long as the service said. A per-file marker on top would outlast it by ten minutes.
+            if client.download_paused().is_none() {
+                remember_failure(state, client, file_id, &e);
+            }
             return Err(e);
         }
     };
@@ -1261,6 +1273,23 @@ fn charge_translation(state: &Arc<AppState>, config: &str) -> bool {
     true
 }
 
+/// The 429 for an install over today's allowance, saying when it comes back.
+///
+/// `quota_key` counts per UTC day, so the allowance returns at UTC midnight. `RateLimit-Policy` and
+/// `RateLimit` are the IETF httpapi draft's names (draft-ietf-httpapi-ratelimit-headers): the policy
+/// is the quota `q` over a window `w` of seconds, the state what `r`emains and the seconds `t` until
+/// it resets. A draft, so `Retry-After` is the header a client can be counted on to read.
+fn allowance_refusal() -> Response<Body> {
+    let reset = ratelimit::until_utc_midnight(std::time::SystemTime::now());
+    let refused = httputil::error(StatusCode::TOO_MANY_REQUESTS, "allowance_exhausted");
+    let mut resp = httputil::retry_after(refused, reset);
+    let policy = format!("\"daily\";q={DAILY_TRANSLATIONS};w=86400");
+    let state = format!("\"daily\";r=0;t={}", reset.as_secs());
+    resp.headers_mut().insert("ratelimit-policy", HeaderValue::from_str(&policy).unwrap());
+    resp.headers_mut().insert("ratelimit", HeaderValue::from_str(&state).unwrap());
+    resp
+}
+
 /// A stable digest for values that go into keys which outlive the process — the daily allowance, the
 /// per-install failure marker, the resync variant of a cache key. Deliberately not `DefaultHasher`:
 /// std may change that algorithm between compiler releases, and a toolchain bump would then reset
@@ -1332,11 +1361,12 @@ pub async fn handle_translate(
     //
     // Said differently from a fresh failure on purpose: from the outside the two are the same 502,
     // and the difference — "we just tried" versus "we are backing off" — is the first thing you want
-    // to know when a translation stops working.
+    // to know when a translation stops working. `Retry-After` is the backoff left, so a client that
+    // reads it comes back when a retry can run rather than polling into the same answer.
     let job_key = translate_fail_key(config, &imdb, season, episode, &lang_key, llm);
     let failed_recently = format!("{SYNCFAIL}{job_key}");
-    if state.cache.get(&failed_recently).is_some() {
-        return httputil::error(StatusCode::BAD_GATEWAY, "translation_backoff");
+    if let Some(left) = state.cache.ttl(&failed_recently) {
+        return httputil::retry_after(httputil::error(StatusCode::BAD_GATEWAY, "translation_backoff"), left);
     }
 
     let Some(http) = state.http.as_ref() else {
@@ -1469,8 +1499,11 @@ pub async fn handle_translate(
                 // own full-price translation, with no backoff — N waiters, N films, on the viewer's
                 // own key. The marker exists to stop exactly that, so it is read again now that we
                 // know how the wait ended. `sync_and_cache` re-checks its marker for this reason.
-                if state.cache.get(&failed_recently).is_some() {
-                    return httputil::error(StatusCode::BAD_GATEWAY, "translation_backoff");
+                if let Some(left) = state.cache.ttl(&failed_recently) {
+                    return httputil::retry_after(
+                        httputil::error(StatusCode::BAD_GATEWAY, "translation_backoff"),
+                        left,
+                    );
                 }
                 match cached_translation(state, &body_key) {
                     // Produced while we waited. This is the branch the whole guard exists for.
@@ -1495,7 +1528,7 @@ pub async fn handle_translate(
                                     "translate: {imdb} → {lang} refused, install is over its daily allowance"
                                 );
                             }
-                            return httputil::error(StatusCode::TOO_MANY_REQUESTS, "allowance_exhausted");
+                            return allowance_refusal();
                         }
                         // A refused credential is about the install, not this title, so the
                         // title-scoped marker cannot catch it — every film is a fresh key.
@@ -1593,7 +1626,7 @@ pub async fn handle_translate(
                                         "translate: {imdb} → {lang} refused, install is over its daily allowance"
                                     );
                                 }
-                                return httputil::error(StatusCode::TOO_MANY_REQUESTS, "allowance_exhausted");
+                                return allowance_refusal();
                             }
                             // The provider refused the key itself. Remembered install-wide rather than
                             // per title, because that is the scope of the fact — and no per-title
@@ -1964,11 +1997,17 @@ async fn produce_translation(
     // poll from the request alone — deriving the body key needs a search, and a poll happens every
     // second while the expensive thing runs.
     let reporter = state.progress.start(job_key, cues.len());
-    let translated =
-        translate::translate(client.http, llm, &cues, lang, &state.cache, &spend, &|done, total| {
-            reporter.set(done, total);
-        })
-        .await;
+    let translated = translate::translate(
+        client.http,
+        llm,
+        &cues,
+        lang,
+        &state.cache,
+        &spend,
+        &|done, total| reporter.set(done, total),
+        &state.llm_pauses,
+    )
+    .await;
     // Past the await, so this frame is going to finish on its own terms: every path from here either
     // returns the body or classifies the failure, and both decide the refund explicitly below.
     slot.armed = false;
@@ -2465,6 +2504,10 @@ mod translate_retry_tests {
             handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
                 .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // Still a 502, and it says how much of the backoff is left.
+        let wait: u64 =
+            resp.headers().get(hyper::header::RETRY_AFTER).unwrap().to_str().unwrap().parse().unwrap();
+        assert!((1..=SYNC_RETRY_TTL.as_secs()).contains(&wait), "Retry-After {wait}");
 
         // The marker's value must never reach the client as a subtitle.
         let body = String::from_utf8_lossy(
@@ -2476,6 +2519,27 @@ mod translate_retry_tests {
         // failing. The config's OpenSubtitles key is a test string, so an attempt that got as far as
         // the upstream would ALSO come back 502 — the status alone proves nothing, only the body does.
         assert!(body.contains("translation_backoff"), "the marker did not short-circuit; body: {body}");
+    }
+
+    /// A refusal for the daily allowance says when the allowance comes back — the end of the UTC day
+    /// its counter is keyed by — both as `Retry-After` and in the draft RateLimit headers.
+    #[tokio::test]
+    async fn an_allowance_refusal_says_when_the_allowance_returns() {
+        let state = state("allowance-headers");
+        let config = config_segment();
+        let now = std::time::SystemTime::now();
+        state.cache.put(quota_key(&config, now), DAILY_TRANSLATIONS.to_string(), QUOTA_TTL);
+
+        let resp =
+            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
+                .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let header = |name: &str| resp.headers().get(name).expect(name).to_str().unwrap().to_string();
+        let wait: u64 = header("retry-after").parse().unwrap();
+        assert!((1..=86_400).contains(&wait), "Retry-After {wait}");
+        assert!(wait.abs_diff(ratelimit::until_utc_midnight(now).as_secs()) <= 1, "not the end of the day");
+        assert_eq!(header("ratelimit-policy"), format!("\"daily\";q={DAILY_TRANSLATIONS};w=86400"));
+        assert_eq!(header("ratelimit"), format!("\"daily\";r=0;t={wait}"));
     }
 
     /// Spellings of one language are one cache key. A translate key is a whole film's LLM bill

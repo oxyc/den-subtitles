@@ -76,6 +76,14 @@ pub fn error(status: StatusCode, slug: &str) -> Response<Body> {
     json(status, &serde_json::json!({ "error": slug }), "no-store")
 }
 
+/// Tell the client how long to wait, in whole seconds rounded up so it never comes back a moment
+/// early, and at least one.
+pub fn retry_after(mut resp: Response<Body>, wait: std::time::Duration) -> Response<Body> {
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    resp.headers_mut().insert(hyper::header::RETRY_AFTER, HeaderValue::from(secs.max(1)));
+    resp
+}
+
 /// The 404 every den addon answers for a path it does not serve. A refused /metrics answers the same,
 /// so a box with no token configured does not advertise that the route exists.
 pub fn not_found() -> Response<Body> {

@@ -248,6 +248,21 @@ impl Cache {
         self.mem_put(key, value, ttl);
     }
 
+    /// How long `key` has left, if it is present — for a marker whose lifetime is the answer, like a
+    /// backoff a client is told to wait out. Reads the tiers the way `get` does.
+    pub fn ttl(&self, key: &str) -> Option<Duration> {
+        {
+            let g = self.inner.lock().unwrap();
+            if let Some(left) = g.map.get(key).and_then(|e| e.expires.checked_duration_since(Instant::now()))
+            {
+                return Some(left);
+            }
+        }
+        let (value, remaining) = self.disk_get(key)?;
+        self.mem_put(key.to_string(), value, remaining);
+        Some(remaining)
+    }
+
     /// Remember this in memory only.
     ///
     /// `put` writes through to disk synchronously — an `fs::write` plus a rename, on the one runtime

@@ -18,6 +18,7 @@ mod inflight;
 mod logging;
 mod metrics;
 mod opensubtitles;
+mod ratelimit;
 mod resync;
 mod seal;
 mod srt;
@@ -104,8 +105,12 @@ pub async fn handle_request<B>(state: Arc<AppState>, req: Request<B>) -> Respons
     resp.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
     // The debug headers readable too: a cross-origin fetch sees only the CORS-safelisted headers unless
     // Expose-Headers names more, and Resource Timing hides Server-Timing without Timing-Allow-Origin.
-    resp.headers_mut()
-        .insert("access-control-expose-headers", HeaderValue::from_static("Server-Timing, X-Den-Degraded"));
+    // Retry-After and the RateLimit pair are on refusals, and are how a browser client knows when to
+    // come back.
+    resp.headers_mut().insert(
+        "access-control-expose-headers",
+        HeaderValue::from_static("Server-Timing, X-Den-Degraded, Retry-After, RateLimit, RateLimit-Policy"),
+    );
     resp.headers_mut().insert("timing-allow-origin", HeaderValue::from_static("*"));
     // Off by default, and then this bool is the whole cost. The path is redacted and the query left
     // out: a config segment is an install's credentials, and `?resync=` carries a stream URL. The
@@ -1004,6 +1009,12 @@ mod tests {
         let missing = handle_request(test_state(""), request(hyper::Method::GET, "/no/such/path")).await;
         for resp in [not_modified, head, missing] {
             assert_eq!(resp.headers().get(ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*", "{}", resp.status());
+            // A cross-origin client reads only what is exposed, and a refusal's wait is the part it
+            // most needs.
+            let exposed = resp.headers().get("access-control-expose-headers").unwrap().to_str().unwrap();
+            for name in ["Retry-After", "RateLimit", "RateLimit-Policy"] {
+                assert!(exposed.split(", ").any(|h| h == name), "{name} is not exposed: {exposed}");
+            }
         }
     }
 
