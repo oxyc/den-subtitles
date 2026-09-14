@@ -50,11 +50,20 @@ run_rustfmt() {
     nix run nixpkgs#rustfmt -- --edition 2021 --check $(git ls-files '*.rs')
 }
 
+# The version as the file carries it now. Read through this both before and after the bump: the bump is the
+# one step whose failure looks exactly like success, so it gets proved rather than trusted.
+read_version() {
+    if [ "$version_file" = "Cargo.toml" ]; then
+        sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1
+    else
+        sed -n 's/.*manifestVersion = "\(.*\)".*/\1/p' "$version_file" | head -1
+    fi
+}
+
 if [ -f Cargo.toml ]; then
     echo "==> formatting";  run_rustfmt
     echo "==> tests";       cargo test --quiet
     version_file="Cargo.toml"
-    current="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
 elif [ -f go.mod ]; then
     echo "==> formatting"
     unformatted="$(gofmt -l .)"
@@ -63,18 +72,24 @@ elif [ -f go.mod ]; then
     echo "==> tests"; go test ./...
     # Go carries its version in a constant rather than a manifest.
     version_file="$(git grep -l 'manifestVersion = "' -- '*.go' | head -1)"
-    current="$(sed -n 's/.*manifestVersion = "\(.*\)".*/\1/p' "$version_file" | head -1)"
 else
     echo "error: no Cargo.toml and no go.mod — teach this script the toolchain" >&2
     exit 1
 fi
 
+current="$(read_version)"
 [ -n "$current" ] || { echo "error: could not read the current version" >&2; exit 1; }
 [ "$current" != "$version" ] || { echo "error: already at $version" >&2; exit 1; }
 
 echo "==> version $current -> $version"
 if [ "$version_file" = "Cargo.toml" ]; then
-    sed -i.bak "0,/^version = \"$current\"/s//version = \"$version\"/" Cargo.toml && rm -f Cargo.toml.bak
+    # Only the FIRST `version = "…"`, which is `[package]`'s. This was `sed -i "0,/re/s//…/"`, whose `0,`
+    # address is a GNU extension: BSD sed — every macOS here — accepts it, substitutes NOTHING, and exits 0.
+    # The release then died at `git commit` with "nothing to commit", and would have tagged a build still
+    # carrying the old version had anything else been staged. awk does the same job on either platform.
+    awk -v old="version = \"$current\"" -v new="version = \"$version\"" \
+        '!bumped && $0 == old { $0 = new; bumped = 1 } { print }' Cargo.toml > Cargo.toml.next
+    mv Cargo.toml.next Cargo.toml
     cargo build --quiet   # refresh the lockfile's own entry
     git add Cargo.toml Cargo.lock
 else
@@ -82,6 +97,9 @@ else
     rm -f "$version_file.bak"
     git add "$version_file"
 fi
+bumped="$(read_version)"
+[ "$bumped" = "$version" ] \
+    || { echo "error: $version_file still says '$bumped' — the version bump did not apply" >&2; exit 1; }
 git commit --quiet -m "${slug#*/} $version"
 
 echo "==> pushing"
