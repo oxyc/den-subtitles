@@ -29,7 +29,10 @@ cd "$(dirname "$0")/.."
 # From the remote, so nothing here names a repo.
 slug="$(git remote get-url origin | sed -e 's#.*[:/]\([^/]*/[^/]*\)$#\1#' -e 's/\.git$//')"
 
-git diff --quiet || { echo "error: working tree has uncommitted changes" >&2; exit 1; }
+# Against HEAD, so a STAGED change counts too. Plain `git diff` compares the working tree with the INDEX, so
+# anything already staged is invisible to it — and that is the one state in which a version bump that changed
+# nothing still produces a commit, and this script tags and publishes a release carrying the old version.
+git diff --quiet HEAD || { echo "error: working tree has uncommitted changes" >&2; exit 1; }
 git fetch --quiet origin
 branch="$(git symbolic-ref --quiet --short HEAD || echo HEAD)"
 main="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD | sed 's#^origin/##' || echo main)"
