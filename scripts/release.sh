@@ -117,8 +117,11 @@ command -v gh >/dev/null 2>&1 || {
 echo "==> waiting for docker-publish"
 status=""; conclusion=""
 for _ in $(seq 1 80); do
-    read -r status conclusion <<<"$(gh run list --repo "$slug" --limit 1 --json status,conclusion \
-        --jq '.[0] | "\(.status) \(.conclusion // "-")"')"
+    # This tag's own image build. The newest run of ANY workflow is whatever started last — main's CI or a Dependabot
+    # update often does — and reading that one reported an image built while the build was still running. Until the
+    # tag's run exists `.[0]` is null, which reads as not completed, so the loop waits for it.
+    read -r status conclusion <<<"$(gh run list --repo "$slug" --workflow docker-publish.yml --branch "v$version" \
+        --limit 1 --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion // "-")"')"
     [ "$status" = "completed" ] && break
     sleep 15
 done
