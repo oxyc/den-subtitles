@@ -24,10 +24,11 @@ use serde_json::{json, Value};
 
 use crate::cache;
 use crate::httputil::{self, Body};
+use crate::inflight::Guard as InFlightGuard;
 use crate::logging::LogGate;
 use crate::opensubtitles;
 use crate::ratelimit;
-use crate::state::{AppState, SyncOutcome, SyncTier};
+use crate::state::{AppState, SyncOutcome, SyncReservation, SyncTier};
 use crate::userconfig::{LlmConfig, UserConfig};
 use crate::{resync, srt, translate};
 
@@ -583,6 +584,25 @@ pub async fn handle_subtitle_file(
     };
     let client = os_client(state, http, &cfg);
 
+    // Exact-key coalescing stays ahead of both admission and body retention. A follower waits with
+    // request metadata only, then observes the settled cache entry before spending a download.
+    let flight = if resync_url.is_some() || ref_id.is_some() {
+        let guard = state.inflight.acquire(&cache_key).await;
+        if let Some(hit) = state.cache.get(&cache_key) {
+            return with_settled_etag(httputil::add_timing(httputil::srt(hit), CACHE_HIT), &settled_etag);
+        }
+        Some(guard)
+    } else {
+        None
+    };
+    // Admission starts before the target download. Requests outside this bound retain only request
+    // metadata, not a capped subtitle body; otherwise a burst of distinct keys could queue an
+    // unbounded number of 2 MiB targets behind four subprocess slots.
+    let reservation = match (resync_url.is_some(), ref_id.is_some()) {
+        (true, _) => Some(state.sync_admission.reserve(SyncTier::Tier2).await),
+        (false, true) => Some(state.sync_admission.reserve(SyncTier::Tier1).await),
+        _ => None,
+    };
     let started = Instant::now();
     let target = match subtitle_srt(state, &client, file_id, lang).await {
         Ok(body) => body,
@@ -598,7 +618,20 @@ pub async fn handle_subtitle_file(
     // for, never that we failed to find out.
     let download = format!("download;dur={}", started.elapsed().as_millis());
     let what = format!("subtitle {file_id}");
-    let resp = sync_and_cache(state, &client, cache_key, target, ref_id, resync_url, &what, true).await;
+    let resp = sync_and_cache(
+        state,
+        &client,
+        cache_key,
+        Some(target),
+        None,
+        ref_id,
+        resync_url,
+        reservation,
+        flight,
+        &what,
+        true,
+    )
+    .await;
     with_settled_etag(httputil::add_timing(resp, &download), &settled_etag)
 }
 
@@ -669,9 +702,12 @@ async fn sync_and_cache(
     state: &Arc<AppState>,
     client: &opensubtitles::Client<'_>,
     cache_key: String,
-    target: String,
+    target: Option<String>,
+    translated_body_key: Option<&str>,
     ref_id: Option<i64>,
     resync_url: Option<String>,
+    mut reservation: Option<SyncReservation<'_>>,
+    flight: Option<InFlightGuard<'_>>,
     what: &str,
     settled: bool,
 ) -> Response<Body> {
@@ -693,16 +729,14 @@ async fn sync_and_cache(
     let shared_marker = format!("{SYNCFAIL}{cache_key}");
     let mine_marker = format!("{SYNCFAIL}{:016x}:{cache_key}", short_hash(client.api_key));
     let backed_off = || state.cache.get(&shared_marker).is_some() || state.cache.get(&mine_marker).is_some();
-    // The unaligned body standing in for a sync that failed moments ago is a fallback, and says so.
-    if wanted_sync && backed_off() {
-        return httputil::degraded(httputil::srt_provisional(target), "sync_failed");
-    }
-
     // One tier binary per key at a time. Concurrent requests for the same alignment were each
     // spawning their own — a 90s alass run against the same stream, on a runtime with one thread —
     // and the scratch-file tag below only made that safe, never rare.
     let _flight = if wanted_sync {
-        let guard = state.inflight.acquire(&cache_key).await;
+        let guard = match flight {
+            Some(guard) => guard,
+            None => state.inflight.acquire(&cache_key).await,
+        };
         // Settled while we waited: the alignment we were about to run has already been run.
         if let Some(hit) = state.cache.get(&cache_key) {
             return httputil::add_timing(httputil::srt(hit), CACHE_HIT);
@@ -710,11 +744,27 @@ async fn sync_and_cache(
         // And it may have failed while we waited, in which case re-running it now is the retry the
         // marker exists to prevent.
         if backed_off() {
+            let Some(target) = retained_sync_target(state, target, translated_body_key) else {
+                return httputil::error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "translation_unavailable",
+                );
+            };
             return httputil::degraded(httputil::srt_provisional(target), "sync_failed");
         }
         Some(guard)
     } else {
         None
+    };
+
+    // Translations are durable before alignment. Their caller deliberately drops its String before
+    // entering this function; only the exact-key leader reserves body capacity and reloads it.
+    if wanted_sync && reservation.is_none() {
+        let tier = if resync_url.is_some() { SyncTier::Tier2 } else { SyncTier::Tier1 };
+        reservation = Some(state.sync_admission.reserve(tier).await);
+    }
+    let Some(target) = retained_sync_target(state, target, translated_body_key) else {
+        return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "translation_unavailable");
     };
 
     let started = Instant::now();
@@ -738,7 +788,10 @@ async fn sync_and_cache(
         let aligned =
             match resync::Relay::open(&url, &state.cfg.scout_origins, &state.cfg.scout_aliases).await {
                 Ok(relay) => {
-                    let mut slot = state.sync_admission.acquire(SyncTier::Tier2).await;
+                    let prepared = reservation
+                        .take()
+                        .expect("Tier-2 sync was reserved before retaining bodies");
+                    let mut slot = state.sync_admission.acquire(prepared).await;
                     let result = state.sync.sync_to_audio(&target, &relay.url(), &tag).await;
                     slot.finish(sync_outcome(&result));
                     result
@@ -762,7 +815,10 @@ async fn sync_and_cache(
         match subtitle_srt(state, client, r, None).await {
             Ok(reference) => {
                 let aligned = {
-                    let mut slot = state.sync_admission.acquire(SyncTier::Tier1).await;
+                    let prepared = reservation
+                        .take()
+                        .expect("Tier-1 sync was reserved before retaining bodies");
+                    let mut slot = state.sync_admission.acquire(prepared).await;
                     let result = state.sync.sync_to_reference(&target, &reference, &tag).await;
                     slot.finish(sync_outcome(&result));
                     result
@@ -821,6 +877,14 @@ async fn sync_and_cache(
         None if settled => httputil::srt(target),
         None => httputil::srt_provisional(target),
     }
+}
+
+fn retained_sync_target(
+    state: &AppState,
+    target: Option<String>,
+    translated_body_key: Option<&str>,
+) -> Option<String> {
+    target.or_else(|| cached_translation(state, translated_body_key?).map(|body| body.srt))
 }
 
 fn sync_outcome(result: &Result<String, String>) -> SyncOutcome {
@@ -1837,6 +1901,17 @@ pub async fn handle_translate(
         // the next request, now pinned, never asks for.
         let ref_id = align_for(used_source);
         let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
+        // Do not wait for sync admission while retaining the translated film. Every translated body
+        // is durable under `body_key` before it reaches here, so release this request's copy, reserve
+        // the appropriate tier, and reload only after it is inside the bounded retention set.
+        let wanted_sync = resync_url.is_some() || ref_id.is_some();
+        let translated = match wanted_sync {
+            true => {
+                drop(translated);
+                None
+            }
+            false => Some(translated),
+        };
         // The cheap half. Run here even for the `.json` form so the engine's follow-up fetch is a
         // cache hit rather than an aligner spawn with the viewer waiting on it.
         let resp = sync_and_cache(
@@ -1844,8 +1919,11 @@ pub async fn handle_translate(
             &client,
             cache_key,
             translated,
+            wanted_sync.then_some(body_key.as_str()),
             ref_id,
             resync_url,
+            None,
+            None,
             &format!("translation of {imdb} → {lang_key}"),
             // Settled only if we actually know whether an anchor exists. If the hashed search failed
             // we are serving an unaligned body that a working search might have aligned, so the

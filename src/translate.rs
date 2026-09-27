@@ -62,7 +62,7 @@ pub const MAX_CUES: usize = 6000;
 /// Ceiling on the DIALOGUE, which is what the bill is actually made of.
 ///
 /// `MAX_CUES` counts cues and says nothing about their size, and nothing else on this path bounds
-/// bytes — `fetch::MAX_BODY` caps the download at 12 MiB, `srt::parse` caps nothing, and a batch is
+/// bytes — `fetch::MAX_SUBTITLE_BODY` caps the download at 2 MiB, `srt::parse` caps nothing, and a batch is
 /// forty cues however large they are. So a source of 3000 cues at 4 KB each clears every gate and
 /// puts megabytes of text through the viewer's own key: millions of input tokens and a double-digit
 /// bill for one film, against pennies for a normal one. It does not take a hostile file — dual-

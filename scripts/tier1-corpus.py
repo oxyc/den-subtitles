@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Tier-1 parity and resource gate for ffsubsync -> alass --no-split.
 
-Run in the released image (which contains both tools) or any Linux environment with
-``alass``, ``ffsubsync`` and GNU ``time``. The fixtures are generated deterministically;
-no copyrighted subtitle text is stored or downloaded.
+Run through the Dockerfile's CI-only ``corpus`` target, or in any Linux environment with
+``alass`` and ``ffsubsync``. The fixtures are generated deterministically; no copyrighted
+subtitle text is stored or downloaded.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ class Case:
     sparse: bool = False
     overlap: bool = False
     malformed: bool = False
+    profile: str = "parallel"
 
 
 CASES = [
@@ -43,6 +44,11 @@ CASES = [
     Case("sparse", 12, offset_ms=7_000, sparse=True),
     Case("overlapping-cues", 240, offset_ms=4_000, overlap=True),
     Case("malformed-but-accepted-srt", 180, offset_ms=3_000, malformed=True),
+    # These resemble the actual Tier-1 relationship: an English hash-matched anchor and a
+    # differently authored foreign-language upload. Cue text, count, boundaries and segmentation
+    # do not correspond one-for-one, so identical generated dialogue cannot make the gate pass.
+    Case("cross-language-split-merge", 520, offset_ms=4_500, profile="resegmented"),
+    Case("missing-and-extra-cues", 700, offset_ms=-3_000, profile="missing-extra"),
     Case("episode", 700, offset_ms=6_000),
     Case("long-film", 2_000, offset_ms=5_000),
     # Neither current Tier-1 implementation is split-aware. This fixture prevents the replacement
@@ -80,8 +86,13 @@ def target_times(case: Case, reference: list[tuple[float, float]]) -> list[tuple
     return out
 
 
-def write_srt(path: Path, times: list[tuple[float, float]], malformed: bool = False) -> list[str]:
-    texts = [f"cue {i}: deterministic dialogue {i * 17 % 101}" for i in range(1, len(times) + 1)]
+def write_srt(
+    path: Path,
+    times: list[tuple[float, float]],
+    malformed: bool = False,
+    texts: list[str] | None = None,
+) -> list[str]:
+    texts = texts or [f"cue {i}: deterministic dialogue {i * 17 % 101}" for i in range(1, len(times) + 1)]
     blocks = [f"{i}\n{stamp(start)} --> {stamp(end)}\n{text}" for i, ((start, end), text) in enumerate(zip(times, texts), 1)]
     body = "\n\n".join(blocks) + "\n"
     if malformed:
@@ -92,6 +103,63 @@ def write_srt(path: Path, times: list[tuple[float, float]], malformed: bool = Fa
         body = body.rstrip("\r\n")
     path.write_text(body, encoding="utf-8")
     return texts
+
+
+def grouped(
+    atoms: list[tuple[float, float]],
+    sizes: tuple[int, ...],
+    language: str,
+    drop_every: int | None = None,
+) -> tuple[list[tuple[float, float]], list[str]]:
+    """Render one subtitle author's segmentation of a shared dialogue timeline."""
+    times: list[tuple[float, float]] = []
+    texts: list[str] = []
+    cursor = 0
+    group = 0
+    while cursor < len(atoms):
+        width = sizes[group % len(sizes)]
+        chosen = list(range(cursor, min(cursor + width, len(atoms))))
+        cursor += width
+        group += 1
+        chosen = [i for i in chosen if drop_every is None or (i + 1) % drop_every]
+        if not chosen:
+            continue
+        times.append((atoms[chosen[0]][0], atoms[chosen[-1]][1]))
+        # Different scripts/languages are intentional. Neither aligner may rely on textual identity.
+        if language == "en":
+            texts.append(f"We meet after scene {group}; keep the timing natural.")
+        else:
+            texts.append(f"Nos vemos después de la escena {group}; conserva el ritmo.")
+    return times, texts
+
+
+def fixture(case: Case) -> tuple[list[tuple[float, float]], list[str], list[tuple[float, float]], list[str]]:
+    atoms = reference_times(case)
+    if case.profile == "parallel":
+        texts = [f"cue {i}: deterministic dialogue {i * 17 % 101}" for i in range(1, len(atoms) + 1)]
+        return atoms, texts, atoms, texts
+
+    reference, reference_text = grouped(atoms, (1, 2, 1, 3, 1), "en")
+    if case.profile == "resegmented":
+        target, target_text = grouped(atoms, (2, 1, 3, 2, 1, 1), "es")
+        return reference, reference_text, target, target_text
+
+    # Real uploads omit forced/sign cues in one language and add SDH/music cues in another. Give
+    # each side different omissions, then add reference-only cues in genuine gaps. This exercises
+    # missing/extra evidence without inventing an index correspondence for the oracle.
+    reference, reference_text = grouped(atoms, (1, 2, 1, 1), "en", drop_every=19)
+    target, target_text = grouped(atoms, (2, 1, 2, 3), "es", drop_every=23)
+    extras: list[tuple[tuple[float, float], str]] = []
+    for i in range(30, len(atoms), 47):
+        previous_end = atoms[i - 1][1]
+        next_start = atoms[i][0]
+        if next_start - previous_end > 300:
+            start = previous_end + 80
+            extras.append(((start, min(start + 180, next_start - 20)), f"[music cue {i}]"))
+    merged = sorted(zip(reference, reference_text, strict=True), key=lambda row: row[0][0])
+    merged.extend(extras)
+    merged.sort(key=lambda row: row[0][0])
+    return [row[0] for row in merged], [row[1] for row in merged], target, target_text
 
 
 def parse(path: Path) -> tuple[list[tuple[int, int]], list[str]]:
@@ -194,12 +262,12 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="den-tier1-corpus-") as raw:
         root = Path(raw)
         for case in CASES:
-            ref_times = reference_times(case)
-            target = target_times(case, ref_times)
+            ref_times, ref_texts, target_truth, target_texts = fixture(case)
+            target = target_times(case, target_truth)
             ref, inc = root / f"{case.name}-ref.srt", root / f"{case.name}-in.srt"
             ffout, alout = root / f"{case.name}-ff.srt", root / f"{case.name}-al.srt"
-            texts = write_srt(ref, ref_times, case.malformed)
-            write_srt(inc, target, case.malformed)
+            write_srt(ref, ref_times, case.malformed, ref_texts)
+            write_srt(inc, target, case.malformed, target_texts)
             # Mirror sync_to_reference's process boundary: den accepts tolerant SRT, then emits
             # canonical SRT for alass. This is why malformed exporter output remains in the corpus.
             canonicalize(ref)
@@ -211,8 +279,8 @@ def main() -> int:
                 run(al)
                 ff_times, ff_text = parse(ffout)
                 al_times, al_text = parse(alout)
-                ff_err, al_err = errors(ff_times, ref_times), errors(al_times, ref_times)
-                if ff_text != texts or al_text != texts:
+                ff_err, al_err = errors(ff_times, target_truth), errors(al_times, target_truth)
+                if ff_text != target_texts or al_text != target_texts:
                     raise AssertionError("cue text/order changed")
                 ff95, al95 = percentile(ff_err, 0.95), percentile(al_err, 0.95)
                 # Allow 100 ms measurement/parser noise over the incumbent. For the deliberately

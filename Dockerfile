@@ -21,6 +21,17 @@ FROM rust:1-trixie AS alass
 ARG ALASS_VERSION=2.0.0
 RUN cargo install alass-cli --version ${ALASS_VERSION} --root /alass --locked
 
+# ---- parity corpus (CI-only; never copied into runtime) -------------------
+FROM debian:trixie-slim AS corpus
+ARG FFSUBSYNC_VERSION=0.5.1
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
+    && pip3 install --no-cache-dir --break-system-packages ffsubsync==${FFSUBSYNC_VERSION} \
+    && apt-get purge -y python3-pip && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=alass /alass/bin/alass-cli /usr/local/bin/alass
+COPY scripts/tier1-corpus.py /usr/local/bin/tier1-corpus
+ENTRYPOINT ["python3", "/usr/local/bin/tier1-corpus"]
+
 # ---- runtime --------------------------------------------------------------
 FROM debian:trixie-slim
 # ffmpeg supplies alass's audio decode; ca-certs supports outbound TLS. `upgrade` first: the slim

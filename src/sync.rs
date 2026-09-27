@@ -300,7 +300,7 @@ mod tests {
     /// sweep, so the first file stays forever. Disk pressure is exactly when a second write fails,
     /// so the leak feeds the condition that caused it.
     /// The tier binary's output goes straight into the cache, and a runaway alignment has no other
-    /// ceiling on it — every other body this addon ingests is capped at MAX_BODY.
+    /// ceiling on it — every subtitle body this addon ingests has a dedicated size cap.
     #[tokio::test]
     async fn an_oversized_alignment_is_refused() {
         let dir = work_dir("t1-huge");
@@ -309,7 +309,7 @@ mod tests {
         // size cap is the only thing that can refuse it.
         let script = format!(
             "printf '1\\n00:00:01,000 --> 00:00:02,000\\nhi\\n' > \"$5\"; head -c {} /dev/zero | tr '\\0' 'a' >> \"$5\"",
-            crate::fetch::MAX_BODY
+            crate::fetch::MAX_SUBTITLE_BODY
         );
         let script = script.replace("$5", "$4");
         let bin = fake_bin(&dir, "fake-alass", &script).await;
@@ -390,11 +390,11 @@ async fn read_capped(path: &PathBuf) -> Result<String, String> {
     use tokio::io::AsyncReadExt;
     let file = tokio::fs::File::open(path).await.map_err(|e| format!("read synced: {e}"))?;
     let mut buf = Vec::new();
-    file.take(crate::fetch::MAX_BODY as u64 + 1)
+    file.take(crate::fetch::MAX_SUBTITLE_BODY as u64 + 1)
         .read_to_end(&mut buf)
         .await
         .map_err(|e| format!("read synced: {e}"))?;
-    if buf.len() > crate::fetch::MAX_BODY {
+    if buf.len() > crate::fetch::MAX_SUBTITLE_BODY {
         return Err("sync output too large".to_string());
     }
     String::from_utf8(buf).map_err(|_| "sync output is not utf-8".to_string())

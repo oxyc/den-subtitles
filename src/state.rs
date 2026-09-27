@@ -202,8 +202,11 @@ impl TierStats {
 /// overtaken indefinitely by later arrivals of its own kind.
 pub struct SyncAdmission {
     memory: Semaphore,
-    tier1: Semaphore,
-    tier2: Semaphore,
+    // Taken before a request downloads or retains either subtitle body. These are deliberately
+    // separate: a queue of slow Tier-2 preparations must not occupy every place a cheap Tier-1
+    // request can use. Requests outside these gates retain only their small request metadata.
+    tier1_preparation: Semaphore,
+    tier2_preparation: Semaphore,
     tier1_stats: TierStats,
     tier2_stats: TierStats,
 }
@@ -212,8 +215,8 @@ impl SyncAdmission {
     fn new() -> Self {
         Self {
             memory: Semaphore::new(SYNC_MEMORY_UNITS),
-            tier1: Semaphore::new(TIER1_SLOTS),
-            tier2: Semaphore::new(TIER2_SLOTS),
+            tier1_preparation: Semaphore::new(TIER1_SLOTS),
+            tier2_preparation: Semaphore::new(TIER2_SLOTS),
             tier1_stats: TierStats::default(),
             tier2_stats: TierStats::default(),
         }
@@ -221,22 +224,48 @@ impl SyncAdmission {
 
     fn parts(&self, tier: SyncTier) -> (&Semaphore, &TierStats, u32) {
         match tier {
-            SyncTier::Tier1 => (&self.tier1, &self.tier1_stats, TIER1_WEIGHT),
-            SyncTier::Tier2 => (&self.tier2, &self.tier2_stats, TIER2_WEIGHT),
+            SyncTier::Tier1 => (&self.tier1_preparation, &self.tier1_stats, TIER1_WEIGHT),
+            SyncTier::Tier2 => (&self.tier2_preparation, &self.tier2_stats, TIER2_WEIGHT),
         }
     }
 
-    pub async fn acquire(&self, tier: SyncTier) -> SyncPermit<'_> {
+    /// Reserve a bounded body-retention place before fetching either sync input. The weighted
+    /// subprocess budget is intentionally acquired later, after network preparation, but at most
+    /// four Tier-1 jobs and one Tier-2 job can reach that point with bodies resident.
+    pub async fn reserve(&self, tier: SyncTier) -> SyncReservation<'_> {
         let queued_at = Instant::now();
-        let (tier_slots, stats, weight) = self.parts(tier);
-        let tier_permit = tier_slots.acquire().await.expect("sync tier semaphore is never closed");
-        let memory_permit =
-            self.memory.acquire_many(weight).await.expect("sync memory semaphore is never closed");
+        let (preparation, stats, weight) = self.parts(tier);
+        let preparation_permit =
+            preparation.acquire().await.expect("sync tier semaphore is never closed");
         let elapsed = queued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         stats.queued.fetch_add(1, Ordering::Relaxed);
         stats.queue_ns.fetch_add(elapsed, Ordering::Relaxed);
+        SyncReservation {
+            stats,
+            weight,
+            _preparation_permit: preparation_permit,
+        }
+    }
+
+    /// Admit a prepared job to the weighted subprocess budget. The reservation remains held until
+    /// the subprocess finishes, so another request cannot start retaining bodies behind it early.
+    pub async fn acquire<'a>(&'a self, reservation: SyncReservation<'a>) -> SyncPermit<'a> {
+        let queued_at = Instant::now();
+        let memory_permit = self
+            .memory
+            .acquire_many(reservation.weight)
+            .await
+            .expect("sync memory semaphore is never closed");
+        let elapsed = queued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        reservation.stats.queue_ns.fetch_add(elapsed, Ordering::Relaxed);
+        let stats = reservation.stats;
         stats.running.fetch_add(1, Ordering::Relaxed);
-        SyncPermit { stats, _tier_permit: tier_permit, _memory_permit: memory_permit, finished: false }
+        SyncPermit {
+            stats,
+            _reservation: reservation,
+            _memory_permit: memory_permit,
+            finished: false,
+        }
     }
 
     pub fn stats(&self, tier: SyncTier) -> SyncStats {
@@ -244,9 +273,15 @@ impl SyncAdmission {
     }
 }
 
+pub struct SyncReservation<'a> {
+    stats: &'a TierStats,
+    weight: u32,
+    _preparation_permit: SemaphorePermit<'a>,
+}
+
 pub struct SyncPermit<'a> {
     stats: &'a TierStats,
-    _tier_permit: SemaphorePermit<'a>,
+    _reservation: SyncReservation<'a>,
     _memory_permit: SemaphorePermit<'a>,
     finished: bool,
 }
@@ -283,11 +318,16 @@ mod sync_admission_tests {
     #[tokio::test]
     async fn tier2_always_leaves_capacity_for_tier1() {
         let admission = SyncAdmission::new();
-        let mut tier2 = admission.acquire(SyncTier::Tier2).await;
-        let mut tier1 = admission.acquire(SyncTier::Tier1).await;
-        assert!(tokio::time::timeout(Duration::from_millis(10), admission.acquire(SyncTier::Tier1))
-            .await
-            .is_err());
+        let tier2_reservation = admission.reserve(SyncTier::Tier2).await;
+        let mut tier2 = admission.acquire(tier2_reservation).await;
+        let tier1_reservation = admission.reserve(SyncTier::Tier1).await;
+        let mut tier1 = admission.acquire(tier1_reservation).await;
+        let second = admission.reserve(SyncTier::Tier1).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), admission.acquire(second))
+                .await
+                .is_err()
+        );
         tier1.finish(SyncOutcome::Completed);
         tier2.finish(SyncOutcome::Completed);
         let one = admission.stats(SyncTier::Tier1);
@@ -301,7 +341,8 @@ mod sync_admission_tests {
         let admission = Arc::new(SyncAdmission::new());
         let mut held = Vec::new();
         for _ in 0..4 {
-            held.push(admission.acquire(SyncTier::Tier1).await);
+            let reservation = admission.reserve(SyncTier::Tier1).await;
+            held.push(admission.acquire(reservation).await);
         }
 
         let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
@@ -309,7 +350,8 @@ mod sync_admission_tests {
         let waiting_tier2 = {
             let admission = admission.clone();
             tokio::spawn(async move {
-                let mut permit = admission.acquire(SyncTier::Tier2).await;
+                let reservation = admission.reserve(SyncTier::Tier2).await;
+                let mut permit = admission.acquire(reservation).await;
                 let _ = acquired_tx.send(());
                 let _ = release_rx.await;
                 permit.finish(SyncOutcome::Completed);
@@ -319,7 +361,8 @@ mod sync_admission_tests {
         let later_tier1 = {
             let admission = admission.clone();
             tokio::spawn(async move {
-                let mut permit = admission.acquire(SyncTier::Tier1).await;
+                let reservation = admission.reserve(SyncTier::Tier1).await;
+                let mut permit = admission.acquire(reservation).await;
                 permit.finish(SyncOutcome::Completed);
             })
         };
@@ -342,11 +385,45 @@ mod sync_admission_tests {
     #[tokio::test]
     async fn dropping_a_running_job_records_cancellation_and_releases_memory() {
         let admission = SyncAdmission::new();
-        drop(admission.acquire(SyncTier::Tier1).await);
+        let reservation = admission.reserve(SyncTier::Tier1).await;
+        drop(admission.acquire(reservation).await);
         let stats = admission.stats(SyncTier::Tier1);
         assert_eq!((stats.running, stats.cancelled), (0, 1));
-        let mut replacement = admission.acquire(SyncTier::Tier1).await;
+        let reservation = admission.reserve(SyncTier::Tier1).await;
+        let mut replacement = admission.acquire(reservation).await;
         replacement.finish(SyncOutcome::TimedOut);
         assert_eq!(admission.stats(SyncTier::Tier1).timed_out, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_requests_do_not_pass_the_body_retention_bound() {
+        let admission = Arc::new(SyncAdmission::new());
+        let mut held = Vec::new();
+        for _ in 0..TIER1_SLOTS {
+            held.push(admission.reserve(SyncTier::Tier1).await);
+        }
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let waiting = {
+            let admission = admission.clone();
+            tokio::spawn(async move {
+                let reservation = admission.reserve(SyncTier::Tier1).await;
+                let _ = acquired_tx.send(());
+                let _ = release_rx.await;
+                drop(reservation);
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "a fifth Tier-1 request passed the four-body bound"
+        );
+        drop(held.pop());
+        tokio::time::timeout(Duration::from_secs(1), acquired_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = release_tx.send(());
+        waiting.await.unwrap();
     }
 }

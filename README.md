@@ -55,7 +55,11 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
 
 - **Tier 1 (automatic).** When a search returns a hash-matched sub, every other sub is handed back
   with `?ref=<id>` and reference-aligned to that anchor on fetch (`alass --no-split`, no audio).
-  Tier 1 admits up to four jobs within a weighted memory budget.
+  Tier 1 admits up to four jobs within a weighted memory budget. Exact-key singleflight runs before
+  admission, and the four-place Tier-1 preparation gate is taken before either subtitle is fetched;
+  queued requests therefore retain no subtitle bodies. Subtitle inputs and aligner output are capped
+  at 2 MiB. The PR corpus gates timing parity against `ffsubsync` across cross-language split/merged,
+  missing/extra-cue, malformed, drift, sparse and long-track fixtures without shipping `ffsubsync`.
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
   non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon runs `alass`
   against the stream audio server-side and the app swaps in the re-synced track. The stream URL has
@@ -65,8 +69,9 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   served unaligned. alass never gets the URL itself: it reads a relay on 127.0.0.1 that follows
   scout's redirect to the debrid CDN, refuses a hop that is neither a listed origin nor a public
   address, pins the address it checked, and never passes a redirect on to ffmpeg.
-  Tier 2 is limited to one job and consumes three of the four memory-budget units, always reserving
-  one for Tier 1. Each tier has its own FIFO queue, so neither can starve the other.
+  Tier 2 is limited to one prepared/running job and consumes three of the four memory-budget units,
+  always reserving one for Tier 1. Each tier has its own FIFO preparation queue, so neither can
+  retain bodies in or starve the other tier's queue.
 
 Known gap: Tier 1 needs a hash-matched anchor in the results. When the search returns *no* hash
 match — the common out-of-sync case — there is no trusted reference, so Tier 1 stays off and the sub

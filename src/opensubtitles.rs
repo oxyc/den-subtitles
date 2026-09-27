@@ -222,7 +222,7 @@ impl<'a> Client<'a> {
             let code = resp.status();
             return Err(DownloadError::Suspect(format!("subtitle link {code}")));
         }
-        let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_BODY)
+        let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_SUBTITLE_BODY)
             .await
             .map_err(DownloadError::Unavailable)?;
         let (body, converted) = crate::fetch::subtitle_text(bytes, lang);
