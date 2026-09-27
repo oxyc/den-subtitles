@@ -21,7 +21,7 @@ use hyper::{Response, StatusCode};
 use subtle::ConstantTimeEq;
 
 use crate::httputil::{self, Body};
-use crate::state::AppState;
+use crate::state::{AppState, SyncTier};
 
 pub fn handle(state: &AppState, headers: &HeaderMap) -> Response<Body> {
     if !authorized(headers, &state.cfg.metrics_token) {
@@ -103,14 +103,7 @@ fn render(state: &AppState) -> String {
         "",
         cache.disk_write_failures,
     );
-    series(
-        &mut out,
-        "subtitles_sync_jobs_running",
-        "gauge",
-        "Sync binaries (alass/ffsubsync) running now.",
-        "",
-        state.syncs_running(),
-    );
+    sync_series(&mut out, state);
     series(
         &mut out,
         "subtitles_translations_running",
@@ -120,6 +113,54 @@ fn render(state: &AppState) -> String {
         state.progress.tracked(),
     );
     out
+}
+
+fn sync_series(out: &mut String, state: &AppState) {
+    let tiers = [
+        ("tier1", state.sync_admission.stats(SyncTier::Tier1)),
+        ("tier2", state.sync_admission.stats(SyncTier::Tier2)),
+    ];
+    let _ = writeln!(
+        out,
+        "# HELP subtitles_sync_jobs_running Sync binaries running now, by tier.\n\
+         # TYPE subtitles_sync_jobs_running gauge"
+    );
+    for (tier, stats) in tiers {
+        let _ = writeln!(out, "subtitles_sync_jobs_running{{tier=\"{tier}\"}} {}", stats.running);
+    }
+    let _ = writeln!(
+        out,
+        "# HELP subtitles_sync_queue_duration_seconds_total Time spent waiting for sync admission.\n\
+         # TYPE subtitles_sync_queue_duration_seconds_total counter"
+    );
+    for (tier, stats) in tiers {
+        let seconds = stats.queue_ns as f64 / 1_000_000_000.0;
+        let _ = writeln!(out, "subtitles_sync_queue_duration_seconds_total{{tier=\"{tier}\"}} {seconds}");
+    }
+    let _ = writeln!(
+        out,
+        "# HELP subtitles_sync_queue_requests_total Sync jobs admitted after queueing.\n\
+         # TYPE subtitles_sync_queue_requests_total counter"
+    );
+    for (tier, stats) in tiers {
+        let _ = writeln!(out, "subtitles_sync_queue_requests_total{{tier=\"{tier}\"}} {}", stats.queued);
+    }
+    let _ = writeln!(
+        out,
+        "# HELP subtitles_sync_jobs_total Finished sync jobs by tier and outcome.\n\
+         # TYPE subtitles_sync_jobs_total counter"
+    );
+    for (tier, stats) in tiers {
+        for (outcome, value) in [
+            ("completed", stats.completed),
+            ("timed_out", stats.timed_out),
+            ("failed", stats.failed),
+            ("cancelled", stats.cancelled),
+        ] {
+            let _ =
+                writeln!(out, "subtitles_sync_jobs_total{{tier=\"{tier}\",outcome=\"{outcome}\"}} {value}");
+        }
+    }
 }
 
 /// One HELP/TYPE block and its single sample. An empty `labels` is an unlabelled series.

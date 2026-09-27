@@ -2,7 +2,7 @@
 name = "den-subtitles"
 version = "0.14.0"
 edition = "2021"
-description = "Den subtitles, one container: Stremio subtitles addon that fetches (OpenSubtitles, hash-matched), AI-translates (BYOK), and auto-syncs (alass/ffsubsync) SRTs for the Den Apple TV app"
+description = "Den subtitles, one container: Stremio subtitles addon that fetches (OpenSubtitles, hash-matched), AI-translates (BYOK), and auto-syncs SRTs for the Den Apple TV app"
 publish = false
 license = "MIT"
 
@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # current_thread async runtime — this is an I/O-bound proxy; the CPU work lives in the
-# alass/ffsubsync/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
+# alass/ffmpeg subprocesses and the LLM APIs, not here. Keeps homelab idle RAM minimal.
 tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }
 hyper = { version = "1", features = ["server", "http1"] }
 # server-graceful: stop accepting on SIGTERM and let in-flight requests finish (see serve_until).

@@ -525,7 +525,7 @@ mod tests {
 #[cfg(test)]
 mod separator_tests {
     use super::*;
-    /// This parser gates every downloaded subtitle body (up to MAX_BODY = 12 MiB of third-party CDN
+    /// This parser gates every downloaded subtitle body (up to the 2 MiB subtitle-body ceiling of third-party CDN
     /// content), it has no await in it, and the runtime has one thread — so its cost is the whole
     /// server's cost. Deciding the separator question per line rescanned the rest of the blank run
     /// each time: 40k padded lines took 1.6s, 160k took 27s, and a megabyte never finished.

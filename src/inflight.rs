@@ -3,7 +3,7 @@
 //! The cache collapses repeated work into one lookup, but only once the first worker has FINISHED.
 //! Until then every arrival is a miss and starts its own copy of the job — and the two jobs this
 //! addon runs on a miss are the two expensive ones: a whole film's LLM translation, charged to the
-//! viewer's own provider account, and an `alass`/`ffsubsync` subprocess on a runtime with one thread.
+//! viewer's own provider account, and an `alass` subprocess on a runtime with one thread.
 //!
 //! The app's own `.json`-then-`.srt` flow is sequential, so the duplicate is not the everyday case.
 //! Two devices on the same title, or a second tap during a run that legitimately takes minutes, is —

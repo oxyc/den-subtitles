@@ -35,11 +35,31 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
-  # The image carries the sync toolchain (alass, ffsubsync, ffmpeg) on top of the binary, so it builds
+  tier1-corpus:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: corpus
+          load: true
+          tags: den-subtitles-tier1-corpus:ci
+          cache-from: type=gha,scope=tier1-corpus
+          cache-to: type=gha,mode=max,scope=tier1-corpus
+      - name: Tier-1 parity and resource gate
+        run: >-
+          docker run --rm
+          --memory=512m --memory-swap=512m
+          den-subtitles-tier1-corpus:ci --cgroup-memory-gate
+
+  # The image carries the sync toolchain (alass and ffmpeg) on top of the binary, so it builds
   # differently from `cargo build`. Catching a Dockerfile break on the PR rather than at `git tag`
   # time, without pushing, for amd64 — the only arch the box runs. A tag's publish job builds it anyway.
   build-pr:
-    needs: test
+    needs: [test, tier1-corpus]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
