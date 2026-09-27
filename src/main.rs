@@ -520,7 +520,6 @@ mod tests {
             cache_dir: std::env::temp_dir().join("den-subtitles-test-cache"),
             cache_max_bytes: 8 * 1024 * 1024,
             public_base_url: None,
-            ffsubsync: "ffsubsync".to_string(),
             alass: "alass".to_string(),
             config_key: config_key.to_string(),
             config_keys_prev: String::new(),
@@ -1067,6 +1066,22 @@ mod tests {
         assert!(body.contains(&build), "no build_info line in:\n{body}");
         assert!(body.contains("\nsubtitles_consecutive_failures{kind=\"opensubtitles\"} 0\n"), "{body}");
         assert!(body.contains("# TYPE subtitles_cache_disk_write_failures_total counter\n"), "{body}");
+        for tier in ["tier1", "tier2"] {
+            assert!(body.contains(&format!("subtitles_sync_jobs_running{{tier=\"{tier}\"}} 0")), "{body}");
+            assert!(
+                body.contains(&format!("subtitles_sync_queue_requests_total{{tier=\"{tier}\"}} 0")),
+                "{body}"
+            );
+            for outcome in ["completed", "timed_out", "failed", "cancelled"] {
+                assert!(
+                    body.contains(&format!(
+                        "subtitles_sync_jobs_total{{tier=\"{tier}\",outcome=\"{outcome}\"}} 0"
+                    )),
+                    "{body}"
+                );
+            }
+        }
+        assert_eq!(body.matches("# HELP subtitles_sync_jobs_total ").count(), 1, "{body}");
     }
 
     /// Every route is a read; anything else is refused before it can reach a handler that spends a

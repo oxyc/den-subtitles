@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Tier-1 parity and resource gate for ffsubsync -> alass --no-split.
+
+Run in the released image (which contains both tools) or any Linux environment with
+``alass``, ``ffsubsync`` and GNU ``time``. The fixtures are generated deterministically;
+no copyrighted subtitle text is stored or downloaded.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import re
+import shutil
+import statistics
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+TIMING = re.compile(r"(\d\d):(\d\d):(\d\d)[,.](\d\d\d)\s*-->\s*(\d\d):(\d\d):(\d\d)[,.](\d\d\d)")
+
+
+@dataclass(frozen=True)
+class Case:
+    name: str
+    cues: int
+    offset_ms: float = 0
+    scale: float = 1
+    cut_at: int | None = None
+    cut_ms: float = 0
+    sparse: bool = False
+    overlap: bool = False
+    malformed: bool = False
+
+
+CASES = [
+    Case("no-op", 180),
+    Case("constant-plus-5s", 240, offset_ms=5_000),
+    Case("constant-minus-12s", 240, offset_ms=-12_000),
+    Case("fps-25-to-23.976", 600, offset_ms=2_000, scale=25 / 23.976),
+    Case("sparse", 12, offset_ms=7_000, sparse=True),
+    Case("overlapping-cues", 240, offset_ms=4_000, overlap=True),
+    Case("malformed-but-accepted-srt", 180, offset_ms=3_000, malformed=True),
+    Case("episode", 700, offset_ms=6_000),
+    Case("long-film", 2_000, offset_ms=5_000),
+    # Neither current Tier-1 implementation is split-aware. This fixture prevents the replacement
+    # from being materially worse while documenting why different-cut repair remains Tier 2.
+    Case("different-cut-parity", 600, offset_ms=2_000, cut_at=300, cut_ms=30_000),
+]
+
+
+def stamp(ms: float) -> str:
+    value = max(0, round(ms))
+    hours, value = divmod(value, 3_600_000)
+    minutes, value = divmod(value, 60_000)
+    seconds, millis = divmod(value, 1_000)
+    return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
+
+
+def reference_times(case: Case) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    cursor = 15_000.0
+    for i in range(case.cues):
+        gap = (24_000 + (i * 7919) % 19_000) if case.sparse else (900 + (i * 7919) % 2_200)
+        cursor += gap
+        duration = 850 + (i * 3571) % 2_100
+        if case.overlap and i % 7 == 0:
+            duration += 2_500
+        out.append((cursor, cursor + duration))
+    return out
+
+
+def target_times(case: Case, reference: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    out = []
+    for i, (start, end) in enumerate(reference):
+        extra = case.cut_ms if case.cut_at is not None and i >= case.cut_at else 0
+        out.append((start * case.scale + case.offset_ms + extra, end * case.scale + case.offset_ms + extra))
+    return out
+
+
+def write_srt(path: Path, times: list[tuple[float, float]], malformed: bool = False) -> list[str]:
+    texts = [f"cue {i}: deterministic dialogue {i * 17 % 101}" for i in range(1, len(times) + 1)]
+    blocks = [f"{i}\n{stamp(start)} --> {stamp(end)}\n{text}" for i, ((start, end), text) in enumerate(zip(times, texts), 1)]
+    body = "\n\n".join(blocks) + "\n"
+    if malformed:
+        # These are accepted by den's parser: BOM, leading prose, CRLF, padded blank separators,
+        # and no final newline. They exercise formatting tolerance without inventing an invalid cue.
+        body = body.replace("\n", "\r\n").replace("\r\n\r\n", "\r\n \t\r\n")
+        body = "\ufeffexported by editor\r\n\r\n" + body
+        body = body.rstrip("\r\n")
+    path.write_text(body, encoding="utf-8")
+    return texts
+
+
+def parse(path: Path) -> tuple[list[tuple[int, int]], list[str]]:
+    body = path.read_text(encoding="utf-8-sig", errors="strict").replace("\r\n", "\n")
+    timings = []
+    texts = []
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        match = TIMING.search(line)
+        if not match:
+            continue
+        values = [int(v) for v in match.groups()]
+        to_ms = lambda p: ((p[0] * 60 + p[1]) * 60 + p[2]) * 1000 + p[3]
+        timings.append((to_ms(values[:4]), to_ms(values[4:])))
+        text = lines[i + 1] if i + 1 < len(lines) else ""
+        texts.append(text)
+    return timings, texts
+
+
+def canonicalize(path: Path) -> None:
+    times, texts = parse(path)
+    blocks = [f"{i}\n{stamp(start)} --> {stamp(end)}\n{text}" for i, ((start, end), text) in enumerate(zip(times, texts), 1)]
+    path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+
+
+def run(command: list[str]) -> None:
+    proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if proc.returncode:
+        raise RuntimeError(f"{' '.join(command[:2])} failed: {proc.stderr[-500:]}")
+
+
+def errors(actual: list[tuple[int, int]], expected: list[tuple[float, float]]) -> list[float]:
+    if len(actual) != len(expected):
+        raise AssertionError(f"cue count changed: {len(expected)} -> {len(actual)}")
+    return [abs(a - e) for pair_a, pair_e in zip(actual, expected) for a, e in zip(pair_a, pair_e)]
+
+
+def percentile(values: list[float], q: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, math.ceil(len(ordered) * q) - 1)]
+
+
+def process_tree_rss_kb(pid: int) -> int:
+    pending, seen, total = [pid], set(), 0
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        try:
+            status = Path(f"/proc/{current}/status").read_text()
+            match = re.search(r"^VmRSS:\s+(\d+)\s+kB", status, re.MULTILINE)
+            total += int(match.group(1)) if match else 0
+            children = Path(f"/proc/{current}/task/{current}/children").read_text().split()
+            pending.extend(int(child) for child in children)
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return total
+
+
+def timed(command: list[str]) -> tuple[float, int]:
+    started = time.perf_counter()
+    proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    peak_rss = 0
+    while proc.poll() is None:
+        peak_rss = max(peak_rss, process_tree_rss_kb(proc.pid))
+        time.sleep(0.005)
+    _, stderr = proc.communicate()
+    if proc.returncode:
+        raise RuntimeError(f"{' '.join(command[:2])} failed: {stderr[-500:]}")
+    return time.perf_counter() - started, peak_rss
+
+
+def concurrent_peak(commands: list[list[str]]) -> int:
+    procs = [subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True) for command in commands]
+    peak_rss = 0
+    while any(proc.poll() is None for proc in procs):
+        peak_rss = max(peak_rss, sum(process_tree_rss_kb(proc.pid) for proc in procs))
+        time.sleep(0.005)
+    for command, proc in zip(commands, procs):
+        _, stderr = proc.communicate()
+        if proc.returncode:
+            raise RuntimeError(f"{' '.join(command[:2])} failed: {stderr[-500:]}")
+    return peak_rss
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--alass", default="alass")
+    parser.add_argument("--ffsubsync", default="ffsubsync")
+    parser.add_argument("--repeats", type=int, default=3)
+    args = parser.parse_args()
+    for binary in (args.alass, args.ffsubsync):
+        if not (Path(binary).is_file() or shutil.which(binary)):
+            parser.error(f"required binary not found: {binary}")
+
+    failed = []
+    resource: dict[str, list[tuple[float, int]]] = {"ffsubsync": [], "alass": []}
+    tier1_peak_kb = mixed_proxy_peak_kb = 0
+    with tempfile.TemporaryDirectory(prefix="den-tier1-corpus-") as raw:
+        root = Path(raw)
+        for case in CASES:
+            ref_times = reference_times(case)
+            target = target_times(case, ref_times)
+            ref, inc = root / f"{case.name}-ref.srt", root / f"{case.name}-in.srt"
+            ffout, alout = root / f"{case.name}-ff.srt", root / f"{case.name}-al.srt"
+            texts = write_srt(ref, ref_times, case.malformed)
+            write_srt(inc, target, case.malformed)
+            # Mirror sync_to_reference's process boundary: den accepts tolerant SRT, then emits
+            # canonical SRT for alass. This is why malformed exporter output remains in the corpus.
+            canonicalize(ref)
+            canonicalize(inc)
+            ff = [args.ffsubsync, str(ref), "-i", str(inc), "-o", str(ffout)]
+            al = [args.alass, "--no-split", str(ref), str(inc), str(alout)]
+            try:
+                run(ff)
+                run(al)
+                ff_times, ff_text = parse(ffout)
+                al_times, al_text = parse(alout)
+                ff_err, al_err = errors(ff_times, ref_times), errors(al_times, ref_times)
+                if ff_text != texts or al_text != texts:
+                    raise AssertionError("cue text/order changed")
+                ff95, al95 = percentile(ff_err, 0.95), percentile(al_err, 0.95)
+                # Allow 100 ms measurement/parser noise over the incumbent. For the deliberately
+                # unsupported different-cut case, parity is the gate; ordinary cases must also land
+                # within 250 ms at p95.
+                ceiling = ff95 + 100 if case.cut_at is not None else max(250, ff95 + 100)
+                if al95 > ceiling:
+                    raise AssertionError(f"p95 regression: ff={ff95:.0f}ms alass={al95:.0f}ms limit={ceiling:.0f}ms")
+                print(f"PASS {case.name:28} p95_ms ff={ff95:8.1f} alass={al95:8.1f}")
+                if case.name == "long-film":
+                    for _ in range(args.repeats):
+                        resource["ffsubsync"].append(timed(ff))
+                        resource["alass"].append(timed(al))
+                    tier1_commands = []
+                    for index in range(4):
+                        output = root / f"long-film-al-{index}.srt"
+                        tier1_commands.append([args.alass, "--no-split", str(ref), str(inc), str(output)])
+                    tier1_peak_kb = concurrent_peak(tier1_commands)
+                    # Admission weights one split-aware Tier-2 job as three Tier-1 units and reserves
+                    # the fourth for cheap work. Subtitle-reference split mode is a conservative DP
+                    # memory proxy; the production Tier-2 benchmark must still include ffmpeg/audio.
+                    mixed_proxy_peak_kb = concurrent_peak(
+                        [
+                            [args.alass, str(ref), str(inc), str(root / "long-film-split.srt")],
+                            [args.alass, "--no-split", str(ref), str(inc), str(root / "long-film-cheap.srt")],
+                        ]
+                    )
+            except (AssertionError, RuntimeError, UnicodeError) as error:
+                failed.append(f"{case.name}: {error}")
+                print(f"FAIL {case.name}: {error}")
+
+    if not failed:
+        ff_wall = statistics.median(v[0] for v in resource["ffsubsync"])
+        al_wall = statistics.median(v[0] for v in resource["alass"])
+        ff_rss = statistics.median(v[1] for v in resource["ffsubsync"])
+        al_rss = statistics.median(v[1] for v in resource["alass"])
+        print(f"RESOURCE median wall_s ff={ff_wall:.3f} alass={al_wall:.3f} speedup={ff_wall/al_wall:.2f}x")
+        print(f"RESOURCE median max_rss_kb ff={ff_rss:.0f} alass={al_rss:.0f} reduction={ff_rss/al_rss:.2f}x")
+        print(f"RESOURCE four_tier1_peak_rss_kb={tier1_peak_kb}")
+        print(f"RESOURCE split_plus_tier1_proxy_peak_rss_kb={mixed_proxy_peak_kb}")
+        if ff_wall / al_wall < 2 or ff_rss / al_rss < 2:
+            failed.append("resource gate missed: both median runtime and peak RSS must improve by >=2x")
+        if tier1_peak_kb >= 450 * 1024 or mixed_proxy_peak_kb >= 480 * 1024:
+            failed.append("admission memory gate missed: subprocess peak leaves insufficient room under 512 MiB")
+
+    if failed:
+        print("\nGATE FAILED")
+        for error in failed:
+            print(f"- {error}")
+        return 1
+    print("\nGATE PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -9,7 +9,7 @@
 //!     (splits-aware — handles ad breaks / different cuts). Costs a stream fetch, so it's a per-title
 //!     user action, not automatic.
 //!
-//! Each tier shells out to a binary (`ffsubsync`, `alass`) exactly like reel drives yt-dlp/ffmpeg —
+//! Each tier shells out to `alass` exactly like reel drives yt-dlp/ffmpeg —
 //! the CPU work lives in the subprocess, not this runtime.
 //!
 //! Wired into the subtitle proxy: a `?ref=<file_id>` on `/subtitle/…` runs Tier 1 against that
@@ -26,7 +26,6 @@ use tokio::time::timeout;
 /// Binary paths + work dir, from env. Defaults assume the binaries are on PATH (the container
 /// installs them).
 pub struct SyncTools {
-    pub ffsubsync: String,
     pub alass: String,
     pub work_dir: PathBuf,
 }
@@ -43,6 +42,12 @@ impl SyncTools {
         reference_srt: &str,
         tag: &str,
     ) -> Result<String, String> {
+        // OpenSubtitles files are valid enough for our deliberately tolerant parser, but can still
+        // carry exporter prose, padded separators, missing indices, or a BOM that alass rejects.
+        // Canonicalize at the process boundary; this preserves cue text/timing while making the
+        // aligner's accepted input exactly the same set the service itself accepts.
+        let target_srt = canonical_srt(target_srt, "target")?;
+        let reference_srt = canonical_srt(reference_srt, "reference")?;
         let target = self.write_temp(tag, "target.srt", target_srt.as_bytes()).await?;
         // If the SECOND write fails, `finish` — the only cleanup — is never reached, and the first
         // file stays forever: the sync work dir has no sweep. Disk pressure is exactly when the
@@ -55,15 +60,16 @@ impl SyncTools {
             }
         };
         let out = self.temp_path(tag, "synced.srt");
-        // ffsubsync <reference> -i <unsynced> -o <out>. Reference-mode skips audio extraction.
+        // `--no-split` is the constant-offset mode: Tier 1's reference is already trusted to match
+        // this exact encode, so split detection buys no correctness and triples peak memory. Keep it
+        // before the positional arguments so the CLI contract is unambiguous in tests and logs.
         let run_result = self
             .run(
-                &self.ffsubsync,
+                &self.alass,
                 &[
+                    "--no-split",
                     reference.to_string_lossy().as_ref(),
-                    "-i",
                     target.to_string_lossy().as_ref(),
-                    "-o",
                     out.to_string_lossy().as_ref(),
                 ],
                 TIER1_BUDGET,
@@ -153,7 +159,7 @@ impl SyncTools {
     ) -> Result<String, String> {
         let result = match run_result {
             Ok(status) if status.success() => match read_capped(out).await {
-                // Exit 0 is the binary's opinion, not a result. ffsubsync and alass both exit 0
+                // Exit 0 is the binary's opinion, not a result. alass can exit 0
                 // having written nothing usable when handed a target they can't parse, and that
                 // empty string was cached for 60 days as the finished alignment — worse than the
                 // raw sub, which at least plays.
@@ -189,12 +195,20 @@ impl SyncTools {
     }
 }
 
+fn canonical_srt(body: &str, name: &str) -> Result<String, String> {
+    let cues = crate::srt::parse(body);
+    if cues.is_empty() {
+        return Err(format!("{name} subtitle has no cues"));
+    }
+    Ok(crate::srt::serialize(&cues))
+}
+
 async fn wait(mut child: tokio::process::Child) -> Result<std::process::ExitStatus, String> {
     child.wait().await.map_err(|e| format!("wait: {e}"))
 }
 
 // Exercise the process orchestration (spawn → arg contract → read back → cleanup) against fake
-// shell-script binaries, so no real `ffsubsync`/`alass` is needed. Unix-only: they rely on `/bin/sh`
+// shell-script binaries, so no real `alass` is needed. Unix-only: they rely on `/bin/sh`
 // and a `chmod +x` script, which is what CI (ubuntu) and the dev machine (macOS) both have.
 #[cfg(all(test, unix))]
 mod tests {
@@ -216,8 +230,8 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
-    fn tools(dir: &std::path::Path, ffsubsync: String) -> SyncTools {
-        SyncTools { ffsubsync, alass: "alass-unused".into(), work_dir: dir.to_path_buf() }
+    fn tools(dir: &std::path::Path, alass: String) -> SyncTools {
+        SyncTools { alass, work_dir: dir.to_path_buf() }
     }
 
     /// A real cue, because the tiers now have to return something that parses as a subtitle.
@@ -227,9 +241,9 @@ mod tests {
     #[tokio::test]
     async fn tier1_success_returns_synced_output_and_removes_temps() {
         let dir = work_dir("t1-ok");
-        // ffsubsync's contract is `<reference> -i <target> -o <out>`; positional $3=target, $5=out.
+        // Tier 1's contract is `--no-split <reference> <target> <out>`.
         // The fake "aligns" by copying the target through, so we can assert the round-trip.
-        let bin = fake_bin(&dir, "fake-ffsubsync", r#"cp "$3" "$5""#).await;
+        let bin = fake_bin(&dir, "fake-alass", r#"test "$1" = --no-split && cp "$3" "$4""#).await;
         let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-ok").await;
         assert_eq!(out.unwrap(), SUB);
         // Inputs and the output scratch file are all cleaned up on success.
@@ -240,9 +254,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tier1_canonicalizes_srt_that_the_service_accepts_but_alass_does_not() {
+        let dir = work_dir("t1-canonical");
+        let bin = fake_bin(
+            &dir,
+            "fake-alass",
+            r#"test "$1" = --no-split; ! grep -q 'exported by editor' "$2"; cp "$3" "$4""#,
+        )
+        .await;
+        let malformed = "\u{feff}exported by editor\r\n\r\n1\r\n00:00:01,000 --> 00:00:02,000\r\nhello";
+        let out = tools(&dir, bin).sync_to_reference(malformed, malformed, "tag-canonical").await.unwrap();
+        assert_eq!(crate::srt::parse(&out), crate::srt::parse(SUB));
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
     async fn tier1_nonzero_exit_errors_and_removes_input_temps() {
         let dir = work_dir("t1-fail");
-        let bin = fake_bin(&dir, "fake-ffsubsync", "exit 1").await;
+        let bin = fake_bin(&dir, "fake-alass", "exit 1").await;
         let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-fail").await;
         assert!(out.is_err());
         // A failed alignment must not leave its inputs behind for the next caller to trip over.
@@ -258,7 +287,8 @@ mod tests {
     async fn a_zero_exit_with_no_cues_is_not_an_alignment() {
         for (name, body) in [("empty", r#": > "$5""#), ("html", r#"echo '<html>nope</html>' > "$5""#)] {
             let dir = work_dir(&format!("t1-junk-{name}"));
-            let bin = fake_bin(&dir, "fake-ffsubsync", body).await;
+            let body = body.replace("$5", "$4");
+            let bin = fake_bin(&dir, "fake-alass", &body).await;
             let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-junk").await;
             assert!(out.is_err(), "{name} output was accepted as an alignment: {out:?}");
             assert!(!dir.join("tag-junk-target.srt").exists(), "{name} leaked its inputs");
@@ -281,7 +311,8 @@ mod tests {
             "printf '1\\n00:00:01,000 --> 00:00:02,000\\nhi\\n' > \"$5\"; head -c {} /dev/zero | tr '\\0' 'a' >> \"$5\"",
             crate::fetch::MAX_BODY
         );
-        let bin = fake_bin(&dir, "fake-ffsubsync", &script).await;
+        let script = script.replace("$5", "$4");
+        let bin = fake_bin(&dir, "fake-alass", &script).await;
         let out = tools(&dir, bin).sync_to_reference(SUB, REF, "tag-huge").await;
         let err = out.expect_err("an oversized alignment was accepted");
         assert!(err.contains("too large"), "refused for the wrong reason: {err}");
@@ -306,7 +337,7 @@ mod tests {
     async fn missing_binary_errors_and_still_removes_input_temps() {
         let dir = work_dir("t1-nobin");
         let out =
-            tools(&dir, "/nonexistent/xyzzy-ffsubsync".into()).sync_to_reference(SUB, REF, "tag-nobin").await;
+            tools(&dir, "/nonexistent/xyzzy-alass".into()).sync_to_reference(SUB, REF, "tag-nobin").await;
         assert!(out.is_err());
         // A spawn failure produced no exit status, but the temp inputs written before the spawn must
         // not leak — every request under a misconfigured binary path would otherwise pile them up.
@@ -321,7 +352,7 @@ mod tests {
     fn the_scratch_sweep_reclaims_what_a_cancelled_run_left() {
         let dir = work_dir("scratch-sweep");
         std::fs::create_dir_all(&dir).unwrap();
-        let tools = SyncTools { ffsubsync: "x".into(), alass: "y".into(), work_dir: dir.clone() };
+        let tools = SyncTools { alass: "y".into(), work_dir: dir.clone() };
 
         let abandoned = dir.join("old-tag-target.srt");
         let in_flight = dir.join("live-tag-target.srt");
@@ -344,8 +375,7 @@ mod tests {
         let dir = work_dir("t2-ok");
         // alass's contract is `<media> <target> <out>`; positional $2=target, $3=out.
         let bin = fake_bin(&dir, "fake-alass", r#"cp "$2" "$3""#).await;
-        let mut t = tools(&dir, "ffsubsync-unused".into());
-        t.alass = bin;
+        let t = tools(&dir, bin);
         let out = t.sync_to_audio(SUB, "http://192.168.1.9/s.mkv", "tag-t2").await;
         assert_eq!(out.unwrap(), SUB);
         assert!(!dir.join("tag-t2-target.srt").exists());

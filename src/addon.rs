@@ -27,7 +27,7 @@ use crate::httputil::{self, Body};
 use crate::logging::LogGate;
 use crate::opensubtitles;
 use crate::ratelimit;
-use crate::state::AppState;
+use crate::state::{AppState, SyncOutcome, SyncTier};
 use crate::userconfig::{LlmConfig, UserConfig};
 use crate::{resync, srt, translate};
 
@@ -67,6 +67,9 @@ const DEAD_FILE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
 /// value did not change: `translate_body_key` names the title, so a lost pin costs a download and
 /// nothing more. Kept long anyway; the pin is fifty bytes and the download is metered.
 const SOURCE_PIN_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 180);
+/// Bumped when Tier-1 output semantics change, so a deploy never serves a 60-day artifact produced
+/// by the previous aligner under a key that claims it is current.
+const TIER1_CACHE_VERSION: u8 = 2;
 
 /// The `Server-Timing` entry for an answer that came out of the cache rather than out of work.
 const CACHE_HIT: &str = "cache;desc=hit";
@@ -487,7 +490,7 @@ fn read_search(state: &AppState, key: &str) -> Option<(Vec<opensubtitles::Subtit
 /// Best, not first. This runs after `rank`, which sorts by language ascending, so taking the first
 /// hash match took the one belonging to the alphabetically-lowest language code — Arabic before
 /// English. Every hash match is equally correct about timing, but they are not equally useful AS a
-/// reference: a hash-matched forced/signs-only track is a handful of cues, and handing ffsubsync a
+/// reference: a hash-matched forced/signs-only track is a handful of cues, and handing the aligner a
 /// near-empty reference produces a bad alignment that then caches for sixty days. `fit_score` has no
 /// cue count to work from, but trust/ratings/downloads separate a full dialogue track from a signs
 /// track well enough.
@@ -735,8 +738,10 @@ async fn sync_and_cache(
         let aligned =
             match resync::Relay::open(&url, &state.cfg.scout_origins, &state.cfg.scout_aliases).await {
                 Ok(relay) => {
-                    let _slot = state.sync_slots.acquire().await;
-                    state.sync.sync_to_audio(&target, &relay.url(), &tag).await
+                    let mut slot = state.sync_admission.acquire(SyncTier::Tier2).await;
+                    let result = state.sync.sync_to_audio(&target, &relay.url(), &tag).await;
+                    slot.finish(sync_outcome(&result));
+                    result
                 }
                 Err(e) => Err(e),
             };
@@ -757,8 +762,10 @@ async fn sync_and_cache(
         match subtitle_srt(state, client, r, None).await {
             Ok(reference) => {
                 let aligned = {
-                    let _slot = state.sync_slots.acquire().await;
-                    state.sync.sync_to_reference(&target, &reference, &tag).await
+                    let mut slot = state.sync_admission.acquire(SyncTier::Tier1).await;
+                    let result = state.sync.sync_to_reference(&target, &reference, &tag).await;
+                    slot.finish(sync_outcome(&result));
+                    result
                 };
                 match aligned {
                     Ok(s) => Some(s),
@@ -813,6 +820,14 @@ async fn sync_and_cache(
         // this is a stand-in and must revalidate rather than being pinned for a year.
         None if settled => httputil::srt(target),
         None => httputil::srt_provisional(target),
+    }
+}
+
+fn sync_outcome(result: &Result<String, String>) -> SyncOutcome {
+    match result {
+        Ok(_) => SyncOutcome::Completed,
+        Err(e) if e.ends_with(" timed out") => SyncOutcome::TimedOut,
+        Err(_) => SyncOutcome::Failed,
     }
 }
 
@@ -1016,7 +1031,7 @@ fn remember_failure(
 /// The `ref` a request may actually use. `tier1_ref_for` refuses a self-reference when it BUILDS a
 /// URL, but this value arrives on the query string where anyone can name it: `?ref=5` on file 5
 /// spawned a tier binary to align a file to itself — a subprocess, on the one runtime thread, for a
-/// guaranteed no-op — and filed the result under `os:5:ref:5` as though an alignment had happened.
+/// guaranteed no-op — and filed the result under a reference key as though an alignment had happened.
 fn vetted_ref(file_id: i64, ref_id: Option<i64>) -> Option<i64> {
     ref_id.filter(|&r| r != file_id)
 }
@@ -1038,7 +1053,7 @@ fn os_base_key(file_id: i64) -> String {
 fn sync_cache_key(base: &str, resync_url: &Option<String>, ref_id: Option<i64>) -> String {
     match (resync_url, ref_id) {
         (Some(url), _) => format!("{base}:resync:{}", short_hash(url)),
-        (None, Some(r)) => format!("{base}:ref:{r}"),
+        (None, Some(r)) => format!("{base}:ref:v{TIER1_CACHE_VERSION}:{r}"),
         (None, None) => base.to_string(),
     }
 }
@@ -1505,7 +1520,7 @@ pub async fn handle_translate(
     // A failed search here means no anchor, and no anchor means carry on without one: `ref_id`
     // becomes `None`, `sync_cache_key` keys on `body_key` itself, and that IS the honest identity of
     // an unaligned body — not a key an aligned one should have owned. Nothing is mis-filed, and a
-    // later request that does find an anchor misses `body_key:ref:R` and aligns then.
+    // later request that does find an anchor misses the versioned reference key and aligns then.
     //
     // Two stricter versions of this were both worse. Refusing outright returned 502 for a title
     // already bought and cached; returning early with whatever happened to be cached could not
@@ -1823,7 +1838,7 @@ pub async fn handle_translate(
         let ref_id = align_for(used_source);
         let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
         // The cheap half. Run here even for the `.json` form so the engine's follow-up fetch is a
-        // cache hit rather than an ffsubsync spawn with the viewer waiting on it.
+        // cache hit rather than an aligner spawn with the viewer waiting on it.
         let resp = sync_and_cache(
             state,
             &client,
@@ -2210,7 +2225,7 @@ mod tests {
     }
 
     /// The anchor is the BEST hash match, not the first one in language order. `tier1_reference`
-    /// runs after `rank` sorts by language ascending, so `find` handed ffsubsync whichever hash match
+    /// runs after `rank` sorts by language ascending, so `find` handed the aligner whichever hash match
     /// belonged to the alphabetically-lowest language code — and a hash-matched forced/signs-only
     /// track is a handful of cues, which makes a poor reference and a bad alignment that then caches
     /// for sixty days.
@@ -2328,7 +2343,7 @@ mod tests {
         let aligned = sync_cache_key(&os_base_key(5), &None, Some(9));
         let resynced = sync_cache_key(&os_base_key(5), &Some("http://host/s.mkv".into()), None);
         assert_eq!(raw, "os:5");
-        assert_eq!(aligned, "os:5:ref:9");
+        assert_eq!(aligned, "os:5:ref:v2:9");
         assert!(resynced.starts_with("os:5:resync:"));
         // The three variants must never collide — else an aligned sub is served from the raw entry.
         assert_ne!(raw, aligned);
@@ -2392,7 +2407,7 @@ mod sync_fallback_tests {
     #[test]
     fn a_rejected_resync_target_leaves_a_plain_request() {
         let vetted: Option<String> = None; // what the SSRF guard leaves behind
-        assert_eq!(sync_cache_key(&os_base_key(5), &vetted, Some(9)), "os:5:ref:9");
+        assert_eq!(sync_cache_key(&os_base_key(5), &vetted, Some(9)), "os:5:ref:v2:9");
         assert_eq!(sync_cache_key(&os_base_key(5), &vetted, None), "os:5");
         // Two different targets stay distinct, so one stream's alignment is never served for another.
         assert_ne!(
@@ -2503,7 +2518,6 @@ mod translate_retry_tests {
             cache_dir: dir,
             cache_max_bytes: 1 << 20,
             public_base_url: None,
-            ffsubsync: "ffsubsync".into(),
             alass: "alass".into(),
             config_key: String::new(),
             config_keys_prev: String::new(),

@@ -13,7 +13,6 @@ pub struct Config {
     /// Fixed public origin for building `/subtitle/…` URLs we hand back; falls back to forwarded
     /// headers when unset.
     pub public_base_url: Option<String>,
-    pub ffsubsync: String,
     pub alass: String,
     /// Sealed config-in-URL (den-scout/docs/SEALED-CONFIG.md). `config_key` = current X25519 private key
     /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
@@ -59,7 +58,6 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256 * 1024 * 1024), // 256 MB — SRTs are tiny, this holds a lot of films
             public_base_url: env_opt("PUBLIC_BASE_URL"),
-            ffsubsync: env_opt("FFSUBSYNC_PATH").unwrap_or_else(|| "ffsubsync".to_string()),
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
