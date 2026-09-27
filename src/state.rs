@@ -235,16 +235,11 @@ impl SyncAdmission {
     pub async fn reserve(&self, tier: SyncTier) -> SyncReservation<'_> {
         let queued_at = Instant::now();
         let (preparation, stats, weight) = self.parts(tier);
-        let preparation_permit =
-            preparation.acquire().await.expect("sync tier semaphore is never closed");
+        let preparation_permit = preparation.acquire().await.expect("sync tier semaphore is never closed");
         let elapsed = queued_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         stats.queued.fetch_add(1, Ordering::Relaxed);
         stats.queue_ns.fetch_add(elapsed, Ordering::Relaxed);
-        SyncReservation {
-            stats,
-            weight,
-            _preparation_permit: preparation_permit,
-        }
+        SyncReservation { stats, weight, _preparation_permit: preparation_permit }
     }
 
     /// Admit a prepared job to the weighted subprocess budget. The reservation remains held until
@@ -260,12 +255,7 @@ impl SyncAdmission {
         reservation.stats.queue_ns.fetch_add(elapsed, Ordering::Relaxed);
         let stats = reservation.stats;
         stats.running.fetch_add(1, Ordering::Relaxed);
-        SyncPermit {
-            stats,
-            _reservation: reservation,
-            _memory_permit: memory_permit,
-            finished: false,
-        }
+        SyncPermit { stats, _reservation: reservation, _memory_permit: memory_permit, finished: false }
     }
 
     pub fn stats(&self, tier: SyncTier) -> SyncStats {
@@ -323,11 +313,7 @@ mod sync_admission_tests {
         let tier1_reservation = admission.reserve(SyncTier::Tier1).await;
         let mut tier1 = admission.acquire(tier1_reservation).await;
         let second = admission.reserve(SyncTier::Tier1).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), admission.acquire(second))
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(10), admission.acquire(second)).await.is_err());
         tier1.finish(SyncOutcome::Completed);
         tier2.finish(SyncOutcome::Completed);
         let one = admission.stats(SyncTier::Tier1);
@@ -414,15 +400,9 @@ mod sync_admission_tests {
             })
         };
         tokio::task::yield_now().await;
-        assert!(
-            !waiting.is_finished(),
-            "a fifth Tier-1 request passed the four-body bound"
-        );
+        assert!(!waiting.is_finished(), "a fifth Tier-1 request passed the four-body bound");
         drop(held.pop());
-        tokio::time::timeout(Duration::from_secs(1), acquired_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), acquired_rx).await.unwrap().unwrap();
         let _ = release_tx.send(());
         waiting.await.unwrap();
     }

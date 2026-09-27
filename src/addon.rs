@@ -745,10 +745,7 @@ async fn sync_and_cache(
         // marker exists to prevent.
         if backed_off() {
             let Some(target) = retained_sync_target(state, target, translated_body_key) else {
-                return httputil::error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "translation_unavailable",
-                );
+                return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "translation_unavailable");
             };
             return httputil::degraded(httputil::srt_provisional(target), "sync_failed");
         }
@@ -785,19 +782,18 @@ async fn sync_and_cache(
         // alass is handed a loopback relay, never `url`: ffmpeg would re-resolve the name and follow
         // redirects on its own (see `resync.rs`). The relay follows the redirect chain here, before
         // the permit, for the reason Tier 1 fetches its reference first — it is network work.
-        let aligned =
-            match resync::Relay::open(&url, &state.cfg.scout_origins, &state.cfg.scout_aliases).await {
-                Ok(relay) => {
-                    let prepared = reservation
-                        .take()
-                        .expect("Tier-2 sync was reserved before retaining bodies");
-                    let mut slot = state.sync_admission.acquire(prepared).await;
-                    let result = state.sync.sync_to_audio(&target, &relay.url(), &tag).await;
-                    slot.finish(sync_outcome(&result));
-                    result
-                }
-                Err(e) => Err(e),
-            };
+        let aligned = match resync::Relay::open(&url, &state.cfg.scout_origins, &state.cfg.scout_aliases)
+            .await
+        {
+            Ok(relay) => {
+                let prepared = reservation.take().expect("Tier-2 sync was reserved before retaining bodies");
+                let mut slot = state.sync_admission.acquire(prepared).await;
+                let result = state.sync.sync_to_audio(&target, &relay.url(), &tag).await;
+                slot.finish(sync_outcome(&result));
+                result
+            }
+            Err(e) => Err(e),
+        };
         match aligned {
             Ok(s) => Some(s),
             Err(e) => {
@@ -815,9 +811,8 @@ async fn sync_and_cache(
         match subtitle_srt(state, client, r, None).await {
             Ok(reference) => {
                 let aligned = {
-                    let prepared = reservation
-                        .take()
-                        .expect("Tier-1 sync was reserved before retaining bodies");
+                    let prepared =
+                        reservation.take().expect("Tier-1 sync was reserved before retaining bodies");
                     let mut slot = state.sync_admission.acquire(prepared).await;
                     let result = state.sync.sync_to_reference(&target, &reference, &tag).await;
                     slot.finish(sync_outcome(&result));
