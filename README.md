@@ -19,7 +19,7 @@ Den (engine)   ──GET …/English.srt─────────────�
 
 It's the **den-reel shape** (an I/O proxy whose CPU work lives in subprocesses), not the den-scout
 shape — so it's Rust: hyper + tokio + reqwest-rustls + `tokio::process`, with a slim-debian runtime
-carrying `alass`/`ffsubsync`/`ffmpeg`.
+carrying `alass`/`ffmpeg`.
 
 ## Why each piece
 
@@ -54,7 +54,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
 (`src/sync.rs`) — now wired into the request path:
 
 - **Tier 1 (automatic).** When a search returns a hash-matched sub, every other sub is handed back
-  with `?ref=<id>` and reference-aligned to that anchor on fetch (`ffsubsync`, no audio).
+  with `?ref=<id>` and reference-aligned to that anchor on fetch (`alass --no-split`, no audio).
+  Tier 1 admits up to four jobs within a weighted memory budget.
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
   non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon runs `alass`
   against the stream audio server-side and the app swaps in the re-synced track. The stream URL has
@@ -64,6 +65,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   served unaligned. alass never gets the URL itself: it reads a relay on 127.0.0.1 that follows
   scout's redirect to the debrid CDN, refuses a hop that is neither a listed origin nor a public
   address, pins the address it checked, and never passes a redirect on to ffmpeg.
+  Tier 2 is limited to one job and consumes three of the four memory-budget units, always reserving
+  one for Tier 1. Each tier has its own FIFO queue, so neither can starve the other.
 
 Known gap: Tier 1 needs a hash-matched anchor in the results. When the search returns *no* hash
 match — the common out-of-sync case — there is no trusted reference, so Tier 1 stays off and the sub
@@ -108,7 +111,8 @@ key across batches and films. The first successful answer ends a pause.
 - `GET /metrics` — Prometheus text for `Authorization: Bearer <METRICS_TOKEN>`; the unknown-path 404
   when the token is unset or wrong. It publishes what the addon already keeps — `subtitles_build_info`,
   the OpenSubtitles failure streak behind `/health`, the memory cache's bytes and entries, whether the
-  disk tier is on and how many of its writes failed, and the sync jobs and translations running now —
+  disk tier is on and how many of its writes failed, translations running now, and fixed-cardinality
+  per-tier sync running, queue-time, admission, completion, timeout, failure and cancellation series —
   computed per scrape, with nothing per-install in the labels.
 - `GET /`, `GET /configure` — the install page that builds (and, with `CONFIG_KEY` set, seals) the
   config segment.
@@ -185,8 +189,7 @@ it optional (`.env.example` lists the same):
 | `LOG_REQUESTS` | unset (off; `0` is off too) | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, with the config segment as `<config>` and no query string. |
 | `SCOUT_ORIGINS` | unset (Tier 2 off) | Comma-separated den-scout origins (`http://192.168.86.193:8080`) a `?resync=` target may be at — the origin of the stream URLs scout hands the app. |
 | `SCOUT_ALIASES` | unset | `<public origin>=<LAN origin>` pairs (`https://d-play.oxy.fi=http://192.168.86.193:8080`): a resync target on scout's public name is fetched at its LAN address, so two services on one box never go through the WAN and the tunnel. Both sides must also be in `SCOUT_ORIGINS`. |
-| `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-2 audio sync. |
-| `FFSUBSYNC_PATH` | `ffsubsync` (image: `/usr/local/bin/ffsubsync`) | The `ffsubsync` binary for Tier-1 reference sync. |
+| `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-1 reference and Tier-2 audio sync. |
 
 On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host` header is fine —
 leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients (i.e. exposed
@@ -197,11 +200,12 @@ lets a forged header steer those URLs at an attacker's server.
 
 ```sh
 cp .env.example .env          # infra only — keys are entered at /configure
-cargo run                     # local (needs alass/ffsubsync on PATH for the sync tiers)
+cargo run                     # local (needs alass on PATH for the sync tiers)
 # or
 docker build -t den-subtitles . && docker run -p 8093:8093 --env-file .env den-subtitles
 
 cargo test --locked           # what CI runs, with cargo fmt --check and clippy -D warnings
+./scripts/tier1-corpus.py     # parity + >=2x runtime/RSS gate (needs legacy ffsubsync too)
 OPENSUBTITLES_KEY=… ./scripts/smoke.sh   # live smoke test against the real OpenSubtitles API
 ```
 

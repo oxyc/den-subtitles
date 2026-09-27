@@ -12,9 +12,9 @@ user's LLM bill, CPU/subprocess spawns) → performance → new surface area.**
 - ~~Charset detection / `encoding_rs` in `fetch.rs`~~. The api.opensubtitles.com `/download` endpoint
   converts server-side; the file behind the temporary link is always UTF-8, so `from_utf8_lossy`
   (`fetch.rs:36`) never corrupts anything. Replaced by task 15.
-- ~~Consensus clustering as a Tier-1 anchor~~. `sync.rs:104` nulls ffsubsync's stdout/stderr so no
-  offset is reported, and ffsubsync applies a framerate *scale*, not a scalar shift. Pairwise over N
-  candidates is N-1 Python spawns at `TIER1_BUDGET` = 20s each (`sync.rs:34`) on a
+- ~~Consensus clustering as a Tier-1 anchor~~. The aligner applies a framerate *scale*, not only a
+  scalar shift. Pairwise over N
+  candidates is N-1 aligner spawns at `TIER1_BUDGET` = 20s each (`sync.rs:33`) on a
   `new_current_thread` runtime (`main.rs:229`). Not viable in a request path.
 - ~~Add the video hash to the translate cache key~~. It would mint a fresh full-film LLM bill per
   encode — exactly what that key is shaped to avoid. See task 5 for the correct shape.
@@ -33,7 +33,7 @@ backoff, and every second target language for the same film, pays again for a ca
 ### 2. Tier-1 picks the alphabetically-first hash match, not the best one
 `tier1_reference` (`addon.rs:258`) is `find(|s| s.hash_match)`, called at `addon.rs:218` *after*
 `rank` sorted by `lang` ascending (`opensubtitles.rs:194`). A hash-matched forced/signs-only track —
-a handful of cues — therefore beats a full one as the ffsubsync reference, and the bad alignment
+a handful of cues — therefore beats a full one as the Tier-1 reference, and the bad alignment
 caches for 60 days.
 
 **Fix:** `max_by_key(|s| (s.hash_match, fit_score(s, None)))` over the hash matches. No invariant
