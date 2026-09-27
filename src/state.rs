@@ -15,7 +15,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 /// CI runs one real audio Tier-2 job (alass and its ffprobe/ffmpeg children, on a two-hour 5.1
 /// soundtrack) beside back-to-back Tier-1 jobs, the service and the same 112 MiB, in a fresh 512 MiB
 /// cgroup, against the same 400 MiB ceiling; it peaks near 310 MiB. Tier-2 alass holds about
-/// 117 MiB RSS and ffmpeg about 52 MiB, which is what the two units must cover.
+/// 115 MiB RSS and ffmpeg about 56 MiB, which is what the two units must cover.
 const SYNC_MEMORY_UNITS: usize = 3;
 const TIER1_SLOTS: usize = 3;
 const TIER2_SLOTS: usize = 1;
