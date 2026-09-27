@@ -224,6 +224,12 @@ CI additionally runs the corpus image in the same 512 MiB cgroup as production. 
 service resident and three real Tier-1 aligners running, it forces 112 MiB resident to model a full
 64 MiB cache with allocator overhead plus every running/prepared tier's capped bodies and buffers. The
 gate requires total cgroup usage to stay below 400 MiB, preserving at least 112 MiB of headroom.
+A second run in a fresh 512 MiB container (`--tier2-memory-gate`) measures admission's other
+maximum under the same ceiling: one real audio Tier-2 job — `alass` against a two-hour synthetic 5.1
+soundtrack built into the corpus image, over a loopback URL as in production, with its
+ffprobe/ffmpeg children — beside back-to-back Tier-1 jobs, the service and the same 112 MiB. It also
+requires that alass's ffmpeg child was seen in the cgroup and that Tier 2 repaired the fixture's
+offset and mid-film cut to within 250 ms at p95.
 
 ## Deploy
 
