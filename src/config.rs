@@ -6,11 +6,6 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Hard ceiling for the in-memory hot tier. This is coupled to the three-slot sync admission and
-/// its 512 MiB full-service CI gate; an environment override may shrink it, never spend headroom
-/// reserved for subprocesses and transient buffers.
-pub const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
-
 pub struct Config {
     pub port: u16,
     pub cache_dir: PathBuf,
@@ -61,12 +56,9 @@ impl Config {
             cache_dir,
             cache_max_bytes: env_opt("CACHE_MAX_BYTES")
                 .and_then(|v| v.parse().ok())
-                // The production cgroup is 512 MiB. Three measured Tier-1 children plus retained
-                // inputs need about 230 MiB, and the service, allocator overhead and network/TLS
-                // buffers need room too. Persistence keeps the larger cold tier on disk; memory is
-                // deliberately only the hot 64 MiB slice.
-                .unwrap_or(MAX_CACHE_BYTES)
-                .min(MAX_CACHE_BYTES),
+                // The disk budget. Memory is clamped to `cache::MAX_MEMORY_BYTES` so the 512 MiB
+                // cgroup keeps room for three Tier-1 children, the service and its buffers.
+                .unwrap_or(256 * 1024 * 1024),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),

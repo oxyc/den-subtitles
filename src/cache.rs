@@ -27,6 +27,11 @@ pub const SEARCH_NS: &str = "search:";
 pub const OS_NS: &str = "os:";
 pub const TRANSLATE_NS: &str = "translate:";
 
+/// Hard ceiling for the in-memory hot tier. This is coupled to the three-slot sync admission and
+/// its 512 MiB full-service CI gate: a larger `CACHE_MAX_BYTES` grows only the disk tier, never the
+/// resident headroom reserved for subprocesses and transient buffers.
+pub const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+
 struct Entry {
     value: String,
     size: usize,
@@ -37,7 +42,9 @@ struct Entry {
 
 pub struct Cache {
     inner: Mutex<Inner>,
+    /// Memory budget: `disk_max_bytes` clamped to `MAX_MEMORY_BYTES`.
     max_bytes: usize,
+    disk_max_bytes: usize,
     /// Disk tier directory, or `None` when persistence is off (memory-only).
     dir: Option<PathBuf>,
 }
@@ -80,8 +87,12 @@ impl Cache {
                 None
             }
         });
-        let cache =
-            Cache { inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, tick: 0 }), max_bytes, dir };
+        let cache = Cache {
+            inner: Mutex::new(Inner { map: HashMap::new(), bytes: 0, tick: 0 }),
+            max_bytes: max_bytes.min(MAX_MEMORY_BYTES),
+            disk_max_bytes: max_bytes,
+            dir,
+        };
         cache.sweep();
         cache
     }
@@ -175,7 +186,7 @@ impl Cache {
             live.push((mtime, meta.len(), path));
         }
         let mut total: u64 = live.iter().map(|(_, size, _)| size).sum();
-        let budget = self.max_bytes as u64;
+        let budget = self.disk_max_bytes as u64;
         if total <= budget {
             return;
         }
@@ -740,6 +751,13 @@ mod tests {
         c.put("c".into(), "0123456789".into(), HOUR);
         assert_eq!(c.get("b"), None, "the least recently used entry should have gone");
         assert_eq!(c.get("a"), Some("0123456789".into()));
+    }
+
+    #[test]
+    fn a_large_budget_grows_disk_but_not_memory() {
+        let c = Cache::new(256 * 1024 * 1024, None);
+        assert_eq!(c.max_bytes, MAX_MEMORY_BYTES);
+        assert_eq!(c.disk_max_bytes, 256 * 1024 * 1024);
     }
 
     #[test]

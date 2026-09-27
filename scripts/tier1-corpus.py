@@ -277,7 +277,6 @@ def full_service_memory_peak(
         {
             "PORT": "18093",
             "CACHE_DIR": str(cache_dir),
-            "CACHE_MAX_BYTES": str(64 * 1024 * 1024),
             "ALASS_PATH": alass,
         }
     )
@@ -422,6 +421,13 @@ def main() -> int:
         print(f"RESOURCE split_plus_tier1_proxy_peak_rss_kb={mixed_proxy_peak_kb}")
         if ff_wall / al_wall < 2 or ff_rss / al_rss < 2:
             failed.append("resource gate missed: both median runtime and peak RSS must improve by >=2x")
+        # The full-service gate below runs three Tier-1 children. Admission's other maximum, one
+        # Tier-2 job plus one Tier-1 job, is covered by it only while its proxy peak stays lower.
+        if mixed_proxy_peak_kb > tier1_peak_kb:
+            failed.append(
+                "admission memory gate missed: split-plus-Tier-1 proxy exceeds the gated "
+                "three-Tier-1 peak"
+            )
         if args.cgroup_memory_gate:
             headroom = service_limit_bytes - service_peak_bytes
             print(

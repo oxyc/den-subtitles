@@ -184,7 +184,7 @@ it optional (`.env.example` lists the same):
 |---|---|---|
 | `PORT` | `8093` | HTTP listen port. |
 | `CACHE_DIR` | `$TMPDIR/den-subtitles-cache` (image: `/cache`) | Disk cache tier and the sync scratch dir. |
-| `CACHE_MAX_BYTES` | `67108864` (64 MiB) | In-memory hot-cache byte budget and hard maximum; the persistent disk tier keeps the larger working set. |
+| `CACHE_MAX_BYTES` | `268435456` (256 MiB) | Disk cache byte budget. The in-memory hot tier uses the same value clamped to 64 MiB, which the 512 MiB sync budget depends on. |
 | `PUBLIC_BASE_URL` | unset (derived from `Host`) | Fixed origin for the `/subtitle` and `/translate` URLs handed back to the app. |
 | `CONFIG_KEY` | unset (sealing off) | Base64 X25519 private key `/configure` seals configs to; back it up. |
 | `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working — which is also why rotation is not revocation. |
