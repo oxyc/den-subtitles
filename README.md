@@ -55,8 +55,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
 
 - **Tier 1 (automatic).** When a search returns a hash-matched sub, every other sub is handed back
   with `?ref=<id>` and reference-aligned to that anchor on fetch (`alass --no-split`, no audio).
-  Tier 1 admits up to four jobs within a weighted memory budget. Exact-key singleflight runs before
-  admission, and the four-place Tier-1 preparation gate is taken before either subtitle is fetched;
+  Tier 1 admits up to three jobs within a weighted memory budget. Exact-key singleflight runs before
+  admission, and the three-place Tier-1 preparation gate is taken before either subtitle is fetched;
   queued requests therefore retain no subtitle bodies. Subtitle inputs and aligner output are capped
   at 2 MiB. The PR corpus gates timing parity against `ffsubsync` across cross-language split/merged,
   missing/extra-cue, malformed, drift, sparse and long-track fixtures without shipping `ffsubsync`.
@@ -69,7 +69,7 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   served unaligned. alass never gets the URL itself: it reads a relay on 127.0.0.1 that follows
   scout's redirect to the debrid CDN, refuses a hop that is neither a listed origin nor a public
   address, pins the address it checked, and never passes a redirect on to ffmpeg.
-  Tier 2 is limited to one prepared/running job and consumes three of the four memory-budget units,
+  Tier 2 is limited to one prepared/running job and consumes two of the three memory-budget units,
   always reserving one for Tier 1. Each tier has its own FIFO preparation queue, so neither can
   retain bodies in or starve the other tier's queue.
 
@@ -184,7 +184,7 @@ it optional (`.env.example` lists the same):
 |---|---|---|
 | `PORT` | `8093` | HTTP listen port. |
 | `CACHE_DIR` | `$TMPDIR/den-subtitles-cache` (image: `/cache`) | Disk cache tier and the sync scratch dir. |
-| `CACHE_MAX_BYTES` | `268435456` (256 MiB) | Cache byte budget. |
+| `CACHE_MAX_BYTES` | `67108864` (64 MiB) | In-memory hot-cache byte budget and hard maximum; the persistent disk tier keeps the larger working set. |
 | `PUBLIC_BASE_URL` | unset (derived from `Host`) | Fixed origin for the `/subtitle` and `/translate` URLs handed back to the app. |
 | `CONFIG_KEY` | unset (sealing off) | Base64 X25519 private key `/configure` seals configs to; back it up. |
 | `CONFIG_KEYS_PREV` | unset | Comma-separated prior keys, so a rotation keeps old installs working — which is also why rotation is not revocation. |
@@ -219,6 +219,11 @@ OpenSubtitles result ordering, the Tier-1 reference selection, the `?resync=` ta
 its relay (a redirect to an internal address is never followed), the
 router's status codes and headers, and the sync subprocess orchestration (spawn → arg contract →
 read-back → cleanup, against fake binaries).
+
+CI additionally runs the corpus image in the same 512 MiB cgroup as production. With the real
+service resident and three real Tier-1 aligners running, it forces 112 MiB resident to model a full
+64 MiB cache with allocator overhead plus every running/prepared tier's capped bodies and buffers. The
+gate requires total cgroup usage to stay below 400 MiB, preserving at least 112 MiB of headroom.
 
 ## Deploy
 

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import tempfile
@@ -246,11 +248,103 @@ def concurrent_peak(commands: list[list[str]]) -> int:
     return peak_rss
 
 
+def cgroup_value(name: str) -> int:
+    path = Path("/sys/fs/cgroup") / name
+    value = path.read_text().strip()
+    if value == "max":
+        raise RuntimeError(f"{name} is unlimited; run the gate with --memory=512m")
+    return int(value)
+
+
+def full_service_memory_peak(
+    root: Path, alass: str, reference: Path, incoming: Path
+) -> tuple[int, int, int]:
+    """Measure the whole container at the admitted Tier-1 maximum, not just child RSS.
+
+    The live cache payload cap is 64 MiB. Python owns and touches 112 MiB here: 80 MiB models that
+    cache plus 25% allocator/HashMap overhead, and 32 MiB covers three running Tier-1 jobs plus the
+    separately prepared Tier-2 job's capped Strings and network buffers. The real service, shared
+    libraries, corpus runner, page cache and three real alass children are charged as well.
+    """
+    limit = cgroup_value("memory.max")
+    if limit > 512 * 1024 * 1024:
+        raise RuntimeError(f"memory.max is {limit}, expected a 512 MiB-or-smaller cgroup")
+
+    cache_dir = root / "service-cache"
+    cache_dir.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "PORT": "18093",
+            "CACHE_DIR": str(cache_dir),
+            "CACHE_MAX_BYTES": str(64 * 1024 * 1024),
+            "ALASS_PATH": alass,
+        }
+    )
+    service = subprocess.Popen(
+        ["den-subtitles"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
+    )
+    forced = None
+    procs: list[subprocess.Popen[str]] = []
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if service.poll() is not None:
+                _, stderr = service.communicate()
+                raise RuntimeError(f"service failed to start: {stderr[-500:]}")
+            try:
+                with socket.create_connection(("127.0.0.1", 18093), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.02)
+        else:
+            raise RuntimeError("service did not listen within 10 seconds")
+
+        forced = bytearray(112 * 1024 * 1024)
+        for page in range(0, len(forced), 4096):
+            forced[page] = 1
+
+        commands = [
+            [alass, "--no-split", str(reference), str(incoming), str(root / f"full-service-{i}.srt")]
+            for i in range(3)
+        ]
+        procs = [
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            for command in commands
+        ]
+        peak = cgroup_value("memory.current")
+        rss_peak_kb = process_tree_rss_kb(os.getpid())
+        while any(proc.poll() is None for proc in procs):
+            peak = max(peak, cgroup_value("memory.current"))
+            rss_peak_kb = max(rss_peak_kb, process_tree_rss_kb(os.getpid()))
+            time.sleep(0.005)
+        for command, proc in zip(commands, procs):
+            _, stderr = proc.communicate()
+            if proc.returncode:
+                raise RuntimeError(f"{' '.join(command[:2])} failed: {stderr[-500:]}")
+        peak = max(peak, cgroup_value("memory.current"), cgroup_value("memory.peak"))
+        return peak, limit, rss_peak_kb
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        if service.poll() is None:
+            service.terminate()
+            try:
+                service.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                service.kill()
+                service.wait()
+        forced = None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--alass", default="alass")
     parser.add_argument("--ffsubsync", default="ffsubsync")
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--cgroup-memory-gate", action="store_true")
     args = parser.parse_args()
     for binary in (args.alass, args.ffsubsync):
         if not (Path(binary).is_file() or shutil.which(binary)):
@@ -259,6 +353,7 @@ def main() -> int:
     failed = []
     resource: dict[str, list[tuple[float, int]]] = {"ffsubsync": [], "alass": []}
     tier1_peak_kb = mixed_proxy_peak_kb = 0
+    service_peak_bytes = service_limit_bytes = service_rss_peak_kb = 0
     with tempfile.TemporaryDirectory(prefix="den-tier1-corpus-") as raw:
         root = Path(raw)
         for case in CASES:
@@ -295,12 +390,12 @@ def main() -> int:
                         resource["ffsubsync"].append(timed(ff))
                         resource["alass"].append(timed(al))
                     tier1_commands = []
-                    for index in range(4):
+                    for index in range(3):
                         output = root / f"long-film-al-{index}.srt"
                         tier1_commands.append([args.alass, "--no-split", str(ref), str(inc), str(output)])
                     tier1_peak_kb = concurrent_peak(tier1_commands)
-                    # Admission weights one split-aware Tier-2 job as three Tier-1 units and reserves
-                    # the fourth for cheap work. Subtitle-reference split mode is a conservative DP
+                    # Admission weights one split-aware Tier-2 job as two Tier-1 units and reserves
+                    # the third for cheap work. Subtitle-reference split mode is a conservative DP
                     # memory proxy; the production Tier-2 benchmark must still include ffmpeg/audio.
                     mixed_proxy_peak_kb = concurrent_peak(
                         [
@@ -308,6 +403,10 @@ def main() -> int:
                             [args.alass, "--no-split", str(ref), str(inc), str(root / "long-film-cheap.srt")],
                         ]
                     )
+                    if args.cgroup_memory_gate:
+                        service_peak_bytes, service_limit_bytes, service_rss_peak_kb = (
+                            full_service_memory_peak(root, args.alass, ref, inc)
+                        )
             except (AssertionError, RuntimeError, UnicodeError) as error:
                 failed.append(f"{case.name}: {error}")
                 print(f"FAIL {case.name}: {error}")
@@ -319,12 +418,23 @@ def main() -> int:
         al_rss = statistics.median(v[1] for v in resource["alass"])
         print(f"RESOURCE median wall_s ff={ff_wall:.3f} alass={al_wall:.3f} speedup={ff_wall/al_wall:.2f}x")
         print(f"RESOURCE median max_rss_kb ff={ff_rss:.0f} alass={al_rss:.0f} reduction={ff_rss/al_rss:.2f}x")
-        print(f"RESOURCE four_tier1_peak_rss_kb={tier1_peak_kb}")
+        print(f"RESOURCE three_tier1_peak_rss_kb={tier1_peak_kb}")
         print(f"RESOURCE split_plus_tier1_proxy_peak_rss_kb={mixed_proxy_peak_kb}")
         if ff_wall / al_wall < 2 or ff_rss / al_rss < 2:
             failed.append("resource gate missed: both median runtime and peak RSS must improve by >=2x")
-        if tier1_peak_kb >= 450 * 1024 or mixed_proxy_peak_kb >= 480 * 1024:
-            failed.append("admission memory gate missed: subprocess peak leaves insufficient room under 512 MiB")
+        if args.cgroup_memory_gate:
+            headroom = service_limit_bytes - service_peak_bytes
+            print(
+                "RESOURCE full_service_cgroup_peak_bytes="
+                f"{service_peak_bytes} limit_bytes={service_limit_bytes} headroom_bytes={headroom} "
+                f"process_tree_peak_rss_kb={service_rss_peak_kb} "
+                "forced_cache_and_body_model_bytes=117440512"
+            )
+            if service_peak_bytes > 400 * 1024 * 1024:
+                failed.append(
+                    "full-service memory gate missed: total cgroup peak must leave >=112 MiB "
+                    "under the 512 MiB production limit"
+                )
 
     if failed:
         print("\nGATE FAILED")

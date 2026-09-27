@@ -7,14 +7,16 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-/// Admission is expressed in the measured ~100 MiB Tier-1 working set. Four units stay below the
-/// container's 512 MiB limit with the tiny Rust process; Tier 2 conservatively takes three, leaving
-/// one unit for Tier 1 so an audio decode can never stop every cheap reference alignment.
-const SYNC_MEMORY_UNITS: usize = 4;
-const TIER1_SLOTS: usize = 4;
+/// Admission and the 64 MiB memory-cache cap are one 512 MiB cgroup budget. Three concurrent
+/// Tier-1 children measure about 200 MiB total; CI additionally forces 112 MiB resident for a full
+/// cache (including allocator overhead) plus retained inputs/outputs and requires at least 112 MiB
+/// cgroup headroom with the real service running. Tier 2 takes two units, leaving one for Tier 1 so
+/// an audio decode cannot stop every cheap reference alignment.
+const SYNC_MEMORY_UNITS: usize = 3;
+const TIER1_SLOTS: usize = 3;
 const TIER2_SLOTS: usize = 1;
 const TIER1_WEIGHT: u32 = 1;
-const TIER2_WEIGHT: u32 = 3;
+const TIER2_WEIGHT: u32 = 2;
 
 use crate::cache::Cache;
 use crate::config::Config;
@@ -231,7 +233,7 @@ impl SyncAdmission {
 
     /// Reserve a bounded body-retention place before fetching either sync input. The weighted
     /// subprocess budget is intentionally acquired later, after network preparation, but at most
-    /// four Tier-1 jobs and one Tier-2 job can reach that point with bodies resident.
+    /// three Tier-1 jobs and one Tier-2 job can reach that point with bodies resident.
     pub async fn reserve(&self, tier: SyncTier) -> SyncReservation<'_> {
         let queued_at = Instant::now();
         let (preparation, stats, weight) = self.parts(tier);
@@ -326,7 +328,7 @@ mod sync_admission_tests {
     async fn queued_tier2_is_not_starved_by_later_tier1_work() {
         let admission = Arc::new(SyncAdmission::new());
         let mut held = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..TIER1_SLOTS {
             let reservation = admission.reserve(SyncTier::Tier1).await;
             held.push(admission.acquire(reservation).await);
         }
@@ -354,9 +356,9 @@ mod sync_admission_tests {
         };
         tokio::task::yield_now().await;
 
-        // Releasing three units satisfies the older weighted Tier-2 waiter. The later one-unit Tier-1
+        // Releasing two units satisfies the older weighted Tier-2 waiter. The later one-unit Tier-1
         // request must not jump the FIFO memory queue while the final original Tier-1 job is running.
-        for mut permit in held.drain(..3) {
+        for mut permit in held.drain(..TIER2_WEIGHT as usize) {
             permit.finish(SyncOutcome::Completed);
         }
         tokio::time::timeout(Duration::from_secs(1), acquired_rx).await.unwrap().unwrap();
@@ -400,7 +402,7 @@ mod sync_admission_tests {
             })
         };
         tokio::task::yield_now().await;
-        assert!(!waiting.is_finished(), "a fifth Tier-1 request passed the four-body bound");
+        assert!(!waiting.is_finished(), "a fourth Tier-1 request passed the three-body bound");
         drop(held.pop());
         tokio::time::timeout(Duration::from_secs(1), acquired_rx).await.unwrap().unwrap();
         let _ = release_tx.send(());

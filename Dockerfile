@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
     && apt-get purge -y python3-pip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=alass /alass/bin/alass-cli /usr/local/bin/alass
+COPY --from=build /src/target/release/den-subtitles /usr/local/bin/den-subtitles
 COPY scripts/tier1-corpus.py /usr/local/bin/tier1-corpus
 ENTRYPOINT ["python3", "/usr/local/bin/tier1-corpus"]
 

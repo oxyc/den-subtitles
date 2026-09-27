@@ -6,6 +6,11 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Hard ceiling for the in-memory hot tier. This is coupled to the three-slot sync admission and
+/// its 512 MiB full-service CI gate; an environment override may shrink it, never spend headroom
+/// reserved for subprocesses and transient buffers.
+pub const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct Config {
     pub port: u16,
     pub cache_dir: PathBuf,
@@ -56,7 +61,12 @@ impl Config {
             cache_dir,
             cache_max_bytes: env_opt("CACHE_MAX_BYTES")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(256 * 1024 * 1024), // 256 MB — SRTs are tiny, this holds a lot of films
+                // The production cgroup is 512 MiB. Three measured Tier-1 children plus retained
+                // inputs need about 230 MiB, and the service, allocator overhead and network/TLS
+                // buffers need room too. Persistence keeps the larger cold tier on disk; memory is
+                // deliberately only the hot 64 MiB slice.
+                .unwrap_or(MAX_CACHE_BYTES)
+                .min(MAX_CACHE_BYTES),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),

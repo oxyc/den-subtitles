@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 pub const MAX_BODY: usize = 12 * 1024 * 1024;
 /// Subtitle input/output ceiling. Search and provider JSON retain the broader generic limit above,
 /// but an SRT beyond 2 MiB is not a plausible film track (the translation path allows only 512 KiB
-/// of dialogue). Keeping this separate makes the four-body sync preparation bound fit comfortably
-/// beside four measured ~100 MiB Tier-1 children in the 512 MiB container.
+/// of dialogue). Keeping this separate makes the three-body sync preparation bound fit comfortably
+/// beside three measured Tier-1 children in the 512 MiB container.
 pub const MAX_SUBTITLE_BODY: usize = 2 * 1024 * 1024;
 
 /// Read a response body into memory, capped at `max` bytes.
