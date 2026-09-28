@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Tier-1 parity and resource gate for ffsubsync -> alass --no-split.
+"""Tier-1 parity and resource gate for ffsubsync -> alass --no-split, and the Tier-2 memory gate.
 
 Run through the Dockerfile's CI-only ``corpus`` target, or in any Linux environment with
-``alass`` and ``ffsubsync``. The fixtures are generated deterministically; no copyrighted
-subtitle text is stored or downloaded.
+``alass`` and ``ffsubsync`` (and ``ffmpeg`` for the Tier-2 soundtrack). The fixtures are generated
+deterministically; no copyrighted subtitle text or audio is stored or downloaded.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.server
 import math
 import os
 import re
@@ -17,7 +19,10 @@ import socket
 import statistics
 import subprocess
 import tempfile
+import threading
 import time
+from array import array
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +62,14 @@ CASES = [
     # from being materially worse while documenting why different-cut repair remains Tier 2.
     Case("different-cut-parity", 600, offset_ms=2_000, cut_at=300, cut_ms=30_000),
 ]
+
+# Tier 2's job: a two-hour film whose subtitle is 5 s late and a further 30 s late after a mid-film
+# cut. The soundtrack speaks exactly the reference cues, so the truth is `reference_times`. Cues
+# start about 2 s apart, so 3,600 of them fill two hours: denser dialogue than a real film carries,
+# which gives the split-aware alignment more to hold, not less.
+TIER2_CASE = Case("audio-tier2", 3_600, offset_ms=5_000, cut_at=1_800, cut_ms=30_000)
+SOUNDTRACK = Path("/usr/local/share/den-subtitles/soundtrack.mkv")
+SAMPLE_RATE = 16_000
 
 
 def stamp(ms: float) -> str:
@@ -204,8 +217,9 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, math.ceil(len(ordered) * q) - 1)]
 
 
-def process_tree_rss_kb(pid: int) -> int:
-    pending, seen, total = [pid], set(), 0
+def process_tree(pid: int) -> list[tuple[int, str, int]]:
+    """(pid, command name, RSS in KB) for `pid` and every descendant."""
+    pending, seen, out = [pid], set(), []
     while pending:
         current = pending.pop()
         if current in seen:
@@ -214,12 +228,17 @@ def process_tree_rss_kb(pid: int) -> int:
         try:
             status = Path(f"/proc/{current}/status").read_text()
             match = re.search(r"^VmRSS:\s+(\d+)\s+kB", status, re.MULTILINE)
-            total += int(match.group(1)) if match else 0
+            name = re.search(r"^Name:\s+(\S+)", status, re.MULTILINE)
+            out.append((current, name.group(1) if name else "?", int(match.group(1)) if match else 0))
             children = Path(f"/proc/{current}/task/{current}/children").read_text().split()
             pending.extend(int(child) for child in children)
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             pass
-    return total
+    return out
+
+
+def process_tree_rss_kb(pid: int) -> int:
+    return sum(rss for _, _, rss in process_tree(pid))
 
 
 def timed(command: list[str]) -> tuple[float, int]:
@@ -256,20 +275,23 @@ def cgroup_value(name: str) -> int:
     return int(value)
 
 
-def full_service_memory_peak(
-    root: Path, alass: str, reference: Path, incoming: Path
-) -> tuple[int, int, int]:
-    """Measure the whole container at the admitted Tier-1 maximum, not just child RSS.
+def cgroup_limit() -> int:
+    limit = cgroup_value("memory.max")
+    if limit > 512 * 1024 * 1024:
+        raise RuntimeError(f"memory.max is {limit}, expected a 512 MiB-or-smaller cgroup")
+    return limit
+
+
+@contextlib.contextmanager
+def resident_service(root: Path, alass: str) -> Iterator[None]:
+    """Run the real service with the cache/body model forced resident beside it.
 
     The live cache payload cap is 64 MiB. Python owns and touches 112 MiB here: 80 MiB models that
     cache plus 25% allocator/HashMap overhead, and 32 MiB covers three running Tier-1 jobs plus the
     separately prepared Tier-2 job's capped Strings and network buffers. The real service, shared
-    libraries, corpus runner, page cache and three real alass children are charged as well.
+    libraries, corpus runner and page cache are charged as well, along with whatever children the
+    caller starts inside the block.
     """
-    limit = cgroup_value("memory.max")
-    if limit > 512 * 1024 * 1024:
-        raise RuntimeError(f"memory.max is {limit}, expected a 512 MiB-or-smaller cgroup")
-
     cache_dir = root / "service-cache"
     cache_dir.mkdir()
     env = os.environ.copy()
@@ -284,7 +306,6 @@ def full_service_memory_peak(
         ["den-subtitles"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env
     )
     forced = None
-    procs: list[subprocess.Popen[str]] = []
     try:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -302,32 +323,8 @@ def full_service_memory_peak(
         forced = bytearray(112 * 1024 * 1024)
         for page in range(0, len(forced), 4096):
             forced[page] = 1
-
-        commands = [
-            [alass, "--no-split", str(reference), str(incoming), str(root / f"full-service-{i}.srt")]
-            for i in range(3)
-        ]
-        procs = [
-            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-            for command in commands
-        ]
-        peak = cgroup_value("memory.current")
-        rss_peak_kb = process_tree_rss_kb(os.getpid())
-        while any(proc.poll() is None for proc in procs):
-            peak = max(peak, cgroup_value("memory.current"))
-            rss_peak_kb = max(rss_peak_kb, process_tree_rss_kb(os.getpid()))
-            time.sleep(0.005)
-        for command, proc in zip(commands, procs):
-            _, stderr = proc.communicate()
-            if proc.returncode:
-                raise RuntimeError(f"{' '.join(command[:2])} failed: {stderr[-500:]}")
-        peak = max(peak, cgroup_value("memory.current"), cgroup_value("memory.peak"))
-        return peak, limit, rss_peak_kb
+        yield
     finally:
-        for proc in procs:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
         if service.poll() is None:
             service.terminate()
             try:
@@ -338,20 +335,287 @@ def full_service_memory_peak(
         forced = None
 
 
+def full_service_memory_peak(
+    root: Path, alass: str, reference: Path, incoming: Path
+) -> tuple[int, int, int]:
+    """Measure the whole container at the admitted Tier-1 maximum, not just child RSS."""
+    limit = cgroup_limit()
+    procs: list[subprocess.Popen[str]] = []
+    with resident_service(root, alass):
+        try:
+            commands = [
+                [alass, "--no-split", str(reference), str(incoming), str(root / f"full-service-{i}.srt")]
+                for i in range(3)
+            ]
+            procs = [
+                subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                for command in commands
+            ]
+            peak = cgroup_value("memory.current")
+            rss_peak_kb = process_tree_rss_kb(os.getpid())
+            while any(proc.poll() is None for proc in procs):
+                peak = max(peak, cgroup_value("memory.current"))
+                rss_peak_kb = max(rss_peak_kb, process_tree_rss_kb(os.getpid()))
+                time.sleep(0.005)
+            for command, proc in zip(commands, procs):
+                _, stderr = proc.communicate()
+                if proc.returncode:
+                    raise RuntimeError(f"{' '.join(command[:2])} failed: {stderr[-500:]}")
+            peak = max(peak, cgroup_value("memory.current"), cgroup_value("memory.peak"))
+            return peak, limit, rss_peak_kb
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+
+def voice_and_floor(seconds: float) -> tuple[bytes, bytes]:
+    """Synthetic dialogue and a room-tone floor, 16-bit mono PCM at SAMPLE_RATE.
+
+    The voice is a 130 Hz harmonic series shaped by two vowel formants, broken into 180 ms syllables
+    with 60 ms pauses, so VAD sees many short speech spans the way it does in real dialogue, and the
+    split-aware alignment has as many spans to work through. The floor is quiet deterministic noise,
+    so the gaps are not digital silence.
+    """
+    harmonics = []
+    for k in range(1, 21):
+        f = 130 * k
+        weight = math.exp(-(((f - 700) / 300) ** 2)) + 0.6 * math.exp(-(((f - 1_200) / 400) ** 2)) + 0.05 / k
+        harmonics.append((2 * math.pi * f, weight))
+    norm = sum(weight for _, weight in harmonics)
+    voice, floor = array("h"), array("h")
+    for n in range(int(seconds * SAMPLE_RATE)):
+        noise = (n * 2_654_435_761 >> 13) % 121 - 60
+        floor.append(noise)
+        t = n / SAMPLE_RATE
+        phase = t % 0.24
+        if phase >= 0.18:
+            voice.append(noise)
+            continue
+        envelope = math.sin(math.pi * phase / 0.18) ** 2
+        sample = sum(weight * math.sin(omega * t) for omega, weight in harmonics) / norm
+        voice.append(round(12_000 * envelope * sample) + noise)
+    return voice.tobytes(), floor.tobytes()
+
+
+def tile(pcm: bytes, samples: int) -> bytes:
+    size = samples * 2
+    return (pcm * (size // len(pcm) + 1))[:size]
+
+
+def write_soundtrack(path: Path) -> None:
+    """Encode TIER2_CASE's dialogue as a two-hour 5.1 E-AC-3 Matroska soundtrack, a film's shape.
+
+    Built into the corpus image, so generating it is never charged to the gate's cgroup.
+    """
+    voice, floor = voice_and_floor(3)
+    times = reference_times(TIER2_CASE)
+    if max(end - start for start, end in times) > 3_000:
+        raise RuntimeError("a cue outlasts the synthetic voice buffer")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encode = [
+        "ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1", "-i", "-",
+        "-ac", "6", "-ar", "48000", "-c:a", "eac3", "-b:a", "192k", str(path),
+    ]
+    ffmpeg = subprocess.Popen(encode, stdin=subprocess.PIPE)
+    assert ffmpeg.stdin is not None
+    cursor = 0
+    for start, end in times:
+        first, last = round(start * SAMPLE_RATE / 1000), round(end * SAMPLE_RATE / 1000)
+        if first > cursor:
+            ffmpeg.stdin.write(tile(floor, first - cursor))
+            cursor = first
+        # Cues can overlap; the voice then carries on from where the previous cue left it.
+        if last > cursor:
+            ffmpeg.stdin.write(voice[(cursor - first) * 2 : (last - first) * 2])
+            cursor = last
+    ffmpeg.stdin.write(tile(floor, 60 * SAMPLE_RATE))  # closing credits
+    ffmpeg.stdin.close()
+    if ffmpeg.wait():
+        raise RuntimeError(f"ffmpeg exited {ffmpeg.returncode} encoding the soundtrack")
+    minutes = (cursor / SAMPLE_RATE + 60) / 60
+    print(f"SOUNDTRACK {path} {minutes:.1f} min {path.stat().st_size} bytes")
+
+
+class MediaRelay(http.server.BaseHTTPRequestHandler):
+    """Stands in for `resync::Relay`: serves one file on loopback, with ranges, at `/media`.
+
+    Production streams the film from the network, so its bytes never sit in this cgroup's page
+    cache. Each served range is dropped from the cache as it goes, so the gate charges ffmpeg's
+    decode and not a copy of the fixture that production never holds.
+    """
+
+    media: Path
+
+    def do_HEAD(self) -> None:
+        self.respond(body=False)
+
+    def do_GET(self) -> None:
+        self.respond(body=True)
+
+    def respond(self, body: bool) -> None:
+        size = self.media.stat().st_size
+        start, end = 0, size - 1
+        requested = re.fullmatch(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
+        if requested:
+            start = int(requested.group(1))
+            end = min(int(requested.group(2) or end), end)
+            if start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.end_headers()
+                return
+        self.send_response(206 if requested else 200)
+        self.send_header("Content-Type", "video/x-matroska")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        if requested:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if not body:
+            return
+        fd = os.open(self.media, os.O_RDONLY)
+        try:
+            offset = start
+            while offset <= end:
+                chunk = os.pread(fd, min(1 << 20, end - offset + 1), offset)
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                os.posix_fadvise(fd, offset, len(chunk), os.POSIX_FADV_DONTNEED)
+                offset += len(chunk)
+        finally:
+            os.close(fd)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+def cgroup_file_and_anon() -> tuple[int, int]:
+    stat = dict(line.split() for line in Path("/sys/fs/cgroup/memory.stat").read_text().splitlines())
+    return int(stat["file"]), int(stat["anon"])
+
+
+def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int]:
+    """Measure the container at admission's other maximum: one audio Tier-2 job and one Tier-1 job.
+
+    Run in a fresh container, so `memory.peak` covers only this load. alass is handed a loopback URL
+    exactly as `sync_to_audio` hands it the relay, and spawns ffprobe and ffmpeg as its own children,
+    which is how they are charged in production. Tier-1 jobs are restarted back to back until Tier 2
+    finishes, so one is resident at every point of the audio decode and the alignment after it.
+    """
+    limit = cgroup_limit()
+    long_film = next(case for case in CASES if case.name == "long-film")
+    ref_times, ref_texts, target_truth, target_texts = fixture(long_film)
+    tier1_ref, tier1_in = root / "tier1-ref.srt", root / "tier1-in.srt"
+    write_srt(tier1_ref, ref_times, texts=ref_texts)
+    write_srt(tier1_in, target_times(long_film, target_truth), texts=target_texts)
+    truth = reference_times(TIER2_CASE)
+    tier2_in, tier2_out = root / "tier2-in.srt", root / "tier2-out.srt"
+    tier2_texts = write_srt(tier2_in, target_times(TIER2_CASE, truth))
+    tier1_command = [alass, "--no-split", str(tier1_ref), str(tier1_in), str(root / "tier1-out.srt")]
+
+    handler = type("Relay", (MediaRelay,), {"media": soundtrack})
+    relay = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=relay.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{relay.server_address[1]}/media"
+    own_cgroup = Path("/proc/self/cgroup").read_text()
+    stats = dict.fromkeys(
+        ["sampled", "file", "anon", "tree_kb", "tier2_alass_kb", "tier1_alass_kb", "ffmpeg_kb", "ffprobe_kb",
+         "ffmpeg_seen", "foreign_cgroup", "tier1_runs"],
+        0,
+    )
+    tier2 = tier1 = None
+    try:
+        with resident_service(root, alass), open(root / "tier2.err", "w+") as tier2_err:
+            started = time.perf_counter()
+            tier2 = subprocess.Popen(
+                [alass, url, str(tier2_in), str(tier2_out)], stdout=subprocess.DEVNULL, stderr=tier2_err
+            )
+            checked: set[int] = set()
+            while tier2.poll() is None:
+                if tier1 is None or tier1.poll() is not None:
+                    if tier1 is not None:
+                        _, stderr = tier1.communicate()
+                        if tier1.returncode:
+                            raise RuntimeError(f"Tier-1 alass failed: {stderr[-500:]}")
+                        stats["tier1_runs"] += 1
+                    tier1 = subprocess.Popen(
+                        tier1_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+                    )
+                current = cgroup_value("memory.current")
+                if current > stats["sampled"]:
+                    stats["sampled"] = current
+                    stats["file"], stats["anon"] = cgroup_file_and_anon()
+                tree = process_tree(os.getpid())
+                stats["tree_kb"] = max(stats["tree_kb"], sum(rss for _, _, rss in tree))
+                for pid, name, rss in tree:
+                    if pid == tier2.pid:
+                        stats["tier2_alass_kb"] = max(stats["tier2_alass_kb"], rss)
+                    elif pid == tier1.pid:
+                        stats["tier1_alass_kb"] = max(stats["tier1_alass_kb"], rss)
+                    elif name in ("ffmpeg", "ffprobe"):
+                        stats[f"{name}_kb"] = max(stats[f"{name}_kb"], rss)
+                    if name == "ffmpeg" and pid not in checked:
+                        checked.add(pid)
+                        stats["ffmpeg_seen"] += 1
+                        with contextlib.suppress(FileNotFoundError):
+                            if Path(f"/proc/{pid}/cgroup").read_text() != own_cgroup:
+                                stats["foreign_cgroup"] += 1
+                time.sleep(0.005)
+            stats["wall_ms"] = round((time.perf_counter() - started) * 1000)
+            stats["memory_peak"] = cgroup_value("memory.peak")
+            stats["peak"] = max(stats["sampled"], cgroup_value("memory.current"), stats["memory_peak"])
+            stats["limit"] = limit
+            if tier2.returncode:
+                tier2_err.seek(0)
+                raise RuntimeError(f"Tier-2 alass failed: {tier2_err.read()[-500:]}")
+    finally:
+        for proc in (tier1, tier2):
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        relay.shutdown()
+
+    aligned, texts = parse(tier2_out)
+    if texts != tier2_texts:
+        raise AssertionError("Tier 2 changed cue text/order")
+    stats["p95_ms"] = round(percentile(errors(aligned, truth), 0.95))
+    return stats
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--alass", default="alass")
     parser.add_argument("--ffsubsync", default="ffsubsync")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--cgroup-memory-gate", action="store_true")
+    parser.add_argument(
+        "--tier2-memory-gate",
+        action="store_true",
+        help="run only the audio Tier-2 + Tier-1 cgroup gate; give it a fresh container",
+    )
+    parser.add_argument("--soundtrack", type=Path, default=SOUNDTRACK)
+    parser.add_argument("--write-soundtrack", type=Path, help="generate the Tier-2 soundtrack and exit")
+    parser.add_argument("--memory-gate-mib", type=int, default=400)
     args = parser.parse_args()
-    for binary in (args.alass, args.ffsubsync):
+    if args.write_soundtrack:
+        write_soundtrack(args.write_soundtrack)
+        return 0
+    for binary in (args.alass,) if args.tier2_memory_gate else (args.alass, args.ffsubsync):
         if not (Path(binary).is_file() or shutil.which(binary)):
             parser.error(f"required binary not found: {binary}")
+    gate_bytes = args.memory_gate_mib * 1024 * 1024
+    if args.tier2_memory_gate:
+        return tier2_gate(args.alass, args.soundtrack, gate_bytes)
 
     failed = []
     resource: dict[str, list[tuple[float, int]]] = {"ffsubsync": [], "alass": []}
-    tier1_peak_kb = mixed_proxy_peak_kb = 0
+    tier1_peak_kb = 0
     service_peak_bytes = service_limit_bytes = service_rss_peak_kb = 0
     with tempfile.TemporaryDirectory(prefix="den-tier1-corpus-") as raw:
         root = Path(raw)
@@ -393,15 +657,6 @@ def main() -> int:
                         output = root / f"long-film-al-{index}.srt"
                         tier1_commands.append([args.alass, "--no-split", str(ref), str(inc), str(output)])
                     tier1_peak_kb = concurrent_peak(tier1_commands)
-                    # Admission weights one split-aware Tier-2 job as two Tier-1 units and reserves
-                    # the third for cheap work. Subtitle-reference split mode is a conservative DP
-                    # memory proxy; the production Tier-2 benchmark must still include ffmpeg/audio.
-                    mixed_proxy_peak_kb = concurrent_peak(
-                        [
-                            [args.alass, str(ref), str(inc), str(root / "long-film-split.srt")],
-                            [args.alass, "--no-split", str(ref), str(inc), str(root / "long-film-cheap.srt")],
-                        ]
-                    )
                     if args.cgroup_memory_gate:
                         service_peak_bytes, service_limit_bytes, service_rss_peak_kb = (
                             full_service_memory_peak(root, args.alass, ref, inc)
@@ -418,16 +673,10 @@ def main() -> int:
         print(f"RESOURCE median wall_s ff={ff_wall:.3f} alass={al_wall:.3f} speedup={ff_wall/al_wall:.2f}x")
         print(f"RESOURCE median max_rss_kb ff={ff_rss:.0f} alass={al_rss:.0f} reduction={ff_rss/al_rss:.2f}x")
         print(f"RESOURCE three_tier1_peak_rss_kb={tier1_peak_kb}")
-        print(f"RESOURCE split_plus_tier1_proxy_peak_rss_kb={mixed_proxy_peak_kb}")
         if ff_wall / al_wall < 2 or ff_rss / al_rss < 2:
             failed.append("resource gate missed: both median runtime and peak RSS must improve by >=2x")
-        # The full-service gate below runs three Tier-1 children. Admission's other maximum, one
-        # Tier-2 job plus one Tier-1 job, is covered by it only while its proxy peak stays lower.
-        if mixed_proxy_peak_kb > tier1_peak_kb:
-            failed.append(
-                "admission memory gate missed: split-plus-Tier-1 proxy exceeds the gated "
-                "three-Tier-1 peak"
-            )
+        # Admission's other maximum, one audio Tier-2 job beside one Tier-1 job, is measured by
+        # --tier2-memory-gate in a container of its own.
         if args.cgroup_memory_gate:
             headroom = service_limit_bytes - service_peak_bytes
             print(
@@ -436,12 +685,56 @@ def main() -> int:
                 f"process_tree_peak_rss_kb={service_rss_peak_kb} "
                 "forced_cache_and_body_model_bytes=117440512"
             )
-            if service_peak_bytes > 400 * 1024 * 1024:
+            if service_peak_bytes > gate_bytes:
                 failed.append(
-                    "full-service memory gate missed: total cgroup peak must leave >=112 MiB "
-                    "under the 512 MiB production limit"
+                    f"full-service memory gate missed: total cgroup peak must stay <= "
+                    f"{args.memory_gate_mib} MiB under the 512 MiB production limit"
                 )
+    return verdict(failed)
 
+
+def tier2_gate(alass: str, soundtrack: Path, gate_bytes: int) -> int:
+    if not soundtrack.is_file():
+        raise SystemExit(f"soundtrack not found: {soundtrack} (build it with --write-soundtrack)")
+    failed = []
+    with tempfile.TemporaryDirectory(prefix="den-tier2-gate-") as raw:
+        try:
+            stats = tier2_memory_peak(Path(raw), alass, soundtrack)
+        except (AssertionError, RuntimeError, UnicodeError) as error:
+            print(f"FAIL audio-tier2: {error}")
+            return verdict([f"audio-tier2: {error}"])
+    print(
+        f"RESOURCE tier2_mixed_cgroup_peak_bytes={stats['peak']} limit_bytes={stats['limit']} "
+        f"headroom_bytes={stats['limit'] - stats['peak']} memory_peak_bytes={stats['memory_peak']} "
+        f"sampled_peak_bytes={stats['sampled']} "
+        f"at_sampled_peak_anon_bytes={stats['anon']} at_sampled_peak_file_bytes={stats['file']} "
+        "forced_cache_and_body_model_bytes=117440512"
+    )
+    print(
+        f"RESOURCE tier2_mixed_peak_rss_kb process_tree={stats['tree_kb']} tier2_alass={stats['tier2_alass_kb']} "
+        f"ffmpeg={stats['ffmpeg_kb']} ffprobe={stats['ffprobe_kb']} tier1_alass={stats['tier1_alass_kb']}"
+    )
+    print(
+        f"RESOURCE tier2_wall_ms={stats['wall_ms']} tier1_runs_alongside={stats['tier1_runs']} "
+        f"tier2_p95_ms={stats['p95_ms']}"
+    )
+    # The measurement is only of Tier 2 if its ffmpeg decode ran, in this cgroup, next to Tier 1.
+    if not stats["ffmpeg_seen"] or stats["foreign_cgroup"]:
+        failed.append("Tier-2 gate did not observe alass's ffmpeg child inside this cgroup")
+    if not stats["tier1_runs"]:
+        failed.append("no Tier-1 job completed alongside Tier 2")
+    # Tier 2 is split-aware: it must repair both the offset and the mid-film cut against the audio.
+    if stats["p95_ms"] > 250:
+        failed.append(f"Tier-2 alignment p95 {stats['p95_ms']} ms exceeds 250 ms")
+    if stats["peak"] > gate_bytes:
+        failed.append(
+            f"Tier-2 mixed memory gate missed: total cgroup peak must stay <= "
+            f"{gate_bytes // (1024 * 1024)} MiB under the 512 MiB production limit"
+        )
+    return verdict(failed)
+
+
+def verdict(failed: list[str]) -> int:
     if failed:
         print("\nGATE FAILED")
         for error in failed:

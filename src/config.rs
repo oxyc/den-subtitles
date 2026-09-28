@@ -57,7 +57,8 @@ impl Config {
             cache_max_bytes: env_opt("CACHE_MAX_BYTES")
                 .and_then(|v| v.parse().ok())
                 // The disk budget. Memory is clamped to `cache::MAX_MEMORY_BYTES` so the 512 MiB
-                // cgroup keeps room for three Tier-1 children, the service and its buffers.
+                // cgroup keeps room for three Tier-1 children (or one audio Tier-2 job and its
+                // ffmpeg beside one Tier-1), the service and its buffers.
                 .unwrap_or(256 * 1024 * 1024),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),

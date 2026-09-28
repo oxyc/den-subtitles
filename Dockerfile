@@ -24,13 +24,16 @@ RUN cargo install alass-cli --version ${ALASS_VERSION} --root /alass --locked
 # ---- parity corpus (CI-only; never copied into runtime) -------------------
 FROM debian:trixie-slim AS corpus
 ARG FFSUBSYNC_VERSION=0.5.1
-RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
+# ffmpeg is the runtime's Debian package, so the Tier-2 gate decodes with the same build production does.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip ffmpeg \
     && pip3 install --no-cache-dir --break-system-packages ffsubsync==${FFSUBSYNC_VERSION} \
     && apt-get purge -y python3-pip && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=alass /alass/bin/alass-cli /usr/local/bin/alass
 COPY --from=build /src/target/release/den-subtitles /usr/local/bin/den-subtitles
 COPY scripts/tier1-corpus.py /usr/local/bin/tier1-corpus
+# The two-hour Tier-2 soundtrack, generated at build time so the gate's cgroup never pays for it.
+RUN python3 /usr/local/bin/tier1-corpus --write-soundtrack /usr/local/share/den-subtitles/soundtrack.mkv
 ENTRYPOINT ["python3", "/usr/local/bin/tier1-corpus"]
 
 # ---- runtime --------------------------------------------------------------

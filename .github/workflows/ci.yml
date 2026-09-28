@@ -54,6 +54,13 @@ jobs:
           docker run --rm
           --memory=512m --memory-swap=512m
           den-subtitles-tier1-corpus:ci --cgroup-memory-gate
+      # A container of its own, so memory.peak covers only one audio Tier-2 job (alass + its ffmpeg
+      # child) beside one Tier-1 job, the service and the cache/body model.
+      - name: Tier-2 audio mixed memory gate
+        run: >-
+          docker run --rm
+          --memory=512m --memory-swap=512m
+          den-subtitles-tier1-corpus:ci --tier2-memory-gate
 
   # The image carries the sync toolchain (alass and ffmpeg) on top of the binary, so it builds
   # differently from `cargo build`. Catching a Dockerfile break on the PR rather than at `git tag`
