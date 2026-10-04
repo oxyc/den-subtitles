@@ -273,6 +273,40 @@ fn format_ts(ms: u64, ms_sep: char) -> String {
     format!("{h:02}:{m:02}:{s:02}{ms_sep}{milli:03}")
 }
 
+/// Cues per minute a real, complete dialogue track runs at; a full file is typically 12+. Below this
+/// — judged over the cues' OWN span, not the film's real runtime, which nothing at this layer knows —
+/// the file is probably captioning only part of the dialogue.
+const MIN_CUES_PER_MINUTE: f64 = 8.0;
+/// A single silence this long, even in a file whose overall density clears the bar above, is the
+/// same tell: dialogue-driven content does not go quiet for minutes at a time by accident.
+const MAX_GAP_MINUTES: f64 = 3.0;
+
+/// Does this cue list look like a transcript of the whole thing, or a sparse one that only captions
+/// part of it? `has_a_cue`/`parse` finding cues at all is not enough: a subtitle made for a DUBBED
+/// release, or an unflagged foreign-parts-only track, has real, correctly-timed cues — just only over
+/// the scenes the dub or the main dialogue doesn't need translating, which OpenSubtitles' own
+/// metadata does not always say.
+///
+/// Found from a real file: Fauda S01E01's English sub for a DUBBED release — 200 cues over 0:19–40:22
+/// (≈5/minute, well under the 8/minute floor here) with gaps up to 4 minutes, including the minute-24
+/// scene a guest reported as missing. Judged against the cues' own span (first cue's start to last
+/// cue's end) rather than the episode's real runtime: a sub that genuinely starts late or ends before
+/// the credits is judged on what it actually covers, not penalised for runtime it was never going to
+/// have.
+pub fn looks_incomplete(cues: &[Cue]) -> bool {
+    let (Some(first), Some(last)) = (cues.first(), cues.last()) else { return true };
+    let span_ms = last.end.saturating_sub(first.start);
+    if span_ms == 0 {
+        return true;
+    }
+    let span_min = span_ms as f64 / 60_000.0;
+    if (cues.len() as f64 / span_min) < MIN_CUES_PER_MINUTE {
+        return true;
+    }
+    let max_gap_ms = cues.windows(2).map(|w| w[1].start.saturating_sub(w[0].end)).max().unwrap_or(0);
+    (max_gap_ms as f64 / 60_000.0) > MAX_GAP_MINUTES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +553,70 @@ mod tests {
         assert_eq!(cues.len(), 2);
         assert_eq!(cues[0].text, "line one\nline two");
         assert_eq!(cues[1].index, 2);
+    }
+
+    /// Evenly spaced cues at a given density (cues/minute) over `minutes`, starting one second in —
+    /// mirrors how `looks_incomplete` measures the Fauda file: by its own span, not the real runtime.
+    fn evenly_spaced(per_minute: f64, minutes: f64) -> Vec<Cue> {
+        let count = (per_minute * minutes).round() as u64;
+        let span_ms = (minutes * 60_000.0) as u64;
+        let step = span_ms / count.max(1);
+        (0..count)
+            .map(|i| Cue {
+                index: i as u32 + 1,
+                start: 1000 + i * step,
+                end: 1000 + i * step + 500,
+                text: "x".into(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_cues_or_a_zero_span_looks_incomplete() {
+        assert!(looks_incomplete(&[]), "no cues at all");
+        let one = vec![Cue { index: 1, start: 5000, end: 5000, text: "x".into() }];
+        assert!(looks_incomplete(&one), "a single zero-length cue has no span to judge");
+    }
+
+    /// The real file this check was written for: Fauda S01E01's English sub for a DUBBED release —
+    /// 200 cues over roughly 0:19–40:22 (≈5/minute), well under the 8/minute floor.
+    #[test]
+    fn the_fauda_dubbed_release_shape_is_flagged() {
+        let cues = evenly_spaced(5.0, 40.0);
+        assert!(looks_incomplete(&cues), "{} cues over 40 minutes should read as sparse", cues.len());
+    }
+
+    /// A real, complete track — dense, no long silences — must not be flagged.
+    #[test]
+    fn a_dense_full_track_is_not_flagged() {
+        let cues = evenly_spaced(12.0, 45.0);
+        assert!(!looks_incomplete(&cues), "{} cues over 45 minutes is a full track", cues.len());
+    }
+
+    /// Density alone can clear the bar while one scene-long silence still gives it away: a 4-minute
+    /// gap in the middle of an otherwise-adequate track.
+    #[test]
+    fn a_single_long_gap_is_flagged_even_at_adequate_density() {
+        let mut cues = evenly_spaced(9.0, 20.0);
+        let last = cues.last().unwrap().end;
+        // One more cue, 4 minutes after the others end — density over the WHOLE span stays above the
+        // floor (181 cues / ~24 minutes ≈ 7.5/min is close, so this also leans on the gap check, not
+        // density alone, to prove the gap signal does its own work).
+        cues.push(Cue {
+            index: 999,
+            start: last + 4 * 60_000,
+            end: last + 4 * 60_000 + 500,
+            text: "x".into(),
+        });
+        assert!(looks_incomplete(&cues), "a 4-minute silence mid-track should be flagged");
+    }
+
+    /// A sub that starts late or ends well before the credits is judged on what it covers, not
+    /// penalised for runtime outside its own span.
+    #[test]
+    fn a_sub_that_starts_late_is_judged_on_its_own_span_only() {
+        let cues = evenly_spaced(12.0, 30.0);
+        assert!(!looks_incomplete(&cues), "a short, dense sub covering only part of the runtime is fine");
     }
 }
 

@@ -628,6 +628,7 @@ mod tests {
             from_trusted: false,
             machine_translated: false,
             ai_translated: false,
+            foreign_parts_only: false,
             ratings: 0.0,
         };
         let key = format!("{}tt0000093:0:0:", crate::cache::SEARCH_NS);
