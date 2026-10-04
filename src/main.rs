@@ -314,11 +314,12 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     // den addon's line.
     let on_off = |on: bool| if on { "on" } else { "off" };
     eprintln!(
-        "den-subtitles {} listening on :{port} — metrics={} log_requests={} sealed={} revoked={} epoch={} \
-         require_iid={} cache_dir={} cache_max_mib={} public_base={} resync={}",
+        "den-subtitles {} listening on :{port} — metrics={} log_requests={} log_identity={} sealed={} \
+         revoked={} epoch={} require_iid={} cache_dir={} cache_max_mib={} public_base={} resync={}",
         env!("CARGO_PKG_VERSION"),
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
+        on_off(state.cfg.log_identity),
         on_off(state.config_keyring.is_some()),
         state.cfg.revocation.revoked_count(),
         state.cfg.revocation.epoch(),
@@ -525,6 +526,7 @@ mod tests {
             config_keys_prev: String::new(),
             metrics_token: metrics_token.to_string(),
             log_requests: false,
+            log_identity: true,
             // Never the live API from a test: port 1 refuses instantly.
             os_api_base: "http://127.0.0.1:1".to_string(),
             scout_origins: Vec::new(),
@@ -629,6 +631,7 @@ mod tests {
             machine_translated: false,
             ai_translated: false,
             foreign_parts_only: false,
+            hearing_impaired: false,
             ratings: 0.0,
         };
         let key = format!("{}tt0000093:0:0:", crate::cache::SEARCH_NS);
