@@ -55,6 +55,12 @@ pub struct Subtitle {
     /// not a reason to leave a field one deploy away from silently losing old entries.
     #[serde(default)]
     pub foreign_parts_only: bool,
+    /// OpenSubtitles' own flag for a track made for deaf/hard-of-hearing viewers — sound cues
+    /// transcribed alongside dialogue. Not ranked against (a full HI track is still a full
+    /// dialogue track), but a deciding factor worth naming in the decision log: see `ranking_factors`.
+    /// `#[serde(default)]` for the same cache-compatibility reason as `foreign_parts_only` above.
+    #[serde(default)]
+    pub hearing_impaired: bool,
     /// 0–10 community rating.
     pub ratings: f64,
 }
@@ -310,6 +316,19 @@ impl DownloadError {
             DownloadError::Gone(m) | DownloadError::Suspect(m) | DownloadError::Unavailable(m) => m,
         }
     }
+
+    /// A stable, short token for the decision log — `message()` is free text for a human, this is
+    /// for grep. `Suspect` splits into `sparse` (real cues, too few for the span — the Fauda shape)
+    /// versus `suspect` (no cues at all, or an interstitial) since the two read very differently on
+    /// an incident: a sparse file is probably the wrong release, a suspect one is probably transient.
+    pub fn reason_tag(&self) -> &'static str {
+        match self {
+            DownloadError::Gone(_) => "gone",
+            DownloadError::Suspect(m) if m.contains("too few cues") => "sparse",
+            DownloadError::Suspect(_) => "suspect",
+            DownloadError::Unavailable(_) => "unavailable",
+        }
+    }
 }
 
 /// How long a spent download quota lasts: until the `reset_time_utc` OpenSubtitles names, or, when the
@@ -347,6 +366,7 @@ fn parse_search(v: &Value) -> Vec<Subtitle> {
             machine_translated: attrs["machine_translated"].as_bool().unwrap_or(false),
             ai_translated: attrs["ai_translated"].as_bool().unwrap_or(false),
             foreign_parts_only: attrs["foreign_parts_only"].as_bool().unwrap_or(false),
+            hearing_impaired: attrs["hearing_impaired"].as_bool().unwrap_or(false),
             ratings: attrs["ratings"].as_f64().unwrap_or(0.0),
         });
     }
@@ -429,6 +449,38 @@ pub fn rank(subs: &mut [Subtitle], filename: Option<&str>) {
     subs.sort_by(|a, b| {
         a.lang.cmp(&b.lang).then_with(|| fit_score(b, filename).cmp(&fit_score(a, filename)))
     });
+}
+
+/// Compact, log-safe tokens saying why `rank` placed `s` where it did — the deciding factors behind
+/// `fit_score`/`text_score`, named rather than scored, for the decision log. No secret ever reaches
+/// this: a `Subtitle` carries none of the install's credentials.
+///
+/// This is the line that would have shown the Fauda bug at a glance: an English file for a DUBBED
+/// release ranked first, with `looks_dubbed` sitting right there in its factors.
+pub fn ranking_factors(s: &Subtitle, filename: Option<&str>) -> Vec<&'static str> {
+    let mut factors = Vec::new();
+    if s.hash_match {
+        factors.push("hash_match");
+    }
+    if filename.is_some_and(|f| release_fit(f, &s.release) > 0) {
+        factors.push("release_match");
+    }
+    if s.downloads > 0 {
+        factors.push("downloads");
+    }
+    if s.machine_translated || s.ai_translated {
+        factors.push("machine_translated");
+    }
+    if s.foreign_parts_only {
+        factors.push("foreign_parts_only");
+    }
+    if looks_dubbed(&s.release) {
+        factors.push("looks_dubbed");
+    }
+    if s.hearing_impaired {
+        factors.push("hearing_impaired");
+    }
+    factors
 }
 
 /// Significant release tokens shared between the file name and a sub's release string imply the same
@@ -614,6 +666,7 @@ mod tests {
             machine_translated: false,
             ai_translated: false,
             foreign_parts_only: false,
+            hearing_impaired: false,
             ratings: 0.0,
         }
     }
@@ -638,6 +691,46 @@ mod tests {
         let correct = sub(1, "en", false, 5, "Spider-Man.2002.1080p.BluRay.x264-AMIABLE");
         let wrong = sub(2, "en", false, 5, "Spider-Man.2002.480p.DVDRip");
         assert!(fit_score(&correct, filename) > fit_score(&wrong, filename));
+    }
+
+    /// The exact case the decision log exists for: a DUBBED release's English file, named in the
+    /// factors it is ranked on rather than buried in a score.
+    #[test]
+    fn ranking_factors_names_the_fauda_shape() {
+        let mut dubbed = sub(1, "en", true, 5, "Fauda.S01E01.DUBBED.WEB-DL");
+        dubbed.foreign_parts_only = false;
+        let filename = Some("Fauda.S01E01.DUBBED.WEB-DL.mkv");
+        let factors = ranking_factors(&dubbed, filename);
+        assert!(factors.contains(&"hash_match"), "{factors:?}");
+        assert!(factors.contains(&"release_match"), "{factors:?}");
+        assert!(factors.contains(&"downloads"), "{factors:?}");
+        assert!(factors.contains(&"looks_dubbed"), "{factors:?}");
+        assert!(!factors.contains(&"foreign_parts_only"), "{factors:?}");
+
+        // A plain, undistinguished sub earns none of them.
+        assert!(ranking_factors(&sub(2, "en", false, 0, ""), None).is_empty());
+    }
+
+    #[test]
+    fn hearing_impaired_is_parsed_and_named_as_a_factor() {
+        let v = json!({"data": [
+            {"attributes": {"language": "en", "download_count": 1, "hearing_impaired": true,
+                "release": "Fight.Club.1999.1080p", "files": [{"file_id": 1}]}},
+        ]});
+        let subs = parse_search(&v);
+        assert!(subs[0].hearing_impaired);
+        assert!(ranking_factors(&subs[0], None).contains(&"hearing_impaired"));
+    }
+
+    #[test]
+    fn download_error_reason_tag_distinguishes_sparse_from_suspect() {
+        assert_eq!(DownloadError::Gone("x".into()).reason_tag(), "gone");
+        assert_eq!(
+            DownloadError::Suspect("file 5 has too few cues for its span".into()).reason_tag(),
+            "sparse"
+        );
+        assert_eq!(DownloadError::Suspect("subtitle link returned no cues".into()).reason_tag(), "suspect");
+        assert_eq!(DownloadError::Unavailable("x".into()).reason_tag(), "unavailable");
     }
 }
 

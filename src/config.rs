@@ -26,6 +26,13 @@ pub struct Config {
     /// One stderr line per request (`LOG_REQUESTS`), off by default. Read once here so that, off, the
     /// request path pays a single bool check.
     pub log_requests: bool,
+    /// Whether a decision-log line (`logging::Line`) may carry identity fields — title id,
+    /// season/episode, file ids, language, release names (`LOG_IDENTITY`). On by default: those
+    /// fields are what makes "wrong/missing subtitles" diagnosable from the journal at all, so the
+    /// flag exists to turn them off for a deploy that must not keep that detail, not to make
+    /// diagnosis the opt-in case. The rest of a line (event, outcome, reason, timing, rid) is
+    /// unaffected either way.
+    pub log_identity: bool,
     /// OpenSubtitles API root. A field so tests can point the request path at a local server instead
     /// of the live API — several of them reach `handle_translate`, which searches before it can do
     /// anything else, and without this they made a real request to api.opensubtitles.com on every
@@ -71,6 +78,9 @@ impl Config {
             .requiring_install_id(env_opt("REQUIRE_INSTALL_ID").is_some_and(|v| v != "0")),
             metrics_token: env_opt("METRICS_TOKEN").unwrap_or_default(),
             log_requests: env_opt("LOG_REQUESTS").is_some_and(|v| v != "0"),
+            // Default ON, unlike `LOG_REQUESTS` above — unset must keep diagnosing titles, not stop
+            // doing it, so only an explicit "0" turns it off.
+            log_identity: env_opt("LOG_IDENTITY").is_none_or(|v| v != "0"),
             os_api_base: crate::opensubtitles::API.to_string(),
             scout_origins: crate::resync::parse_origins(&env_opt("SCOUT_ORIGINS").unwrap_or_default()),
             scout_aliases: crate::resync::parse_aliases(&env_opt("SCOUT_ALIASES").unwrap_or_default()),

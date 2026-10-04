@@ -192,6 +192,7 @@ it optional (`.env.example` lists the same):
 | `CONFIG_EPOCH` | `0` | Links stamped with an `ep` below this are refused; raise it to revoke every existing link without rotating `CONFIG_KEY`. `/config-key` hands it to `/configure` for new links. Not a non-negative integer → warned and enforced as `0`. |
 | `METRICS_TOKEN` | unset (`/metrics` 404s) | Bearer token for `/metrics`. |
 | `LOG_REQUESTS` | unset (off; `0` is off too) | One stderr line per request, `<METHOD> <path> <status> <ms>ms`, with the config segment as `<config>` and no query string. |
+| `LOG_IDENTITY` | unset (on; `0` turns it off) | Whether the decision-log lines below (`event=rank`/`serve`/`sync`/`translate`) may carry identity fields — title id, season/episode, file ids, language, release names. Off drops those fields only; the rest of each line (event, outcome, reason, timing, `rid`) is unaffected. |
 | `SCOUT_ORIGINS` | unset (Tier 2 off) | Comma-separated den-scout origins (`http://192.168.86.193:8080`) a `?resync=` target may be at — the origin of the stream URLs scout hands the app. |
 | `SCOUT_ALIASES` | unset | `<public origin>=<LAN origin>` pairs (`https://d-play.oxy.fi=http://192.168.86.193:8080`): a resync target on scout's public name is fetched at its LAN address, so two services on one box never go through the WAN and the tunnel. Both sides must also be in `SCOUT_ORIGINS`. |
 | `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-1 reference and Tier-2 audio sync. |
@@ -200,6 +201,46 @@ On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Hos
 leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients (i.e. exposed
 publicly), set it to the real origin: a client controls its own `Host` header, so an unset origin
 lets a forged header steer those URLs at an attacker's server.
+
+## Decision log
+
+Four lines, on stderr, saying exactly which file was offered, served, or sync'd/translated, and
+why — the detail that was missing when a guest reported English subtitles on a dubbed release that
+"showed for half the episode": nothing logged which file the picker chose or that it was a DUBBED
+release's track until the cue-density check (`srt::looks_incomplete`) and `looks_dubbed` were added
+afterwards, after-the-fact, from the file itself. Each line follows the convention shared across den
+services: `event=<token> outcome=<served|skipped|refused|degraded|fallback> reason=<text>
+[upstream=<name>] [dur_ms=<n>]`, then identity fields, then `rid=<id>` last — the join key to the
+app's own request line for the same request (see `LOG_REQUESTS` above).
+
+- **`event=rank`** — one `subtitles` catalog answer: how many candidates, the file placed first and
+  the next few, and the deciding factors behind each (hash match, release-name match, downloads,
+  machine-translated, foreign-parts-only, looks-dubbed, hearing-impaired):
+  ```
+  event=rank outcome=served reason=ranked dur_ms=0 candidates=2 imdb=tt1111111 season=1 episode=1 top=os:555 top_lang=en top_factors=hash_match,release_match,downloads,looks_dubbed next1=os:556 next1_lang=en next1_factors=none rid=a1b2c3
+  ```
+- **`event=serve`** — one download/serve decision: a cache hit, which step of the sync ladder ran
+  (`reason=tier1`/`tier2`/`no_sync_needed`), a refusal (`gone`/`suspect`/`sparse`/`unavailable`), or
+  a fallback to an unaligned stand-in — with the served body's cue count, span, cues/minute and
+  largest gap, which is what makes a sparse or dubbed-release file diagnosable after the fact:
+  ```
+  event=serve outcome=served reason=tier1 cache=miss file=os:42 lang=en cues=612 span_s=2380 cues_per_min=15.4 max_gap_s=38 rid=a1b2c3
+  ```
+- **`event=sync`** — a resync/align step (Tier 1 reference-align, Tier 2 audio VAD) that failed,
+  naming the file, the reference (when Tier 1), the title and language.
+- **`event=translate`** — a translation that could not even start: the daily allowance, a refused
+  provider credential, a source that will not download, or a run that failed outright.
+
+`LOG_IDENTITY` (default on) gates the identity fields — `imdb`, `season`, `episode`, `file`/`top`/
+`ref`/`source` (`os:<id>`), `lang` — on every one of these lines. Off, the same four lines still
+log, with identity fields dropped and everything else (event, outcome, reason, timing, `rid`)
+unchanged:
+```
+event=serve outcome=degraded reason=sync_failed cache=miss cues=12 span_s=61 cues_per_min=11.8 max_gap_s=9 rid=a1b2c3
+```
+No API key, BYOK or otherwise, ever reaches any of these lines: the functions that build them take
+only `ServeCtx` (title/file/language identity) and already-redacted text, never a `UserConfig` or
+`LlmConfig`.
 
 ## Run
 

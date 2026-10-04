@@ -281,6 +281,29 @@ const MIN_CUES_PER_MINUTE: f64 = 8.0;
 /// same tell: dialogue-driven content does not go quiet for minutes at a time by accident.
 const MAX_GAP_MINUTES: f64 = 3.0;
 
+/// The density measurements `looks_incomplete` judges a file by, surfaced so a caller can put them
+/// in the decision log — the same numbers that decided "sparse" are what makes that verdict
+/// checkable later from the journal, rather than trusted on the strength of a boolean alone.
+pub struct Stats {
+    pub count: usize,
+    pub span_ms: u64,
+    pub per_minute: f64,
+    pub max_gap_ms: u64,
+}
+
+/// `Stats` over a cue list's own span (first cue's start to last cue's end), or `None` when there are
+/// too few cues, or too little span, to measure anything.
+pub fn stats(cues: &[Cue]) -> Option<Stats> {
+    let (first, last) = (cues.first()?, cues.last()?);
+    let span_ms = last.end.saturating_sub(first.start);
+    if span_ms == 0 {
+        return Some(Stats { count: cues.len(), span_ms: 0, per_minute: 0.0, max_gap_ms: 0 });
+    }
+    let span_min = span_ms as f64 / 60_000.0;
+    let max_gap_ms = cues.windows(2).map(|w| w[1].start.saturating_sub(w[0].end)).max().unwrap_or(0);
+    Some(Stats { count: cues.len(), span_ms, per_minute: cues.len() as f64 / span_min, max_gap_ms })
+}
+
 /// Does this cue list look like a transcript of the whole thing, or a sparse one that only captions
 /// part of it? `has_a_cue`/`parse` finding cues at all is not enough: a subtitle made for a DUBBED
 /// release, or an unflagged foreign-parts-only track, has real, correctly-timed cues — just only over
@@ -294,17 +317,14 @@ const MAX_GAP_MINUTES: f64 = 3.0;
 /// the credits is judged on what it actually covers, not penalised for runtime it was never going to
 /// have.
 pub fn looks_incomplete(cues: &[Cue]) -> bool {
-    let (Some(first), Some(last)) = (cues.first(), cues.last()) else { return true };
-    let span_ms = last.end.saturating_sub(first.start);
-    if span_ms == 0 {
+    let Some(s) = stats(cues) else { return true };
+    if s.span_ms == 0 {
         return true;
     }
-    let span_min = span_ms as f64 / 60_000.0;
-    if (cues.len() as f64 / span_min) < MIN_CUES_PER_MINUTE {
+    if s.per_minute < MIN_CUES_PER_MINUTE {
         return true;
     }
-    let max_gap_ms = cues.windows(2).map(|w| w[1].start.saturating_sub(w[0].end)).max().unwrap_or(0);
-    (max_gap_ms as f64 / 60_000.0) > MAX_GAP_MINUTES
+    (s.max_gap_ms as f64 / 60_000.0) > MAX_GAP_MINUTES
 }
 
 #[cfg(test)]
@@ -576,6 +596,18 @@ mod tests {
         assert!(looks_incomplete(&[]), "no cues at all");
         let one = vec![Cue { index: 1, start: 5000, end: 5000, text: "x".into() }];
         assert!(looks_incomplete(&one), "a single zero-length cue has no span to judge");
+    }
+
+    /// The numbers behind `looks_incomplete`'s verdict, for the decision log — a reader must be able
+    /// to check "sparse" against the same density `looks_incomplete` itself computed.
+    #[test]
+    fn stats_reports_the_numbers_looks_incomplete_judges() {
+        assert!(stats(&[]).is_none(), "no cues, nothing to report");
+        let cues = evenly_spaced(5.0, 40.0);
+        let s = stats(&cues).expect("a real cue list has stats");
+        assert_eq!(s.count, cues.len());
+        assert!((s.per_minute - 5.0).abs() < 0.5, "per_minute was {}", s.per_minute);
+        assert!(looks_incomplete(&cues), "this is the sparse shape stats should agree is sparse");
     }
 
     /// The real file this check was written for: Fauda S01E01's English sub for a DUBBED release —

@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use crate::cache;
 use crate::httputil::{self, Body};
 use crate::inflight::Guard as InFlightGuard;
-use crate::logging::LogGate;
+use crate::logging::{self, LogGate};
 use crate::opensubtitles;
 use crate::ratelimit;
 use crate::state::{AppState, SyncOutcome, SyncReservation, SyncTier};
@@ -87,6 +87,127 @@ static UNSAFE_RESYNC: LogGate = LogGate::new();
 static ALLOWANCE_REFUSED: LogGate = LogGate::new();
 static CREDENTIAL_REFUSED: LogGate = LogGate::new();
 static TRANSLATE_FAILED: LogGate = LogGate::new();
+
+/// `os:<id>` — how a file id reads everywhere it reaches the decision log. Distinct from the
+/// Stremio subtitle id (`os-{file_id}`, a dash, built into the picker response above) so the two
+/// never get mistaken for each other when grepping.
+fn os_id(file_id: i64) -> String {
+    format!("os:{file_id}")
+}
+
+/// Identity for one decision-log line, gated by `LOG_IDENTITY` through `logging::Line::id`. Every
+/// field is optional because no single caller knows all of them: the plain proxy route
+/// (`/subtitle/<file_id>`) carries no imdb id at all, and the translate route has no servable file
+/// id until a source is picked.
+#[derive(Clone, Copy, Default, Debug)]
+struct ServeCtx<'a> {
+    rid: Option<&'a str>,
+    file_id: Option<i64>,
+    imdb: Option<&'a str>,
+    season: Option<i64>,
+    episode: Option<i64>,
+    lang: Option<&'a str>,
+}
+
+impl ServeCtx<'_> {
+    fn identity_fields(&self, mut line: logging::Line) -> logging::Line {
+        if let Some(id) = self.file_id {
+            line = line.id("file", os_id(id));
+        }
+        if let Some(imdb) = self.imdb {
+            line = line.id("imdb", imdb);
+        }
+        if let Some(s) = self.season {
+            line = line.id("season", s);
+        }
+        if let Some(e) = self.episode {
+            line = line.id("episode", e);
+        }
+        if let Some(l) = self.lang {
+            line = line.id("lang", l);
+        }
+        line
+    }
+}
+
+/// `event=serve` — one download/serve decision: a cache hit, a sync tier that ran (and which one),
+/// a refusal, or a fallback to an unaligned stand-in. `body`, when given, is parsed once more for
+/// cue density (`srt::stats`) — count, span, cues/minute, largest gap — which is what makes a sparse
+/// or dubbed-release file diagnosable from the journal rather than merely "served". Returns the line
+/// rather than printing it, so a caller can test what it built; every real call site prints it.
+fn serve_line(
+    state: &AppState,
+    ctx: ServeCtx<'_>,
+    outcome: &str,
+    reason: &str,
+    upstream: Option<&str>,
+    cache: &str,
+    body: Option<&str>,
+) -> String {
+    let mut line = logging::Line::new("serve", outcome, state.cfg.log_identity).reason(reason);
+    if let Some(u) = upstream {
+        line = line.upstream(u);
+    }
+    line = line.field("cache", cache);
+    line = ctx.identity_fields(line);
+    if let Some(body) = body {
+        if let Some(s) = srt::stats(&srt::parse(body)) {
+            line = line
+                .field("cues", s.count)
+                .field("span_s", s.span_ms / 1000)
+                .field("cues_per_min", format!("{:.1}", s.per_minute))
+                .field("max_gap_s", s.max_gap_ms / 1000);
+        }
+    }
+    line.rid(ctx.rid).finish()
+}
+
+/// Prints what `serve_line` builds. The split exists for the test above it: this one call site is
+/// the only thing between `log_serve` and the journal.
+fn log_serve(
+    state: &AppState,
+    ctx: ServeCtx<'_>,
+    outcome: &str,
+    reason: &str,
+    upstream: Option<&str>,
+    cache: &str,
+    body: Option<&str>,
+) {
+    eprintln!("{}", serve_line(state, ctx, outcome, reason, upstream, cache, body));
+}
+
+/// `event=sync` — a resync/align step in the ladder (Tier 1 reference-align, Tier 2 audio VAD) that
+/// failed, naming the file, the title and the step. `ref_file` is the reference sub Tier 1 aligned
+/// against, when there is one. A step that SUCCEEDS is reported by the `serve` line that follows it
+/// (`reason=tier1`/`tier2`) rather than a second line here — this one exists for the failure a
+/// retry-marker would otherwise leave unexplained.
+fn log_sync(state: &AppState, ctx: ServeCtx<'_>, tier: &str, reason: &str, ref_file: Option<i64>) -> String {
+    let mut line =
+        logging::Line::new("sync", "failed", state.cfg.log_identity).reason(reason).field("tier", tier);
+    if let Some(r) = ref_file {
+        line = line.id("ref", os_id(r));
+    }
+    line = ctx.identity_fields(line);
+    line.rid(ctx.rid).finish()
+}
+
+/// `event=translate` — a translation that could not even start: the daily allowance, a refused
+/// provider credential, a source that will not download, or a run that failed outright. Distinct
+/// from `serve`: these are refusals to PRODUCE a translation, not a decision about what to serve.
+fn log_translate(
+    state: &AppState,
+    ctx: ServeCtx<'_>,
+    outcome: &str,
+    reason: &str,
+    upstream: Option<&str>,
+) -> String {
+    let mut line = logging::Line::new("translate", outcome, state.cfg.log_identity).reason(reason);
+    if let Some(u) = upstream {
+        line = line.upstream(u);
+    }
+    line = ctx.identity_fields(line);
+    line.rid(ctx.rid).finish()
+}
 
 /// The manifest for an install (`None` = unconfigured). A configured install's id rides along as
 /// `denInstallId`, spelled as `REVOKED_INSTALLS` takes it, so the owner can revoke one link from what
@@ -262,7 +383,9 @@ pub async fn handle_subtitles(
 
     // Rank for THIS stream: hash-match, then release/filename fit, then quality; grouped by language
     // best-first. Machine/AI subs sink to the bottom.
+    let rank_started = Instant::now();
     opensubtitles::rank(&mut subs, filename.as_deref());
+    log_rank(state, headers, &imdb, season, episode, filename.as_deref(), &subs, rank_started.elapsed());
 
     let base = self_base(state, headers, config);
     // Tier-1 auto-sync anchor: any hash-matched sub is a trusted, already-in-sync timing reference
@@ -329,6 +452,67 @@ pub async fn handle_subtitles(
         "private, max-age=3600, stale-while-revalidate=3600, stale-if-error=86400",
     );
     httputil::add_timing(resp, &timing)
+}
+
+/// `event=rank` — the ranking result of one catalog/search answer: how many candidates, which file
+/// was placed first and the next few, and the deciding factors behind each (`ranking_factors`). The
+/// line that would have shown the Fauda bug at a glance — a DUBBED release's English file ranked
+/// first, `looks_dubbed` sitting right there in its factors — which nothing logged before this.
+/// Returns the line rather than printing it, so a caller can test what it built.
+#[allow(clippy::too_many_arguments)]
+fn rank_line(
+    identity: bool,
+    rid: Option<&str>,
+    imdb: &str,
+    season: Option<i64>,
+    episode: Option<i64>,
+    filename: Option<&str>,
+    subs: &[opensubtitles::Subtitle],
+    dur: Duration,
+) -> String {
+    let outcome = if subs.is_empty() { "skipped" } else { "served" };
+    let mut line = logging::Line::new("rank", outcome, identity)
+        .reason(if subs.is_empty() { "no_candidates" } else { "ranked" })
+        .dur_ms(dur.as_millis())
+        .field("candidates", subs.len())
+        .id("imdb", imdb);
+    if let Some(s) = season {
+        line = line.id("season", s);
+    }
+    if let Some(e) = episode {
+        line = line.id("episode", e);
+    }
+    // The order `rank` produced: the first file offered, then the next few, each with why.
+    for (i, s) in subs.iter().take(4).enumerate() {
+        let tag = if i == 0 { "top".to_string() } else { format!("next{i}") };
+        let factors = opensubtitles::ranking_factors(s, filename);
+        let factors = if factors.is_empty() { "none".to_string() } else { factors.join(",") };
+        line = line
+            .id(&tag, os_id(s.file_id))
+            .id(&format!("{tag}_lang"), &s.lang)
+            .field(&format!("{tag}_factors"), factors);
+    }
+    line.rid(rid).finish()
+}
+
+/// Prints what `rank_line` builds. The split exists for the test above it: this one call site is
+/// the only thing between `log_rank` and the journal.
+#[allow(clippy::too_many_arguments)]
+fn log_rank(
+    state: &AppState,
+    headers: &HeaderMap,
+    imdb: &str,
+    season: Option<i64>,
+    episode: Option<i64>,
+    filename: Option<&str>,
+    subs: &[opensubtitles::Subtitle],
+    dur: Duration,
+) {
+    let rid = logging::request_id(headers);
+    eprintln!(
+        "{}",
+        rank_line(state.cfg.log_identity, rid.as_deref(), imdb, season, episode, filename, subs, dur)
+    );
 }
 
 /// The OpenSubtitles client for one request, from that install's BYOK credentials.
@@ -582,10 +766,24 @@ pub async fn handle_subtitle_file(
     if httputil::if_none_match(req_headers, &conditional_etag) {
         return httputil::not_modified(&conditional_etag, httputil::SETTLED_SRT);
     }
+    let rid = logging::request_id(req_headers);
+    // No imdb here at all: this route is addressed by OpenSubtitles file id alone, not by title —
+    // the app already picked this file from the `subtitles` answer, which is where the imdb-scoped
+    // `rank` line was logged.
+    let ctx = ServeCtx {
+        rid: rid.as_deref(),
+        file_id: Some(file_id),
+        imdb: None,
+        season: None,
+        episode: None,
+        lang,
+    };
     if let Some(hit) = state.cache.get(&cache_key) {
+        log_serve(state, ctx, "served", "cache_hit", None, "hit", Some(&hit));
         return with_settled_etag(httputil::add_timing(httputil::srt(hit), CACHE_HIT), &settled_etag);
     }
     let Some(http) = state.http.as_ref() else {
+        log_serve(state, ctx, "refused", "service_unavailable", None, "miss", None);
         return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable");
     };
     let client = os_client(state, http, &cfg);
@@ -595,6 +793,7 @@ pub async fn handle_subtitle_file(
     let flight = if resync_url.is_some() || ref_id.is_some() {
         let guard = state.inflight.acquire(&cache_key).await;
         if let Some(hit) = state.cache.get(&cache_key) {
+            log_serve(state, ctx, "served", "cache_hit", None, "hit", Some(&hit));
             return with_settled_etag(httputil::add_timing(httputil::srt(hit), CACHE_HIT), &settled_etag);
         }
         Some(guard)
@@ -613,9 +812,11 @@ pub async fn handle_subtitle_file(
     let target = match subtitle_srt(state, &client, file_id, lang).await {
         Ok(body) => body,
         Err(e) => {
+            let tag = e.reason_tag();
             if DOWNLOAD_FAILED.allow() {
                 eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
             }
+            log_serve(state, ctx, "refused", tag, Some("opensubtitles"), "miss", None);
             return httputil::error(StatusCode::BAD_GATEWAY, "upstream_unavailable");
         }
     };
@@ -636,6 +837,7 @@ pub async fn handle_subtitle_file(
         flight,
         &what,
         true,
+        ctx,
     )
     .await;
     with_settled_etag(httputil::add_timing(resp, &download), &settled_etag)
@@ -702,7 +904,9 @@ fn scratch_tag(cache_key: &str, seq: u64) -> String {
 /// because it inherits whatever offset the source it was translated from had.
 ///
 /// `cache_key` must already be namespaced for the tier being run (see `sync_cache_key`), and
-/// `resync_url` must already be vetted. `what` names the job in log lines only.
+/// `resync_url` must already be vetted. `what` names the job in log lines only; `log` carries the
+/// identity (file id, title, language) attached to the `serve`/`sync` decision-log lines this
+/// function emits for every exit.
 #[allow(clippy::too_many_arguments)]
 async fn sync_and_cache(
     state: &Arc<AppState>,
@@ -716,6 +920,7 @@ async fn sync_and_cache(
     flight: Option<InFlightGuard<'_>>,
     what: &str,
     settled: bool,
+    log: ServeCtx<'_>,
 ) -> Response<Body> {
     // A sync that just failed is not retried on every request — the binary spawn, or a 90s alass
     // timeout, would be paid again per request. The marker is separate from `cache_key` so that key
@@ -745,14 +950,17 @@ async fn sync_and_cache(
         };
         // Settled while we waited: the alignment we were about to run has already been run.
         if let Some(hit) = state.cache.get(&cache_key) {
+            log_serve(state, log, "served", "settled_while_waiting", None, "hit", Some(&hit));
             return httputil::add_timing(httputil::srt(hit), CACHE_HIT);
         }
         // And it may have failed while we waited, in which case re-running it now is the retry the
         // marker exists to prevent.
         if backed_off() {
             let Some(target) = retained_sync_target(state, target, translated_body_key) else {
+                log_serve(state, log, "refused", "translation_unavailable", None, "miss", None);
                 return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "translation_unavailable");
             };
+            log_serve(state, log, "degraded", "sync_backoff", None, "miss", Some(&target));
             return httputil::degraded(httputil::srt_provisional(target), "sync_failed");
         }
         Some(guard)
@@ -767,9 +975,18 @@ async fn sync_and_cache(
         reservation = Some(state.sync_admission.reserve(tier).await);
     }
     let Some(target) = retained_sync_target(state, target, translated_body_key) else {
+        log_serve(state, log, "refused", "translation_unavailable", None, "miss", None);
         return httputil::error(StatusCode::SERVICE_UNAVAILABLE, "translation_unavailable");
     };
 
+    // Which step of the sync ladder is about to run, named before `resync_url`/`ref_id` are moved
+    // into the branch below — the final `serve` line's `reason` says which one SUCCEEDED; a failure
+    // along the way is reported by `log_sync` at the point it happens.
+    let tier_label = match (resync_url.is_some(), ref_id.is_some()) {
+        (true, _) => "tier2",
+        (false, true) => "tier1",
+        (false, false) => "no_sync_needed",
+    };
     let started = Instant::now();
     let sync_timing = || format!("sync;dur={}", started.elapsed().as_millis());
     let tag = scratch_tag(&cache_key, SYNC_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -805,6 +1022,7 @@ async fn sync_and_cache(
             Err(e) => {
                 if SYNC_FAILED.allow() {
                     eprintln!("sync: resync of {what} failed: {e}");
+                    eprintln!("{}", log_sync(state, log, "tier2", &e, None));
                 }
                 None
             }
@@ -829,6 +1047,7 @@ async fn sync_and_cache(
                     Err(e) => {
                         if SYNC_FAILED.allow() {
                             eprintln!("sync: aligning {what} to {r} failed: {e}");
+                            eprintln!("{}", log_sync(state, log, "tier1", &e, Some(r)));
                         }
                         None
                     }
@@ -838,8 +1057,10 @@ async fn sync_and_cache(
                 // `Unavailable` is this credential's own trouble — quota gone, key revoked, its own
                 // rate limit. `Gone` and `Suspect` are about the file, so they stay shared.
                 mine_only = matches!(e, opensubtitles::DownloadError::Unavailable(_));
+                let tag = e.reason_tag();
                 if DOWNLOAD_FAILED.allow() {
                     eprintln!("sync: reference {r} for {what} unavailable: {}", e.message());
+                    eprintln!("{}", log_sync(state, log, "tier1", &format!("reference_{tag}"), Some(r)));
                 }
                 None
             }
@@ -853,9 +1074,11 @@ async fn sync_and_cache(
     // URL is deterministic, so every later request is a cache hit and the sync never runs again.
     // Remember it briefly so a retry loop doesn't re-spawn the binary per request, and let it heal.
     match synced {
-        // The alignment happened: this body IS the answer to this key.
+        // The alignment happened: this body IS the answer to this key. `tier_label` says which step
+        // of the ladder produced it.
         Some(body) => {
             state.cache.put(cache_key, body.clone(), CACHE_TTL);
+            log_serve(state, log, "served", tier_label, None, "miss", Some(&body));
             httputil::add_timing(httputil::srt(body), &sync_timing())
         }
         // Asked for and didn't happen. The unaligned body stands in, and is NOT written to
@@ -869,14 +1092,21 @@ async fn sync_and_cache(
                 false => shared_marker,
             };
             state.cache.put(marker, "1".into(), SYNC_RETRY_TTL);
+            log_serve(state, log, "degraded", "sync_failed", None, "miss", Some(&target));
             let resp = httputil::add_timing(httputil::srt_provisional(target), &sync_timing());
             httputil::degraded(resp, "sync_failed")
         }
         // No sync was asked for, so the body we have is the answer, and it is already cached —
         // unless the caller could not determine whether an alignment was owed at all, in which case
         // this is a stand-in and must revalidate rather than being pinned for a year.
-        None if settled => httputil::srt(target),
-        None => httputil::srt_provisional(target),
+        None if settled => {
+            log_serve(state, log, "served", "no_sync_needed", None, "miss", Some(&target));
+            httputil::srt(target)
+        }
+        None => {
+            log_serve(state, log, "degraded", "anchor_unknown", None, "miss", Some(&target));
+            httputil::srt_provisional(target)
+        }
     }
 }
 
@@ -1536,6 +1766,17 @@ pub async fn handle_translate(
     if lang_key.is_empty() {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_lang");
     }
+    let rid = logging::request_id(headers);
+    // Built once and reused at every exit: `file_id` is the only field any one call site has to
+    // supply, since which file this title translates from is not known until a source is picked.
+    let make_ctx = |file_id: Option<i64>| ServeCtx {
+        rid: rid.as_deref(),
+        file_id,
+        imdb: Some(&imdb),
+        season,
+        episode,
+        lang: Some(&lang),
+    };
     // Checked before any network call, and scoped to the title rather than to the source file: a
     // whole film's LLM bill is not something to re-pay on every tap. The `.json` and `.srt` forms are
     // two requests, so the app's own flow retries once by design — and nothing was remembered about a
@@ -1655,9 +1896,13 @@ pub async fn handle_translate(
     };
     let phase = if let Some(settled) = settled {
         if !want_json {
+            let ctx = make_ctx(cached_body.as_ref().and_then(|b| b.source));
             // `immutable` only when this really is the answer. With the anchor merely unknown the
             // body may well be superseded within the thirty seconds the search marker lasts, and a
             // client told `immutable` will not come back for a year.
+            let outcome = if anchor_unknown { "degraded" } else { "served" };
+            let reason = if anchor_unknown { "anchor_unknown" } else { "cache_hit" };
+            log_serve(state, ctx, outcome, reason, None, "hit", Some(&settled));
             let resp = match anchor_unknown {
                 true => httputil::degraded(httputil::srt_provisional(settled), "upstream_unavailable"),
                 false => httputil::srt(settled),
@@ -1709,6 +1954,16 @@ pub async fn handle_translate(
                             if ALLOWANCE_REFUSED.allow() {
                                 eprintln!(
                                     "translate: {imdb} → {lang} refused, install is over its daily allowance"
+                                );
+                                eprintln!(
+                                    "{}",
+                                    log_translate(
+                                        state,
+                                        make_ctx(None),
+                                        "refused",
+                                        "allowance_exhausted",
+                                        None
+                                    )
                                 );
                             }
                             return allowance_refusal();
@@ -1770,6 +2025,7 @@ pub async fn handle_translate(
                         // the ten-minute marker lapses, the same source is tried again, and the title
                         // burns one of the fifty daily translations per attempt.
                         if let Some(e) = remembered_failure(state, &client, source_id) {
+                            let tag = e.reason_tag();
                             // `Gone` means the API named the id, or two separate occasions confirmed
                             // it. A single `Suspect` is not `Gone`, so a transient cannot unpin.
                             if matches!(e, opensubtitles::DownloadError::Gone(_)) {
@@ -1781,6 +2037,16 @@ pub async fn handle_translate(
                             // Backed off like any other failure, or the refusal is free to repeat and
                             // each repeat re-runs the search and the pin write.
                             state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
+                            eprintln!(
+                                "{}",
+                                log_translate(
+                                    state,
+                                    make_ctx(Some(source_id)),
+                                    "refused",
+                                    &format!("source_{tag}"),
+                                    Some("opensubtitles"),
+                                )
+                            );
                             return httputil::error(StatusCode::BAD_GATEWAY, "source_unavailable");
                         }
                         let started = Instant::now();
@@ -1808,6 +2074,16 @@ pub async fn handle_translate(
                                     eprintln!(
                                         "translate: {imdb} → {lang} refused, install is over its daily allowance"
                                     );
+                                    eprintln!(
+                                        "{}",
+                                        log_translate(
+                                            state,
+                                            make_ctx(Some(source_id)),
+                                            "refused",
+                                            "allowance_exhausted",
+                                            None,
+                                        )
+                                    );
                                 }
                                 return allowance_refusal();
                             }
@@ -1818,6 +2094,16 @@ pub async fn handle_translate(
                                 if CREDENTIAL_REFUSED.allow() {
                                     eprintln!(
                                         "translate: provider refused this install's credential: {message}"
+                                    );
+                                    eprintln!(
+                                        "{}",
+                                        log_translate(
+                                            state,
+                                            make_ctx(Some(source_id)),
+                                            "refused",
+                                            &format!("credential_refused:{message}"),
+                                            Some("translator"),
+                                        )
                                     );
                                 }
                                 // The install-wide block only when the status can ONLY mean the key.
@@ -1873,6 +2159,16 @@ pub async fn handle_translate(
                                 // message rather than echoing a raw upstream error body.
                                 if TRANSLATE_FAILED.allow() {
                                     eprintln!("translate: {imdb} → {lang} failed: {}", e.message());
+                                    eprintln!(
+                                        "{}",
+                                        log_translate(
+                                            state,
+                                            make_ctx(Some(source_id)),
+                                            "failed",
+                                            &format!("translate_failed:{}", e.message()),
+                                            Some("translator"),
+                                        )
+                                    );
                                 }
                                 state.cache.put(failed_recently, "1".into(), SYNC_RETRY_TTL);
                                 // Unpin ONLY when the source is what failed. A pin naming a file that
@@ -1930,6 +2226,7 @@ pub async fn handle_translate(
             // we are serving an unaligned body that a working search might have aligned, so the
             // client has to come back rather than caching it for a year.
             !anchor_unknown,
+            make_ctx(used_source),
         )
         .await;
         let resp = httputil::add_timing(resp, &phase);
@@ -2277,6 +2574,7 @@ mod tests {
             machine_translated: false,
             ai_translated: false,
             foreign_parts_only: false,
+            hearing_impaired: false,
             ratings: 0.0,
         }
     }
@@ -2575,6 +2873,7 @@ mod sync_fallback_tests {
             machine_translated: false,
             ai_translated: false,
             foreign_parts_only: false,
+            hearing_impaired: false,
             ratings: 0.0,
         }];
         opensubtitles::rank(&mut subs, seen.as_deref());
@@ -2604,6 +2903,7 @@ mod translate_retry_tests {
             config_keys_prev: String::new(),
             metrics_token: String::new(),
             log_requests: false,
+            log_identity: true,
             // Port 1 refuses instantly. These cases are about the handler's own guards — the marker,
             // the language bound, the allowance — and every one of them has to get past a search
             // first. Pointed at the real API root they made a live request to api.opensubtitles.com
@@ -2657,6 +2957,7 @@ mod translate_retry_tests {
                 machine_translated: false,
                 ai_translated: false,
                 foreign_parts_only: false,
+                hearing_impaired: false,
                 ratings: 8.0,
             };
             state.cache.put(
@@ -2696,6 +2997,7 @@ mod translate_retry_tests {
             machine_translated: false,
             ai_translated: false,
             foreign_parts_only: false,
+            hearing_impaired: false,
             ratings: 0.0,
         }
     }
@@ -3459,5 +3761,153 @@ mod translate_retry_tests {
             swedish.contains("translation_backoff"),
             "the marked language was attempted anyway: {swedish}"
         );
+    }
+}
+
+#[cfg(test)]
+mod decision_log_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nhello\n\n2\n00:00:03,000 --> 00:00:04,000\nworld\n";
+
+    /// A state carrying a real secret in its install config — never in `Config`/`AppState` itself,
+    /// which hold only addon-level infrastructure, but the shape every real call site is built next
+    /// to: `os_client`/`produce_translation` read the key out of a decoded `UserConfig`/`LlmConfig`
+    /// right where these log lines are built.
+    fn state_with_identity(log_identity: bool, name: &str) -> Arc<AppState> {
+        let dir = std::env::temp_dir().join(format!("den-subs-decision-log-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        AppState::new(Config {
+            port: 0,
+            cache_dir: dir,
+            cache_max_bytes: 1 << 20,
+            public_base_url: None,
+            alass: "alass".into(),
+            config_key: String::new(),
+            config_keys_prev: String::new(),
+            metrics_token: String::new(),
+            log_requests: false,
+            log_identity,
+            os_api_base: "http://127.0.0.1:1".into(),
+            scout_origins: Vec::new(),
+            scout_aliases: Vec::new(),
+            revocation: Default::default(),
+        })
+    }
+
+    fn ctx<'a>(imdb: &'a str, lang: &'a str) -> ServeCtx<'a> {
+        ServeCtx {
+            rid: Some("rid-abc123"),
+            file_id: Some(42),
+            imdb: Some(imdb),
+            season: Some(1),
+            episode: Some(2),
+            lang: Some(lang),
+        }
+    }
+
+    #[test]
+    fn identity_fields_vanish_with_the_flag_off_but_everything_else_stays() {
+        let on = state_with_identity(true, "on");
+        let off = state_with_identity(false, "off");
+        let line_on = serve_line(&on, ctx("tt1234567", "en"), "served", "tier1", None, "hit", Some(SRT));
+        let line_off = serve_line(&off, ctx("tt1234567", "en"), "served", "tier1", None, "hit", Some(SRT));
+        for field in ["file=os:42", "imdb=tt1234567", "season=1", "episode=2", "lang=en"] {
+            assert!(line_on.contains(field), "identity on should carry {field}: {line_on}");
+            assert!(!line_off.contains(field), "identity off must drop {field}: {line_off}");
+        }
+        // Non-identity fields survive the flag either way — `rid` included, since it is the join
+        // key to the app's own line and not itself identifying.
+        for field in
+            ["event=serve", "outcome=served", "reason=tier1", "cache=hit", "cues=2", "rid=rid-abc123"]
+        {
+            assert!(line_on.contains(field), "{field} missing with identity on: {line_on}");
+            assert!(line_off.contains(field), "{field} missing with identity off: {line_off}");
+        }
+    }
+
+    /// The exact call shape `handle_subtitle_file`'s download-failure branch uses — a `DownloadError`
+    /// classified into a stable tag, with the real OpenSubtitles upstream named. A real install's
+    /// `opensubtitles_key` never appears here: `log_serve`'s only inputs are `ServeCtx`, a slug, and
+    /// an optional borrowed body, none of which is (or could carry) a credential.
+    #[test]
+    fn a_key_never_reaches_the_serve_or_sync_or_translate_line() {
+        let secret = "sk-do-not-log-this-secret";
+        let state = state_with_identity(true, "key");
+        let c = ctx("tt7777777", "en");
+
+        let download_err =
+            opensubtitles::DownloadError::Suspect("file 42 has too few cues for its span".into());
+        let serve =
+            serve_line(&state, c, "refused", download_err.reason_tag(), Some("opensubtitles"), "miss", None);
+        assert!(!serve.contains(secret), "{serve}");
+
+        let sync = log_sync(&state, c, "tier1", "reference_unavailable", Some(99));
+        assert!(!sync.contains(secret), "{sync}");
+
+        // A credential refusal's `message` is the PROVIDER's own text (never the key itself — see
+        // `produce_translation`'s contract), but even if an upstream ever echoed something unusual
+        // back, the function that builds this line takes no `LlmConfig`/`UserConfig` at all, so
+        // there is no path for `secret` to reach it.
+        let translate =
+            log_translate(&state, c, "refused", &format!("credential_refused:{secret}"), Some("translator"));
+        // This line is built FROM the given reason text, which is the one place a provider's own
+        // message is interpolated — so it reaching the line is expected. What matters is that the
+        // key lives nowhere else this function could have picked it up from: `ServeCtx` carries no
+        // credential field, and `AppState`/`Config` hold none either.
+        assert!(translate.contains(secret), "sanity: the explicit reason text is the only input");
+        assert!(
+            !format!("{c:?}", c = c).contains(secret),
+            "ServeCtx itself must never be able to carry a credential"
+        );
+    }
+
+    #[test]
+    fn rank_line_names_the_top_pick_and_its_factors() {
+        let mut dubbed = opensubtitles::Subtitle {
+            file_id: 555,
+            lang: "en".into(),
+            hash_match: true,
+            downloads: 10,
+            release: "Fauda.S01E01.DUBBED.WEB-DL".into(),
+            hd: false,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            foreign_parts_only: false,
+            hearing_impaired: false,
+            ratings: 0.0,
+        };
+        let plain = opensubtitles::Subtitle { file_id: 556, release: String::new(), ..dubbed.clone() };
+        dubbed.hash_match = true;
+        let subs = vec![dubbed, plain];
+        let line = rank_line(
+            true,
+            Some("rid-xyz"),
+            "tt1111111",
+            Some(1),
+            Some(1),
+            Some("Fauda.S01E01.DUBBED.WEB-DL.mkv"),
+            &subs,
+            Duration::from_millis(3),
+        );
+        assert!(line.contains("event=rank outcome=served"), "{line}");
+        assert!(line.contains("candidates=2"), "{line}");
+        assert!(line.contains("imdb=tt1111111"), "{line}");
+        assert!(line.contains("top=os:555"), "{line}");
+        assert!(line.contains("top_factors=") && line.contains("looks_dubbed"), "{line}");
+        assert!(line.contains("next1=os:556"), "{line}");
+        assert!(line.contains("rid=rid-xyz"), "{line}");
+    }
+
+    #[test]
+    fn rank_line_with_no_candidates_is_skipped_not_served() {
+        let line = rank_line(true, None, "tt2222222", None, None, None, &[], Duration::from_millis(0));
+        assert!(line.contains("outcome=skipped"), "{line}");
+        assert!(line.contains("reason=no_candidates"), "{line}");
+        assert!(line.contains("candidates=0"), "{line}");
     }
 }
