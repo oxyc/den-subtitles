@@ -415,7 +415,11 @@ pub fn text_score(s: &Subtitle) -> i64 {
 /// whatever the dub still leaves in another language, which is a small, scene-dependent fraction of
 /// the runtime. Whole-word, case-insensitive: "dubbed" and "dub" as their own release tokens, not as
 /// a substring of an unrelated word (a release group or title could contain "dub" by coincidence).
-fn looks_dubbed(release: &str) -> bool {
+///
+/// `pub(crate)`: `addon.rs` carries the same verdict to the client as `looksDubbed`, so a caller
+/// that already knows its own audio language (den-remux does) can rank this track against an
+/// embedded one rather than trust `rank`'s language-blind ordering alone.
+pub(crate) fn looks_dubbed(release: &str) -> bool {
     tokenize(release).iter().any(|t| t == "dubbed" || t == "dub")
 }
 

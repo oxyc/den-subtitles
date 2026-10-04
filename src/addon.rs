@@ -305,6 +305,12 @@ pub async fn handle_subtitles(
                 "downloads": s.downloads,
                 "machineTranslated": s.machine_translated,
                 "aiTranslated": s.ai_translated,
+                // OpenSubtitles' own flag, and ours read off the release string (`looks_dubbed`):
+                // both mean "this track's cues cover only part of the dialogue", which a client that
+                // knows its own session's audio language can rank against an embedded track rather
+                // than trust language-blind "first in the list" alone.
+                "foreignPartsOnly": s.foreign_parts_only,
+                "looksDubbed": opensubtitles::looks_dubbed(&s.release),
             })
         })
         .collect();
@@ -2739,6 +2745,39 @@ mod translate_retry_tests {
             "private, max-age=3600, stale-while-revalidate=3600, stale-if-error=86400"
         );
         assert_eq!(resp.headers().get(httputil::SERVER_TIMING).unwrap(), CACHE_HIT);
+    }
+
+    /// The flags a client needs to rank a partial track against its own embedded one — OpenSubtitles'
+    /// `foreign_parts_only` and our own release-string read, `looks_dubbed` — ride along on every
+    /// listed subtitle, not only the ones `rank` demotes: den-remux is the one that knows its
+    /// session's audio language, so it needs both signals even on a track that sorted first.
+    #[tokio::test]
+    async fn the_list_carries_the_partial_track_flags() {
+        let state = state("partial-flags");
+        let entry = SearchEntry {
+            fresh_until: unix_seconds() + 3600,
+            subs: vec![
+                opensubtitles::Subtitle { foreign_parts_only: true, ..listed_sub(5001) },
+                opensubtitles::Subtitle { release: "Fauda.S01E01.DUBBED.WEB-DL".into(), ..listed_sub(5002) },
+            ],
+        };
+        state.cache.put(
+            format!("{}tt0000096:0:0:", cache::SEARCH_NS),
+            serde_json::to_string(&entry).unwrap(),
+            SEARCH_STALE_GRACE,
+        );
+        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt0000096", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let subs = v["subtitles"].as_array().unwrap();
+        let flagged = subs.iter().find(|s| s["id"] == "os-5001").unwrap();
+        assert_eq!(flagged["foreignPartsOnly"], true, "{body:?}");
+        assert_eq!(flagged["looksDubbed"], false, "{body:?}");
+        let dubbed = subs.iter().find(|s| s["id"] == "os-5002").unwrap();
+        assert_eq!(dubbed["foreignPartsOnly"], false, "{body:?}");
+        assert_eq!(dubbed["looksDubbed"], true, "{body:?}");
     }
 
     /// A film's LLM bill must not be re-paid on every tap. The `.json` and `.srt` forms are two
