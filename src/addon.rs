@@ -2270,6 +2270,7 @@ mod tests {
             from_trusted: false,
             machine_translated: false,
             ai_translated: false,
+            foreign_parts_only: false,
             ratings: 0.0,
         }
     }
@@ -2567,6 +2568,7 @@ mod sync_fallback_tests {
             from_trusted: false,
             machine_translated: false,
             ai_translated: false,
+            foreign_parts_only: false,
             ratings: 0.0,
         }];
         opensubtitles::rank(&mut subs, seen.as_deref());
@@ -2648,6 +2650,7 @@ mod translate_retry_tests {
                 from_trusted: true,
                 machine_translated: false,
                 ai_translated: false,
+                foreign_parts_only: false,
                 ratings: 8.0,
             };
             state.cache.put(
@@ -2686,6 +2689,7 @@ mod translate_retry_tests {
             from_trusted: false,
             machine_translated: false,
             ai_translated: false,
+            foreign_parts_only: false,
             ratings: 0.0,
         }
     }

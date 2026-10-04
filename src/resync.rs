@@ -393,7 +393,7 @@ async fn relay(up: Arc<Upstream>, req: Request<Incoming>) -> Response<RelayBody>
 
 /// Take `n` bytes from the relay's budget, or refuse without taking any.
 fn spend(budget: &AtomicU64, n: u64) -> bool {
-    budget.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(n)).is_ok()
+    budget.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(n)).is_ok()
 }
 
 fn bare(status: StatusCode) -> Response<RelayBody> {

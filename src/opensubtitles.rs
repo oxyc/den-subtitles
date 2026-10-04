@@ -39,6 +39,22 @@ pub struct Subtitle {
     /// Machine/AI-translated subs are low quality — demoted to the bottom of the ranking.
     pub machine_translated: bool,
     pub ai_translated: bool,
+    /// OpenSubtitles' own flag for a track that captions only the OTHER language's dialogue — e.g.
+    /// English cues over Arabic in an otherwise-Hebrew show. Correct where it has cues at all, and
+    /// silent for every scene in the show's main language, which is most of the runtime. Demoted for
+    /// the same reason the Apple TV demotes a muxed "forced" track (see that app's `subtitleRank`):
+    /// nothing upstream of `rank` otherwise tells this apart from a full dialogue track, so den-remux's
+    /// "serve the first English hit" picked it, read as subtitles that are "there for half the
+    /// episode" and silent in exactly the scenes spoken in the main language.
+    ///
+    /// `#[serde(default)]`: this field landed after `SearchEntry`'s cache format did, and the cache
+    /// holds entries up to `SEARCH_TTL + SEARCH_STALE_GRACE` (six hours fresh, kept a week past that)
+    /// — long enough to outlive a deploy. Without a default, every cached entry written before this
+    /// field existed fails to deserialize on the first read after the field was added, which happened
+    /// to be invisible here (a parse failure is read as a cache miss, so it just re-searches) but is
+    /// not a reason to leave a field one deploy away from silently losing old entries.
+    #[serde(default)]
+    pub foreign_parts_only: bool,
     /// 0–10 community rating.
     pub ratings: f64,
 }
@@ -239,6 +255,19 @@ impl<'a> Client<'a> {
         if !crate::srt::has_a_cue(&body) {
             return Err(DownloadError::Suspect("subtitle link returned no cues".to_string()));
         }
+        // Real cues are not proof of a complete transcript either. A sub made for a DUBBED release,
+        // or an unflagged foreign-parts-only track, has correctly-timed cues — just only over the
+        // scenes the dub or the main dialogue doesn't need translating, which is a small, uneven
+        // fraction of the runtime. `rank` already pushes a FLAGGED one of either shape to the bottom;
+        // this catches the one OpenSubtitles' own metadata didn't flag (the Fauda file this was found
+        // from: an English sub for a DUBBED release, with no `foreign_parts_only` set).
+        //
+        // `Suspect`, the same as a cue-less body: one sparse read could be a genuinely quiet stretch
+        // in an otherwise full track, so it is not trusted to unpin on its own, but a repeat escalates
+        // it to `Gone` the same way — see `remember_failure`.
+        if crate::srt::looks_incomplete(&crate::srt::parse(&body)) {
+            return Err(DownloadError::Suspect(format!("file {file_id} has too few cues for its span")));
+        }
         Ok(body)
     }
 }
@@ -317,15 +346,18 @@ fn parse_search(v: &Value) -> Vec<Subtitle> {
             from_trusted: attrs["from_trusted"].as_bool().unwrap_or(false),
             machine_translated: attrs["machine_translated"].as_bool().unwrap_or(false),
             ai_translated: attrs["ai_translated"].as_bool().unwrap_or(false),
+            foreign_parts_only: attrs["foreign_parts_only"].as_bool().unwrap_or(false),
             ratings: attrs["ratings"].as_f64().unwrap_or(0.0),
         });
     }
     out
 }
 
-/// Score a subtitle's fit to the playing file. A hash match is decisive; otherwise release/filename
-/// overlap dominates (same encode ⇒ same timing), with trust/ratings/downloads as tie-breakers.
-/// Machine/AI-translated subs are pushed below everything.
+/// Score a subtitle's fit to the playing file. A hash match is decisive — UNLESS the track is
+/// foreign-parts-only, which stays behind a full track whatever its hash or release fit, for the same
+/// reason `text_score` demotes it. Otherwise release/filename overlap dominates (same encode ⇒ same
+/// timing), with trust/ratings/downloads as tie-breakers. Machine/AI-translated subs are pushed below
+/// everything, foreign-parts-only tracks included.
 pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
     const HASH: i64 = 1_000_000;
     let mut score = text_score(s);
@@ -348,6 +380,9 @@ pub fn fit_score(s: &Subtitle, filename: Option<&str>) -> i64 {
 /// encode by the next. Every flip is another metered download.
 pub fn text_score(s: &Subtitle) -> i64 {
     const JUNK: i64 = 2_000_000; // demote machine/AI below even a no-info sub
+                                 // A foreign-parts-only track is accurate where it has cues, so it must not sink as far as a
+                                 // machine-translated one: between a real full track and JUNK, never tied to either.
+    const PARTIAL: i64 = 1_500_000;
     let mut score = 0i64;
     if s.from_trusted {
         score += 400;
@@ -357,7 +392,31 @@ pub fn text_score(s: &Subtitle) -> i64 {
     if s.machine_translated || s.ai_translated {
         score -= JUNK;
     }
+    // Downloads and ratings reward exactly the wrong thing here: a foreign-parts track is the ONLY
+    // English subtitle for an otherwise-subtitled-elsewhere scene, so everyone who needs it at all
+    // downloads it, and it is often hash-matched to the release that burned those scenes in. Nothing
+    // about its popularity says it covers the dialogue a full track does — it never does, by
+    // definition — so it is demoted on its own flag rather than left to outscore a full track on
+    // downloads or a hash match.
+    //
+    // A DUBBED release is the same shape of problem under a different name: its English sub (made
+    // for THAT release) captions only the lines the dub leaves in the original language, which is
+    // the Fauda case this was found from — OpenSubtitles never set `foreign_parts_only` on that file,
+    // but its release string said "DUBBED" and that was decisive. Nothing else here reads `release`
+    // for content, only for filename overlap, so this is the one place it gets to veto a pick.
+    if s.foreign_parts_only || looks_dubbed(&s.release) {
+        score -= PARTIAL;
+    }
     score
+}
+
+/// Does this release string say it was authored against a DUBBED release — an English (or other)
+/// soundtrack replaced, with the original dialogue gone? A subtitle built for one captions only
+/// whatever the dub still leaves in another language, which is a small, scene-dependent fraction of
+/// the runtime. Whole-word, case-insensitive: "dubbed" and "dub" as their own release tokens, not as
+/// a substring of an unrelated word (a release group or title could contain "dub" by coincidence).
+fn looks_dubbed(release: &str) -> bool {
+    tokenize(release).iter().any(|t| t == "dubbed" || t == "dub")
 }
 
 /// Order subtitles for the picker: grouped by language, best-fit first within each language. The
@@ -483,6 +542,17 @@ mod tests {
         let subs = parse_search(&v);
         assert_eq!(subs.len(), 2);
         assert_eq!(subs[0].release, "Fight.Club.1999.1080p.BluRay.x264-AMIABLE");
+        assert!(!subs[0].foreign_parts_only, "unset must default to false, not an absent-field panic");
+    }
+
+    #[test]
+    fn parses_foreign_parts_only() {
+        let v = json!({"data": [
+            {"attributes": {"language": "en", "download_count": 1, "foreign_parts_only": true,
+                "release": "Fauda.S01E01.NF.WEB-DL", "files": [{"file_id": 1}]}},
+        ]});
+        let subs = parse_search(&v);
+        assert!(subs[0].foreign_parts_only);
     }
 
     #[test]
@@ -499,6 +569,34 @@ mod tests {
         assert!(fit_score(&popular_junk, filename) < fit_score(&sub(9, "en", false, 0, ""), filename));
     }
 
+    /// The Fauda report: a guest's English subtitles "showed for half the episode". A
+    /// foreign-parts-only track only has cues over the OTHER language's dialogue (e.g. the Arabic in
+    /// an otherwise-Hebrew show), so a full dialogue track must win whatever the foreign-parts track's
+    /// hash match, downloads, or trust — mirroring the Apple TV's forced-track demotion (den
+    /// `subtitleRank`, commit cc933c0f) for the equivalent muxed-track flag.
+    #[test]
+    fn a_foreign_parts_only_track_never_beats_a_full_one() {
+        let mut foreign_parts = sub(1, "en", true, 50000, "Fauda.S01E01.NF.WEB-DL.DUAL-SMURF");
+        foreign_parts.foreign_parts_only = true;
+        foreign_parts.from_trusted = true;
+        foreign_parts.ratings = 9.0;
+        // No hash match, no trust, no downloads, no release fit at all — the worst a full track can
+        // look — and it must still outrank the foreign-parts one on every signal.
+        let plain_full = sub(2, "en", false, 0, "");
+        let filename = Some("Fauda.S01E01.NF.WEB-DL.DUAL.DDP2.0.H.264-SMURF.mkv");
+        assert!(
+            fit_score(&plain_full, filename) > fit_score(&foreign_parts, filename),
+            "a foreign-parts-only hash match outranked a plain full track"
+        );
+        // It still beats having nothing, the way SDH alone beats no subtitles on the TV.
+        assert!(fit_score(&foreign_parts, filename) > i64::MIN);
+
+        // And `rank`, which groups by language then sorts by fit, puts it last within "en".
+        let mut subs = vec![foreign_parts.clone(), plain_full.clone()];
+        rank(&mut subs, filename);
+        assert_eq!(subs[0].file_id, plain_full.file_id, "the full track must be ranked first");
+    }
+
     fn sub(id: i64, lang: &str, hash: bool, dl: i64, release: &str) -> Subtitle {
         Subtitle {
             file_id: id,
@@ -511,6 +609,7 @@ mod tests {
             from_trusted: false,
             machine_translated: false,
             ai_translated: false,
+            foreign_parts_only: false,
             ratings: 0.0,
         }
     }
@@ -753,5 +852,46 @@ mod download_tests {
     async fn a_real_subtitle_comes_back_intact() {
         let srt = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
         assert_eq!(download_from("200 OK", srt).await.unwrap(), srt);
+    }
+
+    /// `HH:MM:SS,mmm` for an SRT timecode, from milliseconds.
+    fn srt_ts(ms: u64) -> String {
+        let (h, rem) = (ms / 3_600_000, ms % 3_600_000);
+        let (m, rem) = (rem / 60_000, rem % 60_000);
+        let (s, milli) = (rem / 1000, rem % 1000);
+        format!("{h:02}:{m:02}:{s:02},{milli:03}")
+    }
+
+    /// An SRT body with `count` half-second cues spaced `step_ms` apart, starting at 1s — enough to
+    /// drive `looks_incomplete` at a chosen density without hand-writing hundreds of cues.
+    fn spaced_srt(count: u64, step_ms: u64) -> String {
+        let mut out = String::new();
+        for i in 0..count {
+            let start = 1000 + i * step_ms;
+            out.push_str(&format!("{}\n{} --> {}\nline\n\n", i + 1, srt_ts(start), srt_ts(start + 500)));
+        }
+        out
+    }
+
+    /// The Fauda shape downloaded: a DUBBED-release English sub with real, correctly-timed cues —
+    /// `has_a_cue` and `has_a_cue`'s full cousin both pass it — but far too sparse for its own span
+    /// (200 cues over ~40 minutes, ≈5/minute). `download` must refuse it so den-remux's existing
+    /// fall-back-to-the-next-candidate loop moves on, rather than serving it as if it were complete.
+    #[tokio::test]
+    async fn a_sparse_but_cued_body_is_refused() {
+        // `download_from` takes `&'static str` (every other case here is a literal); leaking a test's
+        // own generated body is a fine way to get one without widening that signature for one case.
+        let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str()); // 200 cues, 12s apart ≈ 5/minute over ~40 minutes
+        let err = download_from("200 OK", srt).await.expect_err("a sparse dub sub must not download clean");
+        let msg = err.message();
+        assert!(msg.contains("too few cues"), "{msg}");
+    }
+
+    /// A dense track of the same rough length downloads cleanly — the check is about density, not
+    /// about length or cue count alone.
+    #[tokio::test]
+    async fn a_dense_body_of_similar_length_downloads_clean() {
+        let srt: &'static str = Box::leak(spaced_srt(480, 5_000).into_boxed_str()); // 480 cues, 5s apart ≈ 12/minute over ~40 minutes
+        assert!(download_from("200 OK", srt).await.is_ok());
     }
 }
