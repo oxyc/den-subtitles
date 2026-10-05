@@ -1159,12 +1159,9 @@ mod download_tests {
 
         // A throttle or server outage is a SERVICE fact. It must not enter the suspect-file counter,
         // where a later repeat would promote it to a seven-day `Gone` verdict.
-        for status in [
-            "408 Request Timeout",
-            "425 Too Early",
-            "429 Too Many Requests",
-            "503 Service Unavailable",
-        ] {
+        for status in
+            ["408 Request Timeout", "425 Too Early", "429 Too Many Requests", "503 Service Unavailable"]
+        {
             let err = download_from(status, "nope").await.expect_err("must fail");
             assert!(matches!(err, DownloadError::Unavailable(_)), "{status} from the CDN: {err:?}");
         }
