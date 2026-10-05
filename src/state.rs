@@ -46,7 +46,7 @@ pub struct AppState {
     pub cache: Cache,
     /// One worker per cache key for the two expensive jobs (an LLM translation, a sync subprocess).
     /// The cache only collapses work that has already finished; this collapses work in progress.
-    pub inflight: InFlight,
+    pub inflight: Arc<InFlight>,
     /// How far a running translation has got, for the `.status` endpoint.
     pub progress: Progress,
     /// Tier binaries allowed to run at once. `alass` decodes audio through ffmpeg and gets up to 90
@@ -97,7 +97,7 @@ impl AppState {
             config_keyring,
             http,
             cache,
-            inflight: InFlight::default(),
+            inflight: Arc::new(InFlight::default()),
             progress: Progress::default(),
             sync_admission: SyncAdmission::new(),
             sync,

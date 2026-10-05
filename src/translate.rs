@@ -673,13 +673,18 @@ fn retry_after(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap
 /// Record what a call's outcome says about the key's shared pause. Any answer ends it — a reply the
 /// contract then rejects was still let through by the provider's limiter; a rate limit starts or
 /// extends it; any other refusal leaves it alone.
-fn record_limit<T>(pauses: &Pauses, key: u64, result: &Result<T, CallError>) {
+fn record_limit<T>(
+    pauses: &Pauses,
+    key: u64,
+    observed: crate::ratelimit::Observation,
+    result: &Result<T, CallError>,
+) {
     match result {
         Err(CallError::Upstream { limited: true, retry, .. }) => {
             pauses.limited(key, retry.filter(|wait| !wait.is_zero()));
         }
         Err(CallError::Upstream { .. }) => {}
-        Ok(_) | Err(CallError::Contract(_)) => pauses.answered(key),
+        Ok(_) | Err(CallError::Contract(_)) => pauses.answered(key, observed),
     }
 }
 
@@ -845,6 +850,13 @@ impl BatchCall for Upstream<'_> {
             {
                 return None;
             }
+            let key = self.pause_key();
+            let _permit = self.pauses.acquire(key).await;
+            // A request ahead of the glossary may have installed a pause while this waited.
+            if self.pauses.remaining(key).is_some() {
+                return None;
+            }
+            let observed = self.pauses.begin(key);
             let system = format!(
                 "You are preparing a translation glossary for a film's subtitles. From the dialogue \
                  lines in the user's JSON array, identify the proper nouns, recurring forms of \
@@ -863,7 +875,7 @@ impl BatchCall for Upstream<'_> {
             // await: if the client hangs up during it, this call is charged for and we never learn.
             spend.dispatch();
             let result = call_chat_typed(self.client, self.llm, &system, &user).await;
-            record_limit(self.pauses, self.pause_key(), &result);
+            record_limit(self.pauses, key, observed, &result);
             match result {
                 // Accepted, so billed — even when `parse_glossary` keeps nothing out of it.
                 Ok(text) => Some(parse_glossary(&text)),
@@ -1051,10 +1063,27 @@ async fn call_with_retries(
             }
             tokio::time::sleep(wait).await;
         }
-        let result = upstream.call(sources, context).await;
-        if let Some((pauses, key)) = shared {
-            record_limit(pauses, key, &result);
+        let _permit = match shared {
+            Some((pauses, key)) => Some(pauses.acquire(key).await),
+            None => None,
+        };
+        // A request ahead of this one may have received a 429 while this waited for admission. Do not
+        // spend one of our retry attempts or hold a permit while honoring it.
+        if let Some(left) = shared.and_then(|(pauses, key)| pauses.remaining(key)) {
+            drop(_permit);
+            let wait = left + spread();
+            if wait >= budget.remaining() {
+                return Err(CallError::upstream(format!("provider rate limited, {}s left", left.as_secs())));
+            }
+            tokio::time::sleep(wait).await;
+            continue;
         }
+        let observed = shared.map(|(pauses, key)| pauses.begin(key));
+        let result = upstream.call(sources, context).await;
+        if let (Some((pauses, key)), Some(observed)) = (shared, observed) {
+            record_limit(pauses, key, observed, &result);
+        }
+        drop(_permit);
         let Err(CallError::Upstream { retry: Some(stated), .. }) = &result else { return result };
         if attempt >= ATTEMPTS {
             return result;
