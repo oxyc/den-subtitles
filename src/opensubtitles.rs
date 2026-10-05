@@ -315,7 +315,16 @@ impl<'a> Client<'a> {
         // expired or rate-limited link) returned its HTML error page AS the subtitle — cached under
         // the file id for 60 days and served `immutable`. One transient blip, one track that
         // silently shows nothing forever.
-        if ratelimit::throttled(resp.status(), resp.headers()) || resp.status().is_server_error() {
+        if ratelimit::throttled(resp.status(), resp.headers())
+            || resp.status().is_server_error()
+            // A timeout or an origin asking an early request to be retried is about this attempt,
+            // never evidence that the subtitle file is bad. Letting either reach `Suspect` would
+            // promote two ordinary transport refusals into a seven-day shared `Gone` marker.
+            || matches!(
+                resp.status(),
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_EARLY
+            )
+        {
             let code = resp.status();
             let stated = ratelimit::throttled(code, resp.headers())
                 .then(|| ratelimit::retry_after(resp.headers(), SystemTime::now()))
@@ -1150,7 +1159,12 @@ mod download_tests {
 
         // A throttle or server outage is a SERVICE fact. It must not enter the suspect-file counter,
         // where a later repeat would promote it to a seven-day `Gone` verdict.
-        for status in ["429 Too Many Requests", "503 Service Unavailable"] {
+        for status in [
+            "408 Request Timeout",
+            "425 Too Early",
+            "429 Too Many Requests",
+            "503 Service Unavailable",
+        ] {
             let err = download_from(status, "nope").await.expect_err("must fail");
             assert!(matches!(err, DownloadError::Unavailable(_)), "{status} from the CDN: {err:?}");
         }
