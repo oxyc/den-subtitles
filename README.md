@@ -130,13 +130,21 @@ key across batches and films. The first successful answer ends a pause.
   that does not decode, or whose install is revoked (see Configuration). Every `/<config>/…` route
   gives a revoked install that same answer.
 - `GET /<config>/subtitles/<type>/<id>[/<extra>].json` — the Stremio subtitles resource:
-  hash-matched-first OpenSubtitles results, each `url` pointing at `/subtitle` below.
+  hash-matched-first OpenSubtitles results, each `url` pointing at `/subtitle` below. A candidate
+  already confirmed dead (the API's own 404/410, or two occasions of a cue-less body/expired link) is
+  dropped before it is offered — a language with only dead candidates disappears entirely rather than
+  being listed with nothing that can serve it. A merely sparse candidate (real, correctly-timed, just
+  too little of it) stays listed: it is not dead, and `/subtitle`'s `?sparse=1` can still serve it.
 - `GET /<config>/subtitle/<file_id>.srt` (or `.vtt`) — one subtitle, proxied and cached; `.vtt` is
   the same document as WebVTT. `?ref=<file_id>` reference-aligns it to a hash-matched anchor (Tier 1);
   `?resync=<stream-url>` aligns it to the stream's audio with `alass` (Tier 2). Whatever encoding the
   upload is in (Windows-125x, ISO-8859-x, UTF-16), it is served as UTF-8; `lang=<code>`, set on the
   URLs the subtitles resource hands back for languages with their own legacy encodings, hints that
-  detection.
+  detection. `?sparse=1` is the caller's own last resort, asked for only after every candidate for a
+  language has been tried and refused: a real, correctly-timed but too-sparse-for-its-span track
+  (a dubbed release's English captions, say) is served rather than refused, since it is better than
+  offering the language at all and getting nothing. A cue-less body, an expired CDN link or a dead
+  upload stays refused either way — `sparse` never describes those.
 - `GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.json` — runs (or finds cached) the
   translation and answers `{"url":"…/<lang>.srt"}`.
 - `GET /<config>/translate/<type>/<id>[/<extra>]/<lang>.srt` (or `.vtt`) — the translated subtitle,
@@ -220,11 +228,18 @@ app's own request line for the same request (see `LOG_REQUESTS` above).
   event=rank outcome=served reason=ranked dur_ms=0 candidates=2 imdb=tt1111111 season=1 episode=1 top=os:555 top_lang=en top_factors=hash_match,release_match,downloads,looks_dubbed next1=os:556 next1_lang=en next1_factors=none rid=a1b2c3
   ```
 - **`event=serve`** — one download/serve decision: a cache hit, which step of the sync ladder ran
-  (`reason=tier1`/`tier2`/`no_sync_needed`), a refusal (`gone`/`suspect`/`sparse`/`unavailable`), or
-  a fallback to an unaligned stand-in — with the served body's cue count, span, cues/minute and
-  largest gap, which is what makes a sparse or dubbed-release file diagnosable after the fact:
+  (`reason=tier1`/`tier2`/`no_sync_needed`/`sparse_fallback`), a refusal
+  (`gone`/`suspect`/`sparse`/`no_cues`/`expired_link`/`unavailable`), or a fallback to an unaligned
+  stand-in — with the body's cue count, span, cues/minute and largest gap, which is what makes a
+  sparse or dubbed-release file diagnosable after the fact. A `sparse` REFUSAL carries these numbers
+  too (measured on the download that triggered it, not a second one): a strict request still refuses
+  a too-sparse-for-its-span track so a non-sparse candidate always wins when one exists, and only
+  `?sparse=1` (the caller's own last resort — see `/subtitle`) accepts it, logged as
+  `reason=sparse_fallback`:
   ```
   event=serve outcome=served reason=tier1 cache=miss file=os:42 lang=en cues=612 span_s=2380 cues_per_min=15.4 max_gap_s=38 rid=a1b2c3
+  event=serve outcome=refused reason=sparse upstream=opensubtitles cache=miss file=os:43 cues=200 span_s=2402 cues_per_min=5.0 max_gap_s=180 rid=a1b2c4
+  event=serve outcome=served reason=sparse_fallback cache=miss file=os:43 lang=en cues=200 span_s=2402 cues_per_min=5.0 max_gap_s=180 rid=a1b2c5
   ```
 - **`event=sync`** — a resync/align step (Tier 1 reference-align, Tier 2 audio VAD) that failed,
   naming the file, the reference (when Tier 1), the title and language.
