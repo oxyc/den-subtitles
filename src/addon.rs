@@ -419,11 +419,13 @@ pub async fn handle_subtitles(
     // Drop candidates already confirmed `Gone` (the API's own 404/410, or two occasions of a
     // cue-less body/expired link — see `remember_failure`) before they are offered at all: nothing
     // asking for one of these would ever get it served, picker or fallback alike. A SPARSE verdict
-    // never lands here — it never escalates to `Gone` (same function) — because a real, merely
-    // incomplete track is exactly what the fallback pass (`?sparse=1` on `/subtitle/<id>`) exists to
-    // serve, so it stays listed. The language disappears from `out` below only when EVERY one of its
-    // candidates is actually dead, never because the only ones left are sparse.
-    subs.retain(|s| state.cache.get(&dead_file_key(s.file_id)).is_none());
+    // never escalates to `Gone` any more (same function), because a real, merely incomplete track is
+    // exactly what the fallback pass (`?sparse=1` on `/subtitle/<id>`) exists to serve — so it stays
+    // listed. A `dead_file_key` tag of `sparse` is always an OLD marker, from before that fix, and is
+    // read the same way: stays listed, same as `remembered_failure` still lets `allow_sparse` serve
+    // it. The language disappears from `out` below only when EVERY one of its candidates is actually
+    // dead, never because the only ones left are sparse.
+    subs.retain(|s| state.cache.get(&dead_file_key(s.file_id)).is_none_or(|tag| tag == "sparse"));
 
     // Rank for THIS stream: hash-match, then release/filename fit, then quality; grouped by language
     // best-first. Machine/AI subs sink to the bottom.
@@ -1362,10 +1364,23 @@ fn remembered_failure(
     // cache logs the SAME specific reason a live failure would, instead of collapsing every
     // remembered refusal into one generic verdict. `reason_tag` reads it back out of the
     // `(remembered: <tag>)` wrapper below.
+    //
+    // A `sparse` tag here is never a NEW escalation (`remember_failure` stopped promoting it) — it is
+    // always a marker from before that fix, when a repeat sparse verdict promoted the same way a
+    // `no_cues`/`expired_link` one still does. Read it the same way the live `sparse` backoff below
+    // is read, not as a file that truly cannot serve: `allow_sparse` may still bypass it, and a
+    // strict request refuses it as `sparse`, never as `Gone` (Fauda S1E3's two English files, marked
+    // dead this way before den-subtitles 0.20.0, must stay eligible for the last-resort retry).
     if let Some(tag) = state.cache.get(&dead_file_key(file_id)) {
-        return Some(opensubtitles::DownloadError::Gone(format!(
-            "file {file_id} is gone (remembered: {tag})"
-        )));
+        if !(allow_sparse && tag == "sparse") {
+            return Some(if tag == "sparse" {
+                opensubtitles::DownloadError::Suspect(format!(
+                    "file {file_id} would not download (remembered: {tag})"
+                ))
+            } else {
+                opensubtitles::DownloadError::Gone(format!("file {file_id} is gone (remembered: {tag})"))
+            });
+        }
     }
     // The BACKOFF gates; the strike counter deliberately does not. A burst of requests for one
     // failing file must cost one credit, not one each — but the attempt that confirms a strike has
@@ -3284,6 +3299,36 @@ mod translate_retry_tests {
         );
     }
 
+    /// Fauda S1E3's real case: before den-subtitles 0.20.0 stopped a repeat `sparse` verdict from
+    /// ever escalating, a second sparse refusal on the same file promoted it straight into the
+    /// week-long `Gone` marker — exactly the shared value the listing filter otherwise reads as
+    /// genuinely dead. That old marker's stored value is still `sparse` (`remember_failure` always
+    /// wrote the reason tag as the cache value, escalation path or not), so it must be read the same
+    /// way a live sparse backoff is: stays listed, not dropped as confirmed dead.
+    #[tokio::test]
+    async fn an_old_gone_marker_recorded_for_sparseness_stays_listed() {
+        let state = state("old-gone-sparse");
+        let entry = SearchEntry { fresh_until: unix_seconds() + 3600, subs: vec![listed_sub(3529838)] };
+        state.cache.put(
+            format!("{}tt4565380:1:3:", cache::SEARCH_NS),
+            serde_json::to_string(&entry).unwrap(),
+            SEARCH_STALE_GRACE,
+        );
+        // A pre-0.20.0 Gone marker: a second sparse refusal that used to escalate.
+        state.cache.put(dead_file_key(3529838), "sparse".into(), DEAD_FILE_TTL);
+
+        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let subs = v["subtitles"].as_array().unwrap();
+        assert!(
+            subs.iter().any(|s| s["id"] == "os-3529838"),
+            "an old Gone marker recorded for sparseness must still be listed: {body:?}"
+        );
+    }
+
     /// A film's LLM bill must not be re-paid on every tap. The `.json` and `.srt` forms are two
     /// requests, so the app retries once by design, and nothing was remembered about a failure.
     /// The marker has to short-circuit — and it must never be mistaken for the subtitle itself:
@@ -3852,6 +3897,44 @@ mod translate_retry_tests {
         remember_failure(&state, &client, 11, &DownloadError::Suspect("subtitle link 404".into()));
         let dead = remembered_failure(&state, &client, 11, false).expect("promoted");
         assert_eq!(dead.reason_tag(), "gone", "{dead:?}");
+    }
+
+    /// Before den-subtitles 0.20.0 stopped it, a repeat `sparse` verdict escalated the same way
+    /// `no_cues`/`expired_link` still do, straight into `dead_file_key`'s week-long `Gone` marker —
+    /// and its stored value is still the reason tag that triggered it, `sparse`. That OLD marker must
+    /// be read the same way the LIVE `sparse` backoff is: a strict request refuses it as `sparse`
+    /// (never `Gone`), and `allow_sparse` bypasses it rather than being blocked forever by a marker
+    /// `remember_failure` itself would no longer write.
+    #[test]
+    fn a_gone_marker_recorded_for_sparseness_is_read_as_sparse_not_dead() {
+        use opensubtitles::DownloadError;
+
+        let state = state("old-gone-sparse-remembered");
+        let http = reqwest::Client::new();
+        let cfg = userconfig::decode(state.config_keyring.as_ref(), &config_segment()).unwrap();
+        let client = os_client(&state, &http, &cfg);
+        const FILE_ID: i64 = 3529838;
+
+        // Simulates the marker a pre-0.20.0 escalation left behind — `remember_failure` never writes
+        // this combination any more, but an existing one in the shared cache must still be handled.
+        state.cache.put(dead_file_key(FILE_ID), "sparse".into(), DEAD_FILE_TTL);
+
+        let strict = remembered_failure(&state, &client, FILE_ID, false);
+        assert!(
+            matches!(&strict, Some(DownloadError::Suspect(_))),
+            "an old sparse-tagged Gone marker must not read as a genuinely dead file: {strict:?}"
+        );
+        assert_eq!(strict.unwrap().reason_tag(), "sparse");
+
+        assert!(
+            remembered_failure(&state, &client, FILE_ID, true).is_none(),
+            "allow_sparse must bypass an old sparse-tagged Gone marker, the same as a live sparse backoff"
+        );
+
+        // A genuinely dead marker (any other tag) is unaffected: still `Gone`, still unbypassable.
+        state.cache.put(dead_file_key(FILE_ID + 1), "gone".into(), DEAD_FILE_TTL);
+        let still_dead = remembered_failure(&state, &client, FILE_ID + 1, true);
+        assert!(matches!(still_dead, Some(DownloadError::Gone(_))), "{still_dead:?}");
     }
 
     /// The exact case that lost Fauda S1E3's English subtitles end to end: both of OpenSubtitles'
