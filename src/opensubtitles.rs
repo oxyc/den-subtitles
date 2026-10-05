@@ -318,14 +318,33 @@ impl DownloadError {
     }
 
     /// A stable, short token for the decision log — `message()` is free text for a human, this is
-    /// for grep. `Suspect` splits into `sparse` (real cues, too few for the span — the Fauda shape)
-    /// versus `suspect` (no cues at all, or an interstitial) since the two read very differently on
-    /// an incident: a sparse file is probably the wrong release, a suspect one is probably transient.
+    /// for grep. `Suspect` covers three distinct shapes, named so an incident reads as what actually
+    /// failed rather than one undifferentiated `suspect`:
+    /// - `sparse` — real cues, too few for the span (the Fauda shape): probably the wrong release.
+    /// - `no_cues` — the download parsed to zero cues: an interstitial served as a 200, or a
+    ///   genuinely empty upload.
+    /// - `expired_link` — the CDN returned a non-2xx on the one-shot download link: almost always an
+    ///   expired or rate-limited capability URL, rarely a missing file (see `download`'s `Suspect`
+    ///   there, which deliberately does not trust the API's own 404/410 verdict for this hop).
+    ///
+    /// `m.contains("no_cues")`/`"sparse"`/`"expired_link"` also matches the `(remembered: <tag>)`
+    /// shape `remembered_failure` reconstructs when it answers a backed-off repeat from the negative
+    /// cache rather than the live API — same tag either way, so the decision log reads identically
+    /// whether this request spent a credit or not.
     pub fn reason_tag(&self) -> &'static str {
         match self {
             DownloadError::Gone(_) => "gone",
-            DownloadError::Suspect(m) if m.contains("too few cues") => "sparse",
-            DownloadError::Suspect(_) => "suspect",
+            DownloadError::Suspect(m) => {
+                if m.contains("too few cues") || m.contains("sparse") {
+                    "sparse"
+                } else if m.contains("no cues") || m.contains("no_cues") {
+                    "no_cues"
+                } else if m.starts_with("subtitle link ") || m.contains("expired_link") {
+                    "expired_link"
+                } else {
+                    "suspect"
+                }
+            }
             DownloadError::Unavailable(_) => "unavailable",
         }
     }
@@ -729,8 +748,23 @@ mod tests {
             DownloadError::Suspect("file 5 has too few cues for its span".into()).reason_tag(),
             "sparse"
         );
-        assert_eq!(DownloadError::Suspect("subtitle link returned no cues".into()).reason_tag(), "suspect");
+        // A download that parsed to no cues at all (interstitial or empty upload) is `no_cues`, not
+        // the generic `suspect` this used to collapse into — the two read very differently on an
+        // incident.
+        assert_eq!(DownloadError::Suspect("subtitle link returned no cues".into()).reason_tag(), "no_cues");
+        // A non-2xx on the CDN's one-shot link is `expired_link`: almost always the capability URL
+        // expiring or being rate-limited, not a missing file.
+        assert_eq!(DownloadError::Suspect("subtitle link 404 Not Found".into()).reason_tag(), "expired_link");
         assert_eq!(DownloadError::Unavailable("x".into()).reason_tag(), "unavailable");
+        // A message with no recognised shape still falls back to the generic tag rather than panicking
+        // or silently misclassifying.
+        assert_eq!(DownloadError::Suspect("something new and unanticipated".into()).reason_tag(), "suspect");
+        // `remembered_failure`'s reconstructed "(remembered: <tag>)" shape reads back as the same tag
+        // it was stored under, so a cache hit logs the same specific reason a live failure would.
+        for tag in ["sparse", "no_cues", "expired_link"] {
+            let remembered = DownloadError::Suspect(format!("file 5 would not download (remembered: {tag})"));
+            assert_eq!(remembered.reason_tag(), tag, "remembered {tag} did not round-trip");
+        }
     }
 }
 
