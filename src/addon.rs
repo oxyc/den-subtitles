@@ -1005,7 +1005,7 @@ async fn sync_and_cache(
     ref_id: Option<i64>,
     resync_url: Option<String>,
     mut reservation: Option<SyncReservation<'_>>,
-    flight: Option<InFlightGuard<'_>>,
+    flight: Option<InFlightGuard>,
     what: &str,
     settled: bool,
     log: ServeCtx<'_>,
@@ -1030,7 +1030,7 @@ async fn sync_and_cache(
     // do share the quota.
     let wanted_sync = resync_url.is_some() || ref_id.is_some();
     let shared_marker = format!("{SYNCFAIL}{cache_key}");
-    let mine_marker = format!("{SYNCFAIL}{:016x}:{cache_key}", short_hash(client.api_key));
+    let mine_marker = format!("{SYNCFAIL}{:016x}:{cache_key}", os_download_identity(client));
     let backed_off = || state.cache.get(&shared_marker).is_some() || state.cache.get(&mine_marker).is_some();
     // One tier binary per key at a time. Concurrent requests for the same alignment were each
     // spawning their own — a 90s alass run against the same stream, on a runtime with one thread —
@@ -1258,7 +1258,7 @@ async fn subtitle_srt(
     if let Some(e) = client.download_paused() {
         return Err(e);
     }
-    let _flight = state.inflight.acquire(&key).await;
+    let flight = state.inflight.acquire(&key).await;
     if let Some(hit) = state.cache.get(&key) {
         return Ok(hit);
     }
@@ -1272,7 +1272,55 @@ async fn subtitle_srt(
     {
         return Err(e);
     }
-    let body = match client.download(file_id, lang, allow_sparse).await {
+    // Admission is still request-owned: disconnecting while queued cancels the waiter without
+    // spending. Once admitted, the bounded producer is detached so a committed credit reaches cache.
+    let permit = client.admit_download().await?;
+    // The worker owns the flight and its credentials. Once this task is spawned, a browser navigation
+    // or request timeout can stop waiting without canceling the metered `/download` pipeline: the
+    // worker finishes the CDN fetch and fills the cache, while a later caller waits on the same key.
+    let worker_state = state.clone();
+    let http = (*client.http).clone();
+    let api_key = client.api_key.to_string();
+    let token = client.token.map(str::to_string);
+    let api_base = client.api_base.to_string();
+    let lang = lang.map(str::to_string);
+    let worker = tokio::spawn(async move {
+        let client = opensubtitles::Client {
+            http: &http,
+            api_key: &api_key,
+            token: token.as_deref(),
+            api_base: &api_base,
+            limits: &worker_state.os_limits,
+        };
+        download_and_cache(
+            &worker_state,
+            &client,
+            file_id,
+            lang.as_deref(),
+            allow_sparse,
+            key,
+            flight,
+            permit,
+        )
+        .await
+    });
+    worker.await.unwrap_or_else(|e| {
+        Err(opensubtitles::DownloadError::Unavailable(format!("download worker failed: {e}")))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_and_cache(
+    state: &Arc<AppState>,
+    client: &opensubtitles::Client<'_>,
+    file_id: i64,
+    lang: Option<&str>,
+    allow_sparse: bool,
+    key: String,
+    _flight: InFlightGuard,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<String, opensubtitles::DownloadError> {
+    let body = match client.download_admitted(file_id, lang, allow_sparse, &permit).await {
         Ok(body) => {
             // A success clears the record. Without this the counter tallies failures across a whole
             // day with no credit for the successes between them, so a file that works nine times out
@@ -1340,7 +1388,13 @@ fn suspect_strike_key(file_id: i64) -> String {
 /// one install's OpenSubtitles credential and nobody else's, so keyed by the credential rather than
 /// by the install: two installs sharing a key really do share the quota that produced it.
 fn unavailable_file_key(client: &opensubtitles::Client<'_>, file_id: i64) -> String {
-    format!("{SYNCFAIL}dl:{:016x}:{}", short_hash(client.api_key), os_base_key(file_id))
+    format!("{SYNCFAIL}dl:{:016x}:{}", os_download_identity(client), os_base_key(file_id))
+}
+
+/// The identity OpenSubtitles uses for download allowance: API key plus the optional account token.
+/// Neither secret reaches the cache filename; the separator keeps two different pairs unambiguous.
+fn os_download_identity(client: &opensubtitles::Client<'_>) -> u64 {
+    short_hash(&format!("{}\n{}", client.api_key, client.token.unwrap_or("")))
 }
 
 /// Rebuild the failure a previous attempt recorded, so a request that cannot succeed does not spend
@@ -3037,6 +3091,10 @@ mod translate_retry_tests {
     /// A state with its own cache directory. The disk tier is real and persists between runs, so a
     /// shared directory would carry one test's markers into another's preconditions.
     fn state(name: &str) -> Arc<AppState> {
+        state_with_base(name, "http://127.0.0.1:1".into())
+    }
+
+    fn state_with_base(name: &str, os_api_base: String) -> Arc<AppState> {
         let dir = std::env::temp_dir().join(format!("den-subs-translate-retry-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         AppState::new(Config {
@@ -3055,11 +3113,83 @@ mod translate_retry_tests {
             // first. Pointed at the real API root they made a live request to api.opensubtitles.com
             // on every `cargo test`, which passed whether it 401'd or the network was down, so the
             // dependency was invisible.
-            os_api_base: "http://127.0.0.1:1".into(),
+            os_api_base,
             scout_origins: Vec::new(),
             scout_aliases: Vec::new(),
             revocation: Default::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_waiter_does_not_cancel_a_metered_download_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let server_seen = seen.clone();
+        let cdn_started = Arc::new(tokio::sync::Notify::new());
+        let server_started = cdn_started.clone();
+        let release_cdn = Arc::new(tokio::sync::Notify::new());
+        let server_release = release_cdn.clone();
+        tokio::spawn(async move {
+            for request_number in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                server_seen.fetch_add(1, Ordering::SeqCst);
+                let body = if request_number == 0 {
+                    format!(r#"{{"link":"http://{addr}/cdn"}}"#)
+                } else {
+                    server_started.notify_one();
+                    server_release.notified().await;
+                    "1\n00:00:01,000 --> 00:00:02,000\nHello\n".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let state = state_with_base("cancelled-download", format!("http://{addr}"));
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            let http = reqwest::Client::new();
+            let client = opensubtitles::Client {
+                http: &http,
+                api_key: "key",
+                token: Some("token"),
+                api_base: &first_state.cfg.os_api_base,
+                limits: &first_state.os_limits,
+            };
+            subtitle_srt(&first_state, &client, 77, None, true).await
+        });
+        cdn_started.notified().await;
+        first.abort();
+        let _ = first.await;
+
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            let http = reqwest::Client::new();
+            let client = opensubtitles::Client {
+                http: &http,
+                api_key: "key",
+                token: Some("token"),
+                api_base: &second_state.cfg.os_api_base,
+                limits: &second_state.os_limits,
+            };
+            subtitle_srt(&second_state, &client, 77, None, true).await
+        });
+        tokio::task::yield_now().await;
+        release_cdn.notify_one();
+
+        let body = second.await.unwrap().expect("the detached worker did not populate the cache");
+        assert!(body.contains("Hello"));
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "the retry spent a second /download credit");
     }
 
     /// A config segment with an LLM key, so `handle_translate` gets past its own guards.
@@ -3839,6 +3969,17 @@ mod translate_retry_tests {
         // exhausting its allowance must not deny the file to another.
         remember_failure(&state, &client, 7, &DownloadError::Unavailable("429".into()));
         assert!(matches!(remembered_failure(&state, &client, 7, false), Some(DownloadError::Unavailable(_))));
+        let other_token = opensubtitles::Client {
+            http: client.http,
+            api_key: client.api_key,
+            token: Some("another-user"),
+            api_base: client.api_base,
+            limits: client.limits,
+        };
+        assert!(
+            remembered_failure(&state, &other_token, 7, false).is_none(),
+            "one account token's refusal denied another account sharing the API key"
+        );
         let other = opensubtitles::Client { api_key: "a-different-install-key", ..client };
         assert!(
             remembered_failure(&state, &other, 7, false).is_none(),
@@ -3855,8 +3996,8 @@ mod translate_retry_tests {
         // exists to fix, handed to installs that had done nothing.
         let key = sync_cache_key(&os_base_key(42), &None, Some(43));
         let shared = format!("{SYNCFAIL}{key}");
-        let mine = format!("{SYNCFAIL}{:016x}:{key}", short_hash(client.api_key));
-        let theirs = format!("{SYNCFAIL}{:016x}:{key}", short_hash(other.api_key));
+        let mine = format!("{SYNCFAIL}{:016x}:{key}", os_download_identity(&client));
+        let theirs = format!("{SYNCFAIL}{:016x}:{key}", os_download_identity(&other));
         assert_ne!(shared, mine, "the per-credential marker collided with the shared one");
         assert_ne!(mine, theirs, "two credentials shared a backoff");
         // And neither may be mistaken for the key that holds the settled alignment.

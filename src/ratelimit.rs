@@ -8,11 +8,12 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::StatusCode;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 /// Longest wait honoured from a service's own headers, or reached by our backoff. A service naming
@@ -24,6 +25,9 @@ pub const MAX_PAUSE: Duration = Duration::from_secs(60 * 60);
 const MAX_KEYS: usize = 1024;
 /// The first wait when a service refuses without saying how long; doubled per refusal in a row.
 const BASE_BACKOFF: Duration = Duration::from_secs(2);
+/// Calls allowed to be awaiting one credential at once. One translation already uses four parallel
+/// batches; this keeps a second film or a burst of distinct searches from multiplying that window.
+const MAX_IN_FLIGHT_PER_KEY: usize = 4;
 
 static JITTER_TICK: AtomicU64 = AtomicU64::new(0);
 
@@ -43,15 +47,48 @@ pub fn throttled(status: StatusCode, headers: &HeaderMap) -> bool {
 #[derive(Default)]
 pub struct Pauses {
     inner: Mutex<HashMap<u64, Pause>>,
+    sequence: AtomicU64,
+    admission: Mutex<HashMap<u64, Weak<Semaphore>>>,
 }
 
 struct Pause {
     until: Instant,
     /// Unstated refusals in a row, for the exponential backoff. Reset by an answer.
     strikes: u32,
+    /// Unique revision installed by the response that created or extended this pause. A success from
+    /// an older concurrent request may not clear a newer refusal.
+    generation: u64,
 }
 
+/// The pause revision visible when a request was dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Observation(u64);
+
 impl Pauses {
+    /// Bound calls across every title/run sharing one credential. Weak map entries keep the key space
+    /// bounded: a canceled waiter drops its Arc, and the next acquire sweeps dead entries.
+    pub async fn acquire(&self, key: u64) -> OwnedSemaphorePermit {
+        let semaphore = {
+            let mut entries = self.admission.lock().unwrap();
+            entries.retain(|_, semaphore| semaphore.strong_count() > 0);
+            match entries.get(&key).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT_PER_KEY));
+                    entries.insert(key, Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+        semaphore.acquire_owned().await.expect("credential admission semaphore closed")
+    }
+
+    /// Snapshot the pause revision immediately before a request leaves. Its response may clear only
+    /// that revision, never a newer refusal received from a concurrent request.
+    pub fn begin(&self, key: u64) -> Observation {
+        Observation(self.inner.lock().unwrap().get(&key).map(|p| p.generation).unwrap_or(0))
+    }
+
     /// How much longer this credential must wait, or `None` if it may call now.
     pub fn remaining(&self, key: u64) -> Option<Duration> {
         let g = self.inner.lock().unwrap();
@@ -66,7 +103,9 @@ impl Pauses {
         let now = Instant::now();
         let mut g = self.inner.lock().unwrap();
         make_room(&mut g, key, now);
-        let p = g.entry(key).or_insert(Pause { until: now, strikes: 0 });
+        let generation = self.sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let p = g.entry(key).or_insert(Pause { until: now, strikes: 0, generation });
+        p.generation = generation;
         match stated {
             Some(wait) => p.until = p.until.max(now + wait.min(MAX_PAUSE)),
             // Already paused: this is a request that was in flight when the first refusal landed.
@@ -90,13 +129,18 @@ impl Pauses {
         let now = Instant::now();
         let mut g = self.inner.lock().unwrap();
         make_room(&mut g, key, now);
-        let p = g.entry(key).or_insert(Pause { until: now, strikes: 0 });
+        let generation = self.sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let p = g.entry(key).or_insert(Pause { until: now, strikes: 0, generation });
+        p.generation = generation;
         p.until = p.until.max(now + wait);
     }
 
     /// The service answered. That ends the pause and the run of strikes behind it.
-    pub fn answered(&self, key: u64) {
-        self.inner.lock().unwrap().remove(&key);
+    pub fn answered(&self, key: u64, observed: Observation) {
+        let mut pauses = self.inner.lock().unwrap();
+        if pauses.get(&key).is_some_and(|pause| pause.generation == observed.0) {
+            pauses.remove(&key);
+        }
     }
 }
 
@@ -314,10 +358,73 @@ mod tests {
         p.limited(k, Some(Duration::from_secs(30)));
         assert!(p.remaining(k).unwrap() > Duration::from_secs(29));
 
-        p.answered(k);
+        let observed = p.begin(k);
+        p.answered(k, observed);
         assert_eq!(p.remaining(k), None, "an answer left the credential paused");
         let fresh = p.limited(k, None);
         assert!(fresh <= BASE_BACKOFF * 5 / 4, "an answer did not reset the backoff: {fresh:?}");
+    }
+
+    #[test]
+    fn an_older_answer_cannot_clear_a_newer_pause() {
+        let p = Pauses::default();
+        let k = key("test", "credential");
+        let older = p.begin(k);
+        p.limited(k, Some(Duration::from_secs(30)));
+
+        p.answered(k, older);
+        assert!(p.remaining(k).is_some(), "an older in-flight success erased a newer 429 pause");
+
+        let after_pause = p.begin(k);
+        p.answered(k, after_pause);
+        assert_eq!(p.remaining(k), None, "a request begun after the pause could not clear it");
+    }
+
+    #[tokio::test]
+    async fn admission_is_bounded_across_one_credential() {
+        use std::sync::atomic::AtomicUsize;
+
+        let pauses = Arc::new(Pauses::default());
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let key = key("test", "credential");
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let (pauses, running, peak) = (pauses.clone(), running.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                let _permit = pauses.acquire(key).await;
+                let active = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(active, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                running.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_IN_FLIGHT_PER_KEY);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_admission_waiter_does_not_leak_a_slot() {
+        let pauses = Arc::new(Pauses::default());
+        let key = key("test", "credential");
+        let mut held = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_PER_KEY {
+            held.push(pauses.acquire(key).await);
+        }
+        let waiter = {
+            let pauses = pauses.clone();
+            tokio::spawn(async move { pauses.acquire(key).await })
+        };
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(held.pop());
+
+        let _permit = tokio::time::timeout(Duration::from_secs(1), pauses.acquire(key))
+            .await
+            .expect("a canceled waiter leaked the released credential slot");
     }
 
     #[test]

@@ -26,8 +26,8 @@ pub struct InFlight {
 
 /// The right to produce one key. Releases it on drop, and takes the key back out of the map once
 /// nobody is waiting for it.
-pub struct Guard<'a> {
-    owner: &'a InFlight,
+pub struct Guard {
+    owner: Arc<InFlight>,
     key: String,
     /// Struct fields drop AFTER `Drop::drop` runs, so this Arc is still counted by the cleanup below.
     _permit: OwnedMutexGuard<()>,
@@ -35,7 +35,7 @@ pub struct Guard<'a> {
 
 impl InFlight {
     /// Wait for the exclusive right to produce `key`.
-    pub async fn acquire(&self, key: &str) -> Guard<'_> {
+    pub async fn acquire(self: &Arc<Self>, key: &str) -> Guard {
         let lock = {
             let mut keys = self.keys.lock().unwrap();
             // Sweep entries nobody holds any more. `Guard::drop` keeps an entry alive while a waiter
@@ -48,7 +48,7 @@ impl InFlight {
             keys.entry(key.to_string()).or_default().clone()
         };
         let permit = lock.lock_owned().await;
-        Guard { owner: self, key: key.to_string(), _permit: permit }
+        Guard { owner: self.clone(), key: key.to_string(), _permit: permit }
     }
 
     #[cfg(test)]
@@ -57,7 +57,7 @@ impl InFlight {
     }
 }
 
-impl Drop for Guard<'_> {
+impl Drop for Guard {
     fn drop(&mut self) {
         let mut keys = self.owner.keys.lock().unwrap();
         let Some(lock) = keys.get(&self.key) else { return };
@@ -214,7 +214,7 @@ mod tests {
     /// Different keys are independent — a slow translation must not block an unrelated one.
     #[tokio::test]
     async fn different_keys_do_not_block_each_other() {
-        let flight = InFlight::default();
+        let flight = Arc::new(InFlight::default());
         let held = flight.acquire("a").await;
         // Would hang if this waited on "a".
         let other = tokio::time::timeout(Duration::from_secs(5), flight.acquire("b")).await;

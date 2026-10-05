@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::ratelimit::{self, Pauses};
 
@@ -82,6 +83,10 @@ pub struct Limits {
     /// The daily download quota (a 406). Downloads only, for this key and user: searching costs no
     /// quota and carries on.
     pub downloads: Pauses,
+    /// The CDN does not tell us the scope of a refusal. Treat it conservatively as process-wide: that
+    /// may pause unrelated users briefly, but prevents them spending `/download` credits only to hit
+    /// the same known-refusing CDN from this server's egress.
+    pub cdn: Pauses,
 }
 
 pub struct Client<'a> {
@@ -104,6 +109,10 @@ impl<'a> Client<'a> {
         ratelimit::key("opensubtitles-downloads", &format!("{}\n{}", self.api_key, self.token.unwrap_or("")))
     }
 
+    fn cdn_limit_key(&self) -> u64 {
+        ratelimit::key("opensubtitles-cdn", "global")
+    }
+
     /// Why this credential must not ask for a download right now, or `None`.
     ///
     /// Checked by the caller before `download` rather than inside it, because a refusal made without
@@ -116,19 +125,30 @@ impl<'a> Client<'a> {
                 left.as_secs()
             )));
         }
+        if let Some(left) = self.limits.cdn.remaining(self.cdn_limit_key()) {
+            return Some(DownloadError::Unavailable(format!(
+                "opensubtitles CDN rate limited, {}s left",
+                left.as_secs()
+            )));
+        }
         let left = self.limits.downloads.remaining(self.quota_key())?;
         Some(DownloadError::Unavailable(format!("download quota reached, {}s left", left.as_secs())))
     }
 
     /// Record what an API response said about this key's rate limit. Only a success ends a pause;
     /// any other answer leaves it as it was.
-    fn observe(&self, status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) {
+    fn observe(
+        &self,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        observed: ratelimit::Observation,
+    ) {
         let key = self.api_limit_key();
         let now = SystemTime::now();
         if ratelimit::throttled(status, headers) {
             self.limits.api.limited(key, ratelimit::retry_after(headers, now));
         } else if status.is_success() {
-            self.limits.api.answered(key);
+            self.limits.api.answered(key, observed);
             // Answered, and told the window is spent: the next call would be the 429.
             if let Some(wait) = ratelimit::exhausted_for(headers, now) {
                 self.limits.api.hold(key, wait);
@@ -159,10 +179,15 @@ impl<'a> Client<'a> {
         if let Some(h) = moviehash {
             query.push(("moviehash".into(), h.to_string()));
         }
+        // Admission is shared by the key across titles. Re-check the pause after waiting: a request
+        // ahead of us may have learned about a 429 while this one was queued.
+        let key = self.api_limit_key();
+        let _permit = self.limits.api.acquire(key).await;
         // A rate limit is the key's, so a 429 on one title holds every other title too.
         if let Some(left) = self.limits.api.remaining(self.api_limit_key()) {
             return Err(format!("opensubtitles rate limited, {}s left", left.as_secs()));
         }
+        let observed = self.limits.api.begin(key);
 
         let resp = self
             .http
@@ -173,7 +198,7 @@ impl<'a> Client<'a> {
             .send()
             .await
             .map_err(|e| format!("search failed: {e}"))?;
-        self.observe(resp.status(), resp.headers());
+        self.observe(resp.status(), resp.headers(), observed);
         if !resp.status().is_success() {
             return Err(format!("opensubtitles search {}", resp.status()));
         }
@@ -197,12 +222,44 @@ impl<'a> Client<'a> {
     /// than nothing and is returned `Ok` instead of refused. A cue-less body, an expired link or a
     /// service-level failure is refused either way — "sparse" only ever describes a file with real,
     /// correctly-timed cues that don't cover enough of it, never one of those.
+    #[cfg(test)]
     pub async fn download(
         &self,
         file_id: i64,
         lang: Option<&str>,
         allow_sparse: bool,
     ) -> Result<String, DownloadError> {
+        let permit = self.admit_download().await?;
+        self.download_admitted(file_id, lang, allow_sparse, &permit).await
+    }
+
+    /// Enter the bounded API window and re-check every shared pause after waiting. A caller may do
+    /// this before spawning a request-independent worker, so cancellation while queued stays free.
+    pub async fn admit_download(&self) -> Result<OwnedSemaphorePermit, DownloadError> {
+        let api_key = self.api_limit_key();
+        let permit = self.limits.api.acquire(api_key).await;
+        if let Some(paused) = self.download_paused() {
+            return Err(paused);
+        }
+        Ok(permit)
+    }
+
+    /// Download after admission. The owner keeps `permit` alive through its cache write, bounding the
+    /// complete paid producer rather than only the API response headers.
+    pub async fn download_admitted(
+        &self,
+        file_id: i64,
+        lang: Option<&str>,
+        allow_sparse: bool,
+        _permit: &OwnedSemaphorePermit,
+    ) -> Result<String, DownloadError> {
+        let api_key = self.api_limit_key();
+        // Admission and dispatch are separate scheduling points. A sibling may receive a 429 between
+        // them, so observe it here as well as before returning the permit.
+        if let Some(paused) = self.download_paused() {
+            return Err(paused);
+        }
+        let observed = self.limits.api.begin(api_key);
         let mut req = self
             .http
             .post(format!("{}/download", self.api_base))
@@ -219,7 +276,7 @@ impl<'a> Client<'a> {
             .send()
             .await
             .map_err(|e| DownloadError::Unavailable(format!("download request failed: {e}")))?;
-        self.observe(resp.status(), resp.headers());
+        self.observe(resp.status(), resp.headers(), observed);
         if !resp.status().is_success() {
             let code = resp.status();
             // The daily quota is spent. Every other file would get the same 406 until it resets, so
@@ -237,6 +294,15 @@ impl<'a> Client<'a> {
         let link =
             v["link"].as_str().ok_or_else(|| DownloadError::Unavailable("no download link".to_string()))?;
         // The link is OpenSubtitles-supplied and points at their CDN — cap the fetched body.
+        let cdn_key = self.cdn_limit_key();
+        let _cdn_permit = self.limits.cdn.acquire(cdn_key).await;
+        if let Some(left) = self.limits.cdn.remaining(cdn_key) {
+            return Err(DownloadError::Unavailable(format!(
+                "opensubtitles CDN rate limited, {}s left",
+                left.as_secs()
+            )));
+        }
+        let cdn_observed = self.limits.cdn.begin(cdn_key);
         let resp = self
             .http
             .get(link)
@@ -249,12 +315,30 @@ impl<'a> Client<'a> {
         // expired or rate-limited link) returned its HTML error page AS the subtitle — cached under
         // the file id for 60 days and served `immutable`. One transient blip, one track that
         // silently shows nothing forever.
+        if ratelimit::throttled(resp.status(), resp.headers())
+            || resp.status().is_server_error()
+            // A timeout or an origin asking an early request to be retried is about this attempt,
+            // never evidence that the subtitle file is bad. Letting either reach `Suspect` would
+            // promote two ordinary transport refusals into a seven-day shared `Gone` marker.
+            || matches!(
+                resp.status(),
+                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_EARLY
+            )
+        {
+            let code = resp.status();
+            let stated = ratelimit::throttled(code, resp.headers())
+                .then(|| ratelimit::retry_after(resp.headers(), SystemTime::now()))
+                .flatten();
+            self.limits.cdn.limited(cdn_key, stated);
+            return Err(DownloadError::Unavailable(format!("subtitle CDN {code}")));
+        }
         if !resp.status().is_success() {
             // `Suspect`, not `from_status`: a 404 here is an expired one-shot capability URL far
             // more often than a missing file, and only the API's verdict is trusted to unpin.
             let code = resp.status();
             return Err(DownloadError::Suspect(format!("subtitle link {code}")));
         }
+        self.limits.cdn.answered(cdn_key, cdn_observed);
         let bytes = crate::fetch::capped_bytes(resp, crate::fetch::MAX_SUBTITLE_BODY)
             .await
             .map_err(DownloadError::Unavailable)?;
@@ -913,6 +997,74 @@ mod download_tests {
         )
     }
 
+    async fn throttled_cdn() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                count.fetch_add(1, Ordering::SeqCst);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let response = match request.starts_with("POST") {
+                    true => reply(
+                        "200 OK",
+                        "content-type: application/json\r\n",
+                        &format!(r#"{{"link":"http://{addr}/cdn"}}"#),
+                    ),
+                    false => reply("429 Too Many Requests", "retry-after: 60\r\n", ""),
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn a_cdn_rate_limit_holds_other_files_without_marking_the_file_suspect() {
+        use std::sync::atomic::Ordering;
+
+        let (base, seen) = throttled_cdn().await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client = Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits };
+
+        let first = client.download(1, None, false).await.expect_err("the CDN 429 was accepted");
+        assert!(matches!(first, DownloadError::Unavailable(_)), "CDN throttle blamed the file: {first:?}");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "expected one API call and one CDN call");
+
+        let second = client.download(2, None, false).await.expect_err("the CDN pause let another file out");
+        assert!(matches!(second, DownloadError::Unavailable(_)));
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "a paused CDN spent another /download credit");
+    }
+
+    #[tokio::test]
+    async fn a_pause_installed_after_admission_still_stops_dispatch() {
+        use std::sync::atomic::Ordering;
+
+        let (base, seen) =
+            scripted(vec![reply("200 OK", "content-type: application/json\r\n", r#"{"link":"unused"}"#)])
+                .await;
+        let http = reqwest::Client::new();
+        let limits = Limits::default();
+        let client = Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits };
+        let permit = client.admit_download().await.unwrap();
+        limits.api.limited(client.api_limit_key(), Some(Duration::from_secs(60)));
+
+        let err = client
+            .download_admitted(1, None, false, &permit)
+            .await
+            .expect_err("a pause installed after admission still dispatched");
+        assert!(matches!(err, DownloadError::Unavailable(_)));
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "the paused request reached the API");
+    }
+
     /// A rate limit is the KEY's. Remembered only per title, a 429 on one film left every other film
     /// asking an API that had already refused the key — and a success is what lets it ask again.
     #[tokio::test]
@@ -1005,11 +1157,17 @@ mod download_tests {
         let err = download_from("200 OK", "<html>not a subtitle</html>").await.expect_err("must fail");
         assert!(matches!(err, DownloadError::Suspect(_)), "an interstitial unpinned the source: {err:?}");
 
-        // Every other CDN status is the same kind of fact — the link did not work — and none of them
-        // may unpin either. `download_from` drives the CDN leg only; the fake API always answers.
+        // A throttle or server outage is a SERVICE fact. It must not enter the suspect-file counter,
+        // where a later repeat would promote it to a seven-day `Gone` verdict.
         for status in
-            ["406 Not Acceptable", "429 Too Many Requests", "503 Service Unavailable", "403 Forbidden"]
+            ["408 Request Timeout", "425 Too Early", "429 Too Many Requests", "503 Service Unavailable"]
         {
+            let err = download_from(status, "nope").await.expect_err("must fail");
+            assert!(matches!(err, DownloadError::Unavailable(_)), "{status} from the CDN: {err:?}");
+        }
+        // Other capability-link refusals remain suspect: they say this one link did not work, without
+        // the authoritative file verdict that only the API's 404/410 supplies.
+        for status in ["406 Not Acceptable", "403 Forbidden"] {
             let err = download_from(status, "nope").await.expect_err("must fail");
             assert!(matches!(err, DownloadError::Suspect(_)), "{status} from the CDN: {err:?}");
         }
