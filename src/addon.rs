@@ -55,10 +55,13 @@ const SEARCH_STALE_GRACE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 /// long enough that the queue behind a single-flighted miss does not run one live search each,
 /// serially, at up to the client timeout apiece.
 const SEARCH_FAIL_TTL: Duration = Duration::from_secs(30);
-/// How long a file the API says does not exist is remembered as not existing. A day: long enough
-/// that a dead track in a picker list stops costing a download credit per playback, short enough
-/// that an upload restored tomorrow is picked up.
-const DEAD_FILE_TTL: Duration = Duration::from_secs(60 * 60 * 24);
+/// How long a file the API says does not exist — or a repeat `Suspect` refusal `remember_failure`
+/// has promoted to the same verdict — is remembered as not existing. A week: a day was long enough
+/// to stop a burst of requests within one sitting, but not across sittings — a viewer revisiting the
+/// same title days apart re-confirmed the same dead file each time, and each confirmation is a
+/// metered download. Long enough that a dead track in a picker list stops costing a download credit
+/// across a typical gap between revisits, short enough that an upload restored later is picked up.
+const DEAD_FILE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 /// Lifetime of a pinned translation source. Long because the pin is what keeps every language of one
 /// film reading from ONE source file: that is a single metered download for the title rather than one
 /// per language, and it is the whole job now.
@@ -454,13 +457,18 @@ pub async fn handle_subtitles(
     httputil::add_timing(resp, &timing)
 }
 
-/// `event=rank` — the ranking result of one catalog/search answer: how many candidates, which file
-/// was placed first and the next few, and the deciding factors behind each (`ranking_factors`). The
-/// line that would have shown the Fauda bug at a glance — a DUBBED release's English file ranked
-/// first, `looks_dubbed` sitting right there in its factors — which nothing logged before this.
-/// Returns the line rather than printing it, so a caller can test what it built.
+/// `event=rank` — the ranking result of one catalog/search answer, ONE LINE PER LANGUAGE present in
+/// the results. The search always asks OpenSubtitles for every language (`cached_search` passes
+/// `"all"`), and `rank` groups the returned list by language, best fit first within each — so a
+/// single global line named whichever language's code happened to sort first alphabetically (often
+/// not the one the viewer's own language setting wants) and said nothing about what any other
+/// language got offered. A line per language instead names that language's own top file, the next 2
+/// behind it, and the deciding factors (`ranking_factors`) — the line that would have shown the
+/// Fauda bug at a glance for the language it actually happened in, a DUBBED release's English file
+/// ranked first with `looks_dubbed` sitting right there in its factors.
+/// Returns the lines rather than printing them, so a caller can test what they built.
 #[allow(clippy::too_many_arguments)]
-fn rank_line(
+fn rank_lines(
     identity: bool,
     rid: Option<&str>,
     imdb: &str,
@@ -469,34 +477,53 @@ fn rank_line(
     filename: Option<&str>,
     subs: &[opensubtitles::Subtitle],
     dur: Duration,
-) -> String {
-    let outcome = if subs.is_empty() { "skipped" } else { "served" };
-    let mut line = logging::Line::new("rank", outcome, identity)
-        .reason(if subs.is_empty() { "no_candidates" } else { "ranked" })
-        .dur_ms(dur.as_millis())
-        .field("candidates", subs.len())
-        .id("imdb", imdb);
-    if let Some(s) = season {
-        line = line.id("season", s);
+) -> Vec<String> {
+    if subs.is_empty() {
+        let mut line = logging::Line::new("rank", "skipped", identity)
+            .reason("no_candidates")
+            .dur_ms(dur.as_millis())
+            .field("candidates", 0)
+            .id("imdb", imdb);
+        if let Some(s) = season {
+            line = line.id("season", s);
+        }
+        if let Some(e) = episode {
+            line = line.id("episode", e);
+        }
+        return vec![line.rid(rid).finish()];
     }
-    if let Some(e) = episode {
-        line = line.id("episode", e);
-    }
-    // The order `rank` produced: the first file offered, then the next few, each with why.
-    for (i, s) in subs.iter().take(4).enumerate() {
-        let tag = if i == 0 { "top".to_string() } else { format!("next{i}") };
-        let factors = opensubtitles::ranking_factors(s, filename);
-        let factors = if factors.is_empty() { "none".to_string() } else { factors.join(",") };
-        line = line
-            .id(&tag, os_id(s.file_id))
-            .id(&format!("{tag}_lang"), &s.lang)
-            .field(&format!("{tag}_factors"), factors);
-    }
-    line.rid(rid).finish()
+    // Already grouped by language — `rank`'s sort order — so a run of the same `lang` is one
+    // contiguous slice, and chunking on that is enough: no re-sorting or collecting into a map.
+    subs.chunk_by(|a, b| a.lang == b.lang)
+        .map(|group| {
+            let lang = &group[0].lang;
+            let mut line = logging::Line::new("rank", "served", identity)
+                .reason("ranked")
+                .dur_ms(dur.as_millis())
+                .field("candidates", group.len())
+                .id("imdb", imdb);
+            if let Some(s) = season {
+                line = line.id("season", s);
+            }
+            if let Some(e) = episode {
+                line = line.id("episode", e);
+            }
+            line = line.id("lang", lang);
+            // The order `rank` produced within this language: its top file, then the next 2, each
+            // with why.
+            for (i, s) in group.iter().take(3).enumerate() {
+                let tag = if i == 0 { "top".to_string() } else { format!("next{i}") };
+                let factors = opensubtitles::ranking_factors(s, filename);
+                let factors = if factors.is_empty() { "none".to_string() } else { factors.join(",") };
+                line = line.id(&tag, os_id(s.file_id)).field(&format!("{tag}_factors"), factors);
+            }
+            line.rid(rid).finish()
+        })
+        .collect()
 }
 
-/// Prints what `rank_line` builds. The split exists for the test above it: this one call site is
-/// the only thing between `log_rank` and the journal.
+/// Prints what `rank_lines` builds, one `eprintln!` per language. The split exists for the test above
+/// it: this one call site is the only thing between `log_rank` and the journal.
 #[allow(clippy::too_many_arguments)]
 fn log_rank(
     state: &AppState,
@@ -509,10 +536,10 @@ fn log_rank(
     dur: Duration,
 ) {
     let rid = logging::request_id(headers);
-    eprintln!(
-        "{}",
-        rank_line(state.cfg.log_identity, rid.as_deref(), imdb, season, episode, filename, subs, dur)
-    );
+    for line in rank_lines(state.cfg.log_identity, rid.as_deref(), imdb, season, episode, filename, subs, dur)
+    {
+        eprintln!("{line}");
+    }
 }
 
 /// The OpenSubtitles client for one request, from that install's BYOK credentials.
@@ -809,6 +836,12 @@ pub async fn handle_subtitle_file(
         _ => None,
     };
     let started = Instant::now();
+    // Read before the call: a file already in the negative cache answers from it without touching
+    // OpenSubtitles at all, so the `serve` line below must say `cache=hit`, not the "miss" every
+    // refusal used to carry regardless of whether a credit was actually spent finding it out. A plain
+    // read, same as `subtitle_srt`'s own check a moment later — reading it twice costs nothing and
+    // the second read only ever confirms the first on the single-threaded path a request takes here.
+    let refusal_cached = remembered_failure(state, &client, file_id).is_some();
     let target = match subtitle_srt(state, &client, file_id, lang).await {
         Ok(body) => body,
         Err(e) => {
@@ -816,7 +849,8 @@ pub async fn handle_subtitle_file(
             if DOWNLOAD_FAILED.allow() {
                 eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
             }
-            log_serve(state, ctx, "refused", tag, Some("opensubtitles"), "miss", None);
+            let cache = if refusal_cached { "hit" } else { "miss" };
+            log_serve(state, ctx, "refused", tag, Some("opensubtitles"), cache, None);
             return httputil::error(StatusCode::BAD_GATEWAY, "upstream_unavailable");
         }
     };
@@ -1247,17 +1281,24 @@ fn remembered_failure(
     client: &opensubtitles::Client<'_>,
     file_id: i64,
 ) -> Option<opensubtitles::DownloadError> {
-    if state.cache.get(&dead_file_key(file_id)).is_some() {
-        return Some(opensubtitles::DownloadError::Gone(format!("file {file_id} is gone (remembered)")));
+    // The stored value is the reason tag (`sparse`/`no_cues`/`expired_link`/`gone`/`suspect`) the
+    // original failure classified as, not a bare marker — so a request answered from this negative
+    // cache logs the SAME specific reason a live failure would, instead of collapsing every
+    // remembered refusal into one generic verdict. `reason_tag` reads it back out of the
+    // `(remembered: <tag>)` wrapper below.
+    if let Some(tag) = state.cache.get(&dead_file_key(file_id)) {
+        return Some(opensubtitles::DownloadError::Gone(format!(
+            "file {file_id} is gone (remembered: {tag})"
+        )));
     }
     // The BACKOFF gates; the strike counter deliberately does not. A burst of requests for one
     // failing file must cost one credit, not one each — but the attempt that confirms a strike has
     // to be allowed through, and it is, ten minutes later when this lapses.
     //
     // `get_mem` to match `put_mem` — going through `get` would probe a disk tier nothing writes to.
-    if state.cache.get_mem(&suspect_backoff_key(file_id)).is_some() {
+    if let Some(tag) = state.cache.get_mem(&suspect_backoff_key(file_id)) {
         return Some(opensubtitles::DownloadError::Suspect(format!(
-            "file {file_id} would not download (remembered)"
+            "file {file_id} would not download (remembered: {tag})"
         )));
     }
     if state.cache.get_mem(&unavailable_file_key(client, file_id)).is_some() {
@@ -1287,7 +1328,7 @@ fn forget_failure(state: &Arc<AppState>, file_id: i64) {
 /// Remember a download failure so the next request does not spend a credit rediscovering it.
 ///
 /// A `Suspect` escalates on repeat: the first one is a short shared strike, and a second inside that
-/// window promotes to the day-long `Gone` marker. That is what separates a CDN interstitial — which
+/// window promotes to the week-long `Gone` marker. That is what separates a CDN interstitial — which
 /// clears on its own and must not touch the shared source pin — from an upload that really is junk,
 /// which would otherwise be re-fetched every ten minutes for a metered credit each time.
 fn remember_failure(
@@ -1297,19 +1338,22 @@ fn remember_failure(
     e: &opensubtitles::DownloadError,
 ) {
     use opensubtitles::DownloadError::*;
+    // The reason this exact failure classified as — stored as the cache VALUE (not a bare "1") so a
+    // later `remembered_failure` hit can log the same specific tag a live failure would.
+    let tag = e.reason_tag();
     match e {
-        Gone(_) => state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL),
+        Gone(_) => state.cache.put(dead_file_key(file_id), tag.into(), DEAD_FILE_TTL),
         // Two failures on two OCCASIONS promote. The gate is always refreshed, so a burst costs one
         // credit; the counter promotes only when the earlier failure is at least a backoff window
         // old, so the confirming attempt is one that genuinely had to be let through rather than a
         // sibling from the same instant.
         Suspect(_) => {
-            state.cache.put_mem(suspect_backoff_key(file_id), "1".into(), SYNC_RETRY_TTL);
+            state.cache.put_mem(suspect_backoff_key(file_id), tag.into(), SYNC_RETRY_TTL);
             let strike = suspect_strike_key(file_id);
             let first = state.cache.get_mem(&strike).and_then(|v| v.parse::<u64>().ok());
             match first {
                 Some(then) if unix_seconds().saturating_sub(then) >= SYNC_RETRY_TTL.as_secs() => {
-                    state.cache.put(dead_file_key(file_id), "1".into(), DEAD_FILE_TTL)
+                    state.cache.put(dead_file_key(file_id), tag.into(), DEAD_FILE_TTL)
                 }
                 // Already counted, too recent to confirm — leave it, so the clock keeps running from
                 // the FIRST failure rather than being pushed forward by every sibling in a burst.
@@ -3614,6 +3658,41 @@ mod translate_retry_tests {
         assert_ne!(mine, key);
     }
 
+    /// Issue: the same two files kept getting re-downloaded from OpenSubtitles over and over, each a
+    /// metered credit, while the log said `reason=suspect` every time — undifferentiated, and
+    /// `cache=miss` even on the requests `remembered_failure` was gating. A remembered refusal must
+    /// name the SAME specific reason a live failure would (not collapse to a generic verdict), so an
+    /// incident reads the same whether this request spent a credit or answered from the negative
+    /// cache.
+    #[test]
+    fn a_remembered_refusal_keeps_its_specific_reason() {
+        use opensubtitles::DownloadError;
+
+        let state = state("tag-roundtrip");
+        let http = reqwest::Client::new();
+        let cfg = userconfig::decode(state.config_keyring.as_ref(), &config_segment()).unwrap();
+        let client = os_client(&state, &http, &cfg);
+
+        // Backed off, not yet promoted: the remembered error still reports `no_cues`, not the
+        // generic `suspect` a bare "1" marker used to force every remembered refusal into.
+        remember_failure(
+            &state,
+            &client,
+            11,
+            &DownloadError::Suspect("subtitle link returned no cues".into()),
+        );
+        let remembered = remembered_failure(&state, &client, 11).expect("backed off");
+        assert_eq!(remembered.reason_tag(), "no_cues", "{remembered:?}");
+
+        // Promoted to the week-long `Gone` marker (a later occasion confirms it): the verdict is now
+        // `gone` — the confirmed fact, not the shape of whichever occasion triggered the promotion.
+        let long_ago = (unix_seconds() - SYNC_RETRY_TTL.as_secs() - 1).to_string();
+        state.cache.put_mem(suspect_strike_key(11), long_ago, DEAD_FILE_TTL);
+        remember_failure(&state, &client, 11, &DownloadError::Suspect("subtitle link 404".into()));
+        let dead = remembered_failure(&state, &client, 11).expect("promoted");
+        assert_eq!(dead.reason_tag(), "gone", "{dead:?}");
+    }
+
     /// The pin is what keeps a drifting source pick from spending a metered credit each time it
     /// drifts. It has to be scoped to the title alone — every language of one film translating from
     /// the same source, so a film costs one download rather than one per language — and removable,
@@ -3865,7 +3944,7 @@ mod decision_log_tests {
     }
 
     #[test]
-    fn rank_line_names_the_top_pick_and_its_factors() {
+    fn rank_lines_name_the_top_pick_and_its_factors() {
         let mut dubbed = opensubtitles::Subtitle {
             file_id: 555,
             lang: "en".into(),
@@ -3884,7 +3963,7 @@ mod decision_log_tests {
         let plain = opensubtitles::Subtitle { file_id: 556, release: String::new(), ..dubbed.clone() };
         dubbed.hash_match = true;
         let subs = vec![dubbed, plain];
-        let line = rank_line(
+        let lines = rank_lines(
             true,
             Some("rid-xyz"),
             "tt1111111",
@@ -3894,18 +3973,68 @@ mod decision_log_tests {
             &subs,
             Duration::from_millis(3),
         );
+        // Both candidates are "en", so this is one language and one line.
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
         assert!(line.contains("event=rank outcome=served"), "{line}");
         assert!(line.contains("candidates=2"), "{line}");
         assert!(line.contains("imdb=tt1111111"), "{line}");
+        assert!(line.contains("lang=en"), "{line}");
         assert!(line.contains("top=os:555"), "{line}");
         assert!(line.contains("top_factors=") && line.contains("looks_dubbed"), "{line}");
         assert!(line.contains("next1=os:556"), "{line}");
         assert!(line.contains("rid=rid-xyz"), "{line}");
     }
 
+    /// The bug this line exists to fix: a global "top" named whichever language sorted first
+    /// alphabetically and said nothing about any other language a viewer might actually have asked
+    /// for. Arabic sorting ahead of Swedish must not bury what Swedish got — each language gets its
+    /// own line, with its own top file and the next 2 behind it.
     #[test]
-    fn rank_line_with_no_candidates_is_skipped_not_served() {
-        let line = rank_line(true, None, "tt2222222", None, None, None, &[], Duration::from_millis(0));
+    fn a_line_per_language_names_each_one_s_own_top_pick() {
+        let base = opensubtitles::Subtitle {
+            file_id: 0,
+            lang: String::new(),
+            hash_match: false,
+            downloads: 0,
+            release: String::new(),
+            hd: false,
+            fps: 0.0,
+            from_trusted: false,
+            machine_translated: false,
+            ai_translated: false,
+            foreign_parts_only: false,
+            hearing_impaired: false,
+            ratings: 0.0,
+        };
+        // Already in `rank`'s own order: grouped by language, ascending — Arabic before Swedish.
+        let subs = vec![
+            opensubtitles::Subtitle { file_id: 1, lang: "ar".into(), ..base.clone() },
+            opensubtitles::Subtitle { file_id: 2, lang: "ar".into(), ..base.clone() },
+            opensubtitles::Subtitle { file_id: 3, lang: "sv".into(), ..base.clone() },
+        ];
+        let lines = rank_lines(true, None, "tt3333333", None, None, None, &subs, Duration::from_millis(1));
+        assert_eq!(lines.len(), 2, "one line per language: {lines:?}");
+
+        let ar = &lines[0];
+        assert!(ar.contains("lang=ar"), "{ar}");
+        assert!(ar.contains("candidates=2"), "{ar}");
+        assert!(ar.contains("top=os:1"), "{ar}");
+        assert!(ar.contains("next1=os:2"), "{ar}");
+
+        // Swedish gets its OWN line naming its OWN top file — not buried behind Arabic's.
+        let sv = &lines[1];
+        assert!(sv.contains("lang=sv"), "{sv}");
+        assert!(sv.contains("candidates=1"), "{sv}");
+        assert!(sv.contains("top=os:3"), "{sv}");
+        assert!(!sv.contains("os:1") && !sv.contains("os:2"), "{sv}");
+    }
+
+    #[test]
+    fn rank_lines_with_no_candidates_is_skipped_not_served() {
+        let lines = rank_lines(true, None, "tt2222222", None, None, None, &[], Duration::from_millis(0));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
         assert!(line.contains("outcome=skipped"), "{line}");
         assert!(line.contains("reason=no_candidates"), "{line}");
         assert!(line.contains("candidates=0"), "{line}");
