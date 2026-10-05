@@ -894,7 +894,11 @@ pub async fn handle_subtitle_file(
             }
             let cache = if refusal_cached { "hit" } else { "miss" };
             log_serve_refused(state, ctx, tag, Some("opensubtitles"), cache, stats);
-            return httputil::error(StatusCode::BAD_GATEWAY, "upstream_unavailable");
+            // `X-Den-Degraded: <tag>` (the same convention every den addon uses) is what lets
+            // den-remux tell a `sparse` refusal apart from any other failure, so only THAT one is
+            // worth retrying with `?sparse=1` — retrying a cue-less body or a transient blip the same
+            // way would spend a second metered credit for no better chance of succeeding.
+            return httputil::degraded(httputil::error(StatusCode::BAD_GATEWAY, "upstream_unavailable"), tag);
         }
     };
     // `allow_sparse` only ever rescues a sparse body (download() refuses anything else regardless),
@@ -3926,6 +3930,37 @@ mod translate_retry_tests {
         assert!(
             state.cache.get(&dead_file_key(FILE_ID)).is_none(),
             "a second occasion of the same SPARSE verdict must not escalate to the shared Gone marker"
+        );
+    }
+
+    /// den-remux cannot tell a `sparse` refusal apart from any other failure by status code alone —
+    /// both are a 502 — so the `X-Den-Degraded` header (the same convention every den addon uses) is
+    /// what lets it retry with `?sparse=1` ONLY for the one reason that flag can actually rescue,
+    /// rather than spending a second metered credit on a cue-less body or a transient blip that would
+    /// refuse it again regardless.
+    #[tokio::test]
+    async fn a_refused_subtitle_names_its_reason_in_the_degraded_header() {
+        const FILE_ID: i64 = 90001;
+        let state = state("degraded-header");
+        state.cache.put_mem(suspect_backoff_key(FILE_ID), "sparse".into(), SYNC_RETRY_TTL);
+
+        let resp = handle_subtitle_file(
+            &state,
+            &HeaderMap::new(),
+            &config_segment(),
+            FILE_ID,
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            resp.headers().get(httputil::X_DEN_DEGRADED).unwrap(),
+            "sparse",
+            "a strict refusal must name its specific reason, not a generic one"
         );
     }
 
