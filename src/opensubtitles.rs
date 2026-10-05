@@ -191,7 +191,18 @@ impl<'a> Client<'a> {
     ///
     /// `lang` is the subtitle's declared language, when the caller knows it — a hint for working out
     /// the file's encoding (see `fetch::subtitle_text`).
-    pub async fn download(&self, file_id: i64, lang: Option<&str>) -> Result<String, DownloadError> {
+    ///
+    /// `allow_sparse`: the caller has already established that every candidate for this language is
+    /// sparse (see `handle_subtitle_file`'s strict pass), so a real-but-incomplete track is better
+    /// than nothing and is returned `Ok` instead of refused. A cue-less body, an expired link or a
+    /// service-level failure is refused either way — "sparse" only ever describes a file with real,
+    /// correctly-timed cues that don't cover enough of it, never one of those.
+    pub async fn download(
+        &self,
+        file_id: i64,
+        lang: Option<&str>,
+        allow_sparse: bool,
+    ) -> Result<String, DownloadError> {
         let mut req = self
             .http
             .post(format!("{}/download", self.api_base))
@@ -270,9 +281,29 @@ impl<'a> Client<'a> {
         //
         // `Suspect`, the same as a cue-less body: one sparse read could be a genuinely quiet stretch
         // in an otherwise full track, so it is not trusted to unpin on its own, but a repeat escalates
-        // it to `Gone` the same way — see `remember_failure`.
-        if crate::srt::looks_incomplete(&crate::srt::parse(&body)) {
-            return Err(DownloadError::Suspect(format!("file {file_id} has too few cues for its span")));
+        // it to `Gone` the same way — see `remember_failure`. Unless the caller has already
+        // established nothing better exists for this language (`allow_sparse`), in which case a real
+        // track beats none and this is handed back rather than refused.
+        let cues = crate::srt::parse(&body);
+        if crate::srt::looks_incomplete(&cues) && !allow_sparse {
+            // The density numbers that made the call, appended in the same `key=value` shape the
+            // decision log uses for a SERVED body (`serve_line`) — `stats()` below reads them back
+            // out, so a sparse refusal is as diagnosable from the journal as a served one, without
+            // spending a second download credit to re-measure it.
+            let detail = crate::srt::stats(&cues)
+                .map(|s| {
+                    format!(
+                        " cues={} span_s={} cues_per_min={:.1} max_gap_s={}",
+                        s.count,
+                        s.span_ms / 1000,
+                        s.per_minute,
+                        s.max_gap_ms / 1000
+                    )
+                })
+                .unwrap_or_default();
+            return Err(DownloadError::Suspect(format!(
+                "file {file_id} has too few cues for its span{detail}"
+            )));
         }
         Ok(body)
     }
@@ -347,6 +378,22 @@ impl DownloadError {
             }
             DownloadError::Unavailable(_) => "unavailable",
         }
+    }
+
+    /// The cue-density numbers `download`'s sparse check measured, read back out of the message it
+    /// embedded them in — `None` for every other refusal, and for a `sparse` one reconstructed from
+    /// the negative cache (`remembered_failure` never re-measures, so it never has them to embed).
+    /// Lets a refused `serve` line carry the same `cues`/`span_s`/`cues_per_min`/`max_gap_s` fields a
+    /// served one does, without holding onto the downloaded body just to log it.
+    pub fn stats(&self) -> Option<crate::srt::Stats> {
+        let DownloadError::Suspect(m) = self else { return None };
+        let rest = m.split_once(" cues=")?.1;
+        let mut parts = rest.split_whitespace();
+        let count = parts.next()?.parse().ok()?;
+        let span_s: u64 = parts.next()?.strip_prefix("span_s=")?.parse().ok()?;
+        let per_minute: f64 = parts.next()?.strip_prefix("cues_per_min=")?.parse().ok()?;
+        let max_gap_s: u64 = parts.next()?.strip_prefix("max_gap_s=")?.parse().ok()?;
+        Some(crate::srt::Stats { count, span_ms: span_s * 1000, per_minute, max_gap_ms: max_gap_s * 1000 })
     }
 }
 
@@ -766,6 +813,28 @@ mod tests {
             assert_eq!(remembered.reason_tag(), tag, "remembered {tag} did not round-trip");
         }
     }
+
+    /// `stats()` reads back exactly the numbers `download` embedded for a sparse refusal, and is
+    /// `None` for every shape that never had any to embed — a cue-less body, an expired link, a
+    /// remembered repeat (which never re-measures), and every non-`Suspect` variant.
+    #[test]
+    fn download_error_stats_round_trips_only_for_a_measured_sparse_refusal() {
+        let sparse = DownloadError::Suspect(
+            "file 5 has too few cues for its span cues=200 span_s=2400 cues_per_min=5.0 max_gap_s=180".into(),
+        );
+        let stats = sparse.stats().expect("a sparse refusal must carry its numbers");
+        assert_eq!((stats.count, stats.span_ms, stats.max_gap_ms), (200, 2_400_000, 180_000));
+        assert!((stats.per_minute - 5.0).abs() < 0.01);
+
+        assert!(DownloadError::Suspect("subtitle link returned no cues".into()).stats().is_none());
+        assert!(DownloadError::Suspect("subtitle link 404 Not Found".into()).stats().is_none());
+        assert!(
+            DownloadError::Suspect("file 5 would not download (remembered: sparse)".into()).stats().is_none(),
+            "a remembered repeat never re-measured the file, so it has no numbers to give back"
+        );
+        assert!(DownloadError::Gone("x".into()).stats().is_none());
+        assert!(DownloadError::Unavailable("x".into()).stats().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -801,11 +870,19 @@ mod download_tests {
     }
 
     async fn download_from(status: &'static str, body: &'static str) -> Result<String, DownloadError> {
+        download_from_allowing_sparse(status, body, false).await
+    }
+
+    async fn download_from_allowing_sparse(
+        status: &'static str,
+        body: &'static str,
+        allow_sparse: bool,
+    ) -> Result<String, DownloadError> {
         let base = upstream(status, body).await;
         let http = reqwest::Client::new();
         let limits = Limits::default();
         Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits }
-            .download(1, None)
+            .download(1, None, allow_sparse)
             .await
     }
 
@@ -887,7 +964,7 @@ mod download_tests {
         let client =
             Client { http: &http, api_key: "k", token: Some("user"), api_base: &base, limits: &limits };
 
-        let err = client.download(1, None).await.expect_err("a 406 must fail");
+        let err = client.download(1, None, false).await.expect_err("a 406 must fail");
         assert!(matches!(err, DownloadError::Unavailable(_)), "the quota was blamed on the file: {err:?}");
         assert!(
             matches!(client.download_paused(), Some(DownloadError::Unavailable(_))),
@@ -1014,8 +1091,31 @@ mod download_tests {
         // own generated body is a fine way to get one without widening that signature for one case.
         let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str()); // 200 cues, 12s apart ≈ 5/minute over ~40 minutes
         let err = download_from("200 OK", srt).await.expect_err("a sparse dub sub must not download clean");
+        // The density numbers that made the call travel with the refusal — `stats()` reads them back
+        // out — so the verdict is checkable from the journal without re-downloading the file.
+        let stats = err.stats().expect("a sparse-but-cued refusal must carry its density numbers");
+        assert_eq!(stats.count, 200);
+        assert!(stats.per_minute < 8.0, "{} cues/minute should read as sparse", stats.per_minute);
         let msg = err.message();
         assert!(msg.contains("too few cues"), "{msg}");
+    }
+
+    /// The owner's call: a sparse file is better than nothing when it is the only thing a language
+    /// has. `allow_sparse` is den-subtitles saying exactly that has been established — so the SAME
+    /// sparse body that `a_sparse_but_cued_body_is_refused` rejects is handed back here instead.
+    #[tokio::test]
+    async fn a_sparse_body_is_handed_back_when_the_caller_allows_it() {
+        let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str());
+        assert_eq!(download_from_allowing_sparse("200 OK", srt, true).await.unwrap(), srt);
+    }
+
+    /// `allow_sparse` rescues a real-but-incomplete track, never a non-subtitle. A CDN interstitial
+    /// or a genuinely empty upload stays refused even on the fallback pass — "sparse" never describes
+    /// either, so there is no file here for "better than nothing" to apply to.
+    #[tokio::test]
+    async fn allow_sparse_does_not_rescue_a_cue_less_body() {
+        assert!(download_from_allowing_sparse("200 OK", "<html>not a subtitle</html>", true).await.is_err());
+        assert!(download_from_allowing_sparse("200 OK", "", true).await.is_err());
     }
 
     /// A dense track of the same rough length downloads cleanly — the check is about density, not

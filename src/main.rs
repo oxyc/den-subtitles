@@ -201,7 +201,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             addon::handle_subtitles(state, &parts.headers, config, id, extra).await
         }
         "subtitle" => {
-            // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>][&lang=<code>]
+            // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>][&lang=<code>][&sparse=1]
             let file = segs.get(2).copied().unwrap_or("");
             let (stem, want_vtt) = split_subtitle_format(file);
             match stem.and_then(|n| n.parse::<i64>().ok()) {
@@ -210,6 +210,10 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                     let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
                     let resync = query_get(query, "resync");
                     let lang = query_get(query, "lang");
+                    // The caller's own last resort: it has already established nothing better exists
+                    // for this language (every other candidate was tried and refused), so a real but
+                    // sparse track is worth serving rather than nothing. See `Client::download`.
+                    let allow_sparse = query_get(query, "sparse").as_deref() == Some("1");
                     let resp = addon::handle_subtitle_file(
                         state,
                         &parts.headers,
@@ -219,6 +223,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                         resync,
                         lang.as_deref(),
                         want_vtt,
+                        allow_sparse,
                     )
                     .await;
                     if want_vtt {
