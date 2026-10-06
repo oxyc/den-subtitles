@@ -419,11 +419,10 @@ pub async fn handle_subtitles(
     // Drop candidates already confirmed `Gone` (the API's own 404/410, or two occasions of a
     // cue-less body/expired link — see `remember_failure`) before they are offered at all: nothing
     // asking for one of these would ever get it served, picker or fallback alike. A SPARSE verdict
-    // never escalates to `Gone` any more (same function), because a real, merely incomplete track is
-    // exactly what the fallback pass (`?sparse=1` on `/subtitle/<id>`) exists to serve — so it stays
-    // listed. A `dead_file_key` tag of `sparse` is always an OLD marker, from before that fix, and is
-    // read the same way: stays listed, same as `remembered_failure` still lets `allow_sparse` serve
-    // it. The language disappears from `out` below only when EVERY one of its candidates is actually
+    // never escalates to `Gone` any more (same function), and a `dead_file_key` tag of `sparse` is
+    // always a stale marker from before either that fix or the relative-sparse rule — one
+    // `remembered_failure` purges on sight rather than trust — so either way it stays listed here.
+    // The language disappears from `out` below only when EVERY one of its candidates is actually
     // dead, never because the only ones left are sparse.
     subs.retain(|s| state.cache.get(&dead_file_key(s.file_id)).is_none_or(|tag| tag == "sparse"));
 
@@ -439,12 +438,21 @@ pub async fn handle_subtitles(
     // hash match at all — the out-of-sync gap Tier-1 can't close (see `tier1_reference`); either way
     // those subs are served as-is and only the Tier-2 audio resync (a user action) can fix them.
     let reference = if cfg.auto_sync { tier1_reference(&subs) } else { None };
+    // The download route is addressed by file id alone and carries no title at all — everything it
+    // needs to judge a candidate relative to its siblings (see `judge_sparse`) rides along in the
+    // URL instead, exactly like `ref`/`lang` below. `episode_key` (shared by every language in this
+    // answer) is what lets the per-episode "fullest seen" cache find the same record from any of
+    // them; `dub_flagged` is decisive on its own regardless of density.
+    let episode_key = self::episode_key(&imdb, season, episode);
     let out: Vec<Value> = subs
         .iter()
         .map(|s| {
             // A sub that needs Tier-1 gets `?ref=<id>` so the proxy reference-aligns it on fetch; a
             // hash match (or anything, when there's no anchor) is served as-is.
-            let mut query = Vec::new();
+            let mut query = vec![format!("ep={episode_key}")];
+            if opensubtitles::looks_dubbed(&s.release) || s.foreign_parts_only {
+                query.push("dub=1".to_string());
+            }
             if let Some(ref_id) = tier1_ref_for(s, reference) {
                 query.push(format!("ref={ref_id}"));
             }
@@ -809,6 +817,8 @@ pub async fn handle_subtitle_file(
     lang: Option<&str>,
     want_vtt: bool,
     allow_sparse: bool,
+    episode_key: Option<String>,
+    dub_flagged: bool,
 ) -> Response<Body> {
     let Some(cfg) = state.decode_config(config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
@@ -886,27 +896,40 @@ pub async fn handle_subtitle_file(
     // read, same as `subtitle_srt`'s own check a moment later — reading it twice costs nothing and
     // the second read only ever confirms the first on the single-threaded path a request takes here.
     let refusal_cached = remembered_failure(state, &client, file_id, allow_sparse).is_some();
-    let target = match subtitle_srt(state, &client, file_id, lang, allow_sparse).await {
-        Ok(body) => body,
-        Err(e) => {
-            let tag = e.reason_tag();
-            let stats = e.stats();
-            if DOWNLOAD_FAILED.allow() {
-                eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
+    let target =
+        match subtitle_srt(state, &client, file_id, lang, allow_sparse, episode_key.as_deref(), dub_flagged)
+            .await
+        {
+            Ok(body) => body,
+            Err(e) => {
+                let tag = e.reason_tag();
+                let stats = e.stats();
+                if DOWNLOAD_FAILED.allow() {
+                    eprintln!("subtitle: download of file {file_id} failed: {}", e.message());
+                }
+                let cache = if refusal_cached { "hit" } else { "miss" };
+                log_serve_refused(state, ctx, tag, Some("opensubtitles"), cache, stats);
+                // `X-Den-Degraded: <tag>` (the same convention every den addon uses) is what lets
+                // den-remux tell a `sparse` refusal apart from any other failure, so only THAT one is
+                // worth retrying with `?sparse=1` — retrying a cue-less body or a transient blip the same
+                // way would spend a second metered credit for no better chance of succeeding.
+                return httputil::degraded(
+                    httputil::error(StatusCode::BAD_GATEWAY, "upstream_unavailable"),
+                    tag,
+                );
             }
-            let cache = if refusal_cached { "hit" } else { "miss" };
-            log_serve_refused(state, ctx, tag, Some("opensubtitles"), cache, stats);
-            // `X-Den-Degraded: <tag>` (the same convention every den addon uses) is what lets
-            // den-remux tell a `sparse` refusal apart from any other failure, so only THAT one is
-            // worth retrying with `?sparse=1` — retrying a cue-less body or a transient blip the same
-            // way would spend a second metered credit for no better chance of succeeding.
-            return httputil::degraded(httputil::error(StatusCode::BAD_GATEWAY, "upstream_unavailable"), tag);
-        }
-    };
+        };
     // `allow_sparse` only ever rescues a sparse body (download() refuses anything else regardless),
     // so re-measuring it here just tells `sync_and_cache` whether to log `sparse_fallback` rather
-    // than the tier that actually served it — never whether to accept the body at all.
-    let sparse_fallback = allow_sparse && srt::looks_incomplete(&srt::parse(&target));
+    // than the tier that actually served it — never whether to accept the body at all. The fullest
+    // sibling count may already include THIS file by now (`download_and_cache` just recorded it), so
+    // this read is a best-effort echo for the log line, not a re-run of the real gate.
+    let sparse_fallback = allow_sparse
+        && (dub_flagged
+            || srt::looks_incomplete(
+                &srt::parse(&target),
+                fullest_sibling_cues(state, episode_key.as_deref()),
+            ));
 
     // Settled: this handler is told which reference to use, so "no ref" here means none was asked
     // for, never that we failed to find out.
@@ -1131,7 +1154,7 @@ async fn sync_and_cache(
         // fetched BEFORE taking a permit: that is a network download, and a permit meant to bound
         // subprocesses should not be spent waiting on OpenSubtitles.
         // The reference's language is not known here; its encoding is detected unhinted.
-        match subtitle_srt(state, client, r, None, false).await {
+        match subtitle_srt(state, client, r, None, false, None, false).await {
             Ok(reference) => {
                 let aligned = {
                     let prepared =
@@ -1228,12 +1251,16 @@ fn sync_outcome(result: &Result<String, String>) -> SyncOutcome {
 /// Fetch a subtitle's SRT, cached by file id (the raw, un-synced text — reused as a sync input).
 /// `lang` hints the encoding detection when this call is the one that downloads. `allow_sparse` is
 /// forwarded to `Client::download` and to `remembered_failure`'s backoff check — see both for why.
+/// `episode_key`/`dub_flagged` feed `download_and_cache`'s sparse judgement; see `judge_sparse`.
+#[allow(clippy::too_many_arguments)]
 async fn subtitle_srt(
     state: &Arc<AppState>,
     client: &opensubtitles::Client<'_>,
     file_id: i64,
     lang: Option<&str>,
     allow_sparse: bool,
+    episode_key: Option<&str>,
+    dub_flagged: bool,
 ) -> Result<String, opensubtitles::DownloadError> {
     let key = os_base_key(file_id);
     if let Some(hit) = state.cache.get(&key) {
@@ -1284,6 +1311,7 @@ async fn subtitle_srt(
     let token = client.token.map(str::to_string);
     let api_base = client.api_base.to_string();
     let lang = lang.map(str::to_string);
+    let episode_key = episode_key.map(str::to_string);
     let worker = tokio::spawn(async move {
         let client = opensubtitles::Client {
             http: &http,
@@ -1298,6 +1326,8 @@ async fn subtitle_srt(
             file_id,
             lang.as_deref(),
             allow_sparse,
+            episode_key.as_deref(),
+            dub_flagged,
             key,
             flight,
             permit,
@@ -1316,28 +1346,43 @@ async fn download_and_cache(
     file_id: i64,
     lang: Option<&str>,
     allow_sparse: bool,
+    episode_key: Option<&str>,
+    dub_flagged: bool,
     key: String,
     _flight: InFlightGuard,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<String, opensubtitles::DownloadError> {
-    let body = match client.download_admitted(file_id, lang, allow_sparse, &permit).await {
-        Ok(body) => {
-            // A success clears the record. Without this the counter tallies failures across a whole
-            // day with no credit for the successes between them, so a file that works nine times out
-            // of ten still gets convicted on its second bad afternoon — and the verdict is the one
-            // thing trusted to drop a pin shared by every install.
-            forget_failure(state, file_id);
-            body
-        }
-        Err(e) => {
-            // A failure that paused the key — a 429, a spent quota — is remembered by that pause, for
-            // as long as the service said. A per-file marker on top would outlast it by ten minutes.
-            if client.download_paused().is_none() {
-                remember_failure(state, client, file_id, &e);
+    // Read before the download: this file's own verdict must compare against what was already known
+    // BEFORE it, not against a record it is about to contribute to itself.
+    let fullest = fullest_sibling_cues(state, episode_key);
+    let body =
+        match client.download_admitted(file_id, lang, allow_sparse, dub_flagged, fullest, &permit).await {
+            Ok(body) => {
+                // A success clears the record. Without this the counter tallies failures across a whole
+                // day with no credit for the successes between them, so a file that works nine times out
+                // of ten still gets convicted on its second bad afternoon — and the verdict is the one
+                // thing trusted to drop a pin shared by every install.
+                forget_failure(state, file_id);
+                // Measured regardless of `allow_sparse`/the sparse verdict: a low count can only ever
+                // leave the running max unchanged, and a credit was already spent learning it either
+                // way. Never from a dub-flagged file — its own count must not become a future sibling's
+                // baseline, flagged or not.
+                if !dub_flagged {
+                    if let Some(s) = srt::stats(&srt::parse(&body)) {
+                        record_episode_cues(state, episode_key, s.count);
+                    }
+                }
+                body
             }
-            return Err(e);
-        }
-    };
+            Err(e) => {
+                // A failure that paused the key — a 429, a spent quota — is remembered by that pause, for
+                // as long as the service said. A per-file marker on top would outlast it by ten minutes.
+                if client.download_paused().is_none() {
+                    remember_failure(state, client, file_id, &e);
+                }
+                return Err(e);
+            }
+        };
     state.cache.put(key, body.clone(), CACHE_TTL);
     Ok(body)
 }
@@ -1350,6 +1395,43 @@ async fn download_and_cache(
 /// subtitle and must never be reachable as a body.
 fn source_pin_key(imdb: &str, season: Option<i64>, episode: Option<i64>) -> String {
     format!("source:{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0))
+}
+
+/// Identity for one episode (or movie), shared by every language `handle_subtitles` answers for it —
+/// carried in each URL's `?ep=` so the file-id-only download route can key the per-episode "fullest
+/// seen" sibling record (`episode_stats_key`) without knowing the title any other way.
+fn episode_key(imdb: &str, season: Option<i64>, episode: Option<i64>) -> String {
+    format!("{imdb}:{}:{}", season.unwrap_or(0), episode.unwrap_or(0))
+}
+
+/// Cache key for an episode's running "fullest candidate seen" cue count (any non-dub-flagged
+/// language) — what `judge_sparse` compares a new candidate against, since the download route sees
+/// one file at a time and has no other way to know what else exists for the same episode.
+fn episode_stats_key(episode_key: &str) -> String {
+    format!("{SYNCFAIL}ep-stats:{episode_key}")
+}
+
+/// How long the per-episode "fullest seen" fact is kept — a week, the same lifetime as
+/// `DEAD_FILE_TTL`'s other per-title fact: long enough to span a viewer's whole run at an episode
+/// (replays, a resync days later), short enough to refresh itself if the candidate list changes.
+const EPISODE_STATS_TTL: Duration = DEAD_FILE_TTL;
+
+/// The most cues any candidate for this episode is already known to have, read before judging a new
+/// one — `None` when there's no record yet (a lone candidate, or the first of its episode this
+/// process has seen).
+fn fullest_sibling_cues(state: &Arc<AppState>, episode_key: Option<&str>) -> Option<usize> {
+    state.cache.get(&episode_stats_key(episode_key?))?.parse().ok()
+}
+
+/// Record that a real (non-dub-flagged) candidate for this episode had `count` cues, so a sibling
+/// judged later can compare against it. A plain read-modify-write: two downloads for the same
+/// episode racing here could drop one update, but this is a soft heuristic feeding a density
+/// comparison, not billing or security, and the next candidate's own write corrects it.
+fn record_episode_cues(state: &Arc<AppState>, episode_key: Option<&str>, count: usize) {
+    let Some(key) = episode_key else { return };
+    if count > fullest_sibling_cues(state, Some(key)).unwrap_or(0) {
+        state.cache.put(episode_stats_key(key), count.to_string(), EPISODE_STATS_TTL);
+    }
 }
 
 /// "This file will not download." A fact about the file, so shared by every install — and its own
@@ -1419,21 +1501,20 @@ fn remembered_failure(
     // remembered refusal into one generic verdict. `reason_tag` reads it back out of the
     // `(remembered: <tag>)` wrapper below.
     //
-    // A `sparse` tag here is never a NEW escalation (`remember_failure` stopped promoting it) — it is
-    // always a marker from before that fix, when a repeat sparse verdict promoted the same way a
-    // `no_cues`/`expired_link` one still does. Read it the same way the live `sparse` backoff below
-    // is read, not as a file that truly cannot serve: `allow_sparse` may still bypass it, and a
-    // strict request refuses it as `sparse`, never as `Gone` (Fauda S1E3's two English files, marked
-    // dead this way before den-subtitles 0.20.0, must stay eligible for the last-resort retry).
+    // A `sparse` tag here is never a NEW escalation (`remember_failure` stopped promoting it) — it
+    // can only be a marker from before that fix, written under a density rule this build no longer
+    // runs (the old absolute 8/minute floor, not today's relative-to-siblings or dub-flagged one). A
+    // file judged sparse then can easily not be now — Springfloden's three English files, all
+    // comfortably clear of the current floors, would otherwise sit refused for the rest of a week on
+    // a verdict nothing here still measures. Purged rather than trusted, so the file is judged fresh
+    // at the one-download cost a live sparse refusal already pays.
     if let Some(tag) = state.cache.get(&dead_file_key(file_id)) {
-        if !(allow_sparse && tag == "sparse") {
-            return Some(if tag == "sparse" {
-                opensubtitles::DownloadError::Suspect(format!(
-                    "file {file_id} would not download (remembered: {tag})"
-                ))
-            } else {
-                opensubtitles::DownloadError::Gone(format!("file {file_id} is gone (remembered: {tag})"))
-            });
+        if tag == "sparse" {
+            state.cache.remove(&dead_file_key(file_id));
+        } else {
+            return Some(opensubtitles::DownloadError::Gone(format!(
+                "file {file_id} is gone (remembered: {tag})"
+            )));
         }
     }
     // The BACKOFF gates; the strike counter deliberately does not. A burst of requests for one
@@ -2621,7 +2702,9 @@ async fn produce_translation(
     // look identical from here, and on the free tier the first is an ordinary evening — so unpinning
     // on it would re-pick the source and owe another credit for the replacement, because the viewer
     // ran out of credits.
-    let raw = subtitle_srt(state, client, source_file_id, None, false).await.map_err(classify_download)?;
+    let raw = subtitle_srt(state, client, source_file_id, None, false, None, false)
+        .await
+        .map_err(classify_download)?;
     let cues = srt::parse(&raw);
     if cues.is_empty() {
         // Unreachable in practice — `download` gates on `has_a_cue`, and a differential test pins
@@ -3166,7 +3249,7 @@ mod translate_retry_tests {
                 api_base: &first_state.cfg.os_api_base,
                 limits: &first_state.os_limits,
             };
-            subtitle_srt(&first_state, &client, 77, None, true).await
+            subtitle_srt(&first_state, &client, 77, None, true, None, false).await
         });
         cdn_started.notified().await;
         first.abort();
@@ -3182,7 +3265,7 @@ mod translate_retry_tests {
                 api_base: &second_state.cfg.os_api_base,
                 limits: &second_state.os_limits,
             };
-            subtitle_srt(&second_state, &client, 77, None, true).await
+            subtitle_srt(&second_state, &client, 77, None, true, None, false).await
         });
         tokio::task::yield_now().await;
         release_cdn.notify_one();
@@ -3427,6 +3510,74 @@ mod translate_retry_tests {
             subs.iter().any(|s| s["id"] == "os-3529838"),
             "a sparse (not dead) candidate must still be listed: {body:?}"
         );
+    }
+
+    /// Every URL `handle_subtitles` hands out for the same episode must carry the SAME `?ep=` value
+    /// (any language, so the download route's per-episode "fullest seen" record finds it from
+    /// whichever file is fetched first) and `?dub=1` only on the release `judge_sparse` would refuse
+    /// outright — the file-id-only download route has no other way to know either fact.
+    #[tokio::test]
+    async fn handle_subtitles_urls_carry_the_shared_episode_key_and_the_dub_flag() {
+        let state = state("ep-key-and-dub-flag");
+        let mut dubbed = listed_sub(5002);
+        dubbed.release = "Fauda.S01E03.DUBBED.WEB-DL".into();
+        let entry = SearchEntry { fresh_until: unix_seconds() + 3600, subs: vec![listed_sub(5001), dubbed] };
+        state.cache.put(
+            format!("{}tt4565380:1:3:", cache::SEARCH_NS),
+            serde_json::to_string(&entry).unwrap(),
+            SEARCH_STALE_GRACE,
+        );
+
+        let resp = handle_subtitles(&state, &HeaderMap::new(), &config_segment(), "tt4565380:1:3", "").await;
+        use http_body_util::BodyExt;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let subs = v["subtitles"].as_array().unwrap();
+        let url =
+            |id: &str| subs.iter().find(|s| s["id"] == id).unwrap()["url"].as_str().unwrap().to_string();
+        let (plain_url, dub_url) = (url("os-5001"), url("os-5002"));
+
+        // No URL-parsing crate in scope here — a plain split on the one query param this test cares
+        // about, since the URLs are built by plain string formatting, not escaped.
+        fn param(url: &str, name: &str) -> Option<String> {
+            url.split('?').nth(1)?.split('&').find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                (k == name).then(|| v.to_string())
+            })
+        }
+        let ep_plain = param(&plain_url, "ep").expect("ep= missing from the non-dub URL");
+        let ep_dub = param(&dub_url, "ep").expect("ep= missing from the dub URL");
+        assert_eq!(ep_plain, ep_dub, "siblings in the same episode must share one ep= key");
+        assert_eq!(ep_plain, "tt4565380:1:3");
+        assert_eq!(param(&plain_url, "dub"), None, "a plain release must not carry dub=1");
+        assert_eq!(param(&dub_url, "dub"), Some("1".to_string()), "a DUBBED release must carry dub=1");
+    }
+
+    /// `record_episode_cues`/`fullest_sibling_cues` — the per-episode cache record `judge_sparse`'s
+    /// relative check reads. A lower count never lowers the running max, and no record at all (a
+    /// lone candidate, or the first of its episode) reads back as `None`.
+    #[test]
+    fn episode_cue_stats_only_ever_grow() {
+        let state = state("episode-cue-stats");
+        let key = "tt0000000:1:1";
+        assert_eq!(fullest_sibling_cues(&state, Some(key)), None, "nothing recorded yet");
+        assert_eq!(fullest_sibling_cues(&state, None), None, "no episode key at all");
+
+        record_episode_cues(&state, Some(key), 276);
+        assert_eq!(fullest_sibling_cues(&state, Some(key)), Some(276));
+
+        record_episode_cues(&state, Some(key), 200); // a sparser sibling arrives later
+        assert_eq!(
+            fullest_sibling_cues(&state, Some(key)),
+            Some(276),
+            "a lower count must not lower the max"
+        );
+
+        record_episode_cues(&state, Some(key), 321); // then a fuller one
+        assert_eq!(fullest_sibling_cues(&state, Some(key)), Some(321));
+
+        // A different episode's record is untouched.
+        assert_eq!(fullest_sibling_cues(&state, Some("tt9999999:1:1")), None);
     }
 
     /// Fauda S1E3's real case: before den-subtitles 0.20.0 stopped a repeat `sparse` verdict from
@@ -4042,12 +4193,15 @@ mod translate_retry_tests {
 
     /// Before den-subtitles 0.20.0 stopped it, a repeat `sparse` verdict escalated the same way
     /// `no_cues`/`expired_link` still do, straight into `dead_file_key`'s week-long `Gone` marker —
-    /// and its stored value is still the reason tag that triggered it, `sparse`. That OLD marker must
-    /// be read the same way the LIVE `sparse` backoff is: a strict request refuses it as `sparse`
-    /// (never `Gone`), and `allow_sparse` bypasses it rather than being blocked forever by a marker
-    /// `remember_failure` itself would no longer write.
+    /// and its stored value is still the reason tag that triggered it, `sparse`. That OLD marker
+    /// predates the relative-sparse rule too, so it is PURGED rather than trusted on sight: a file
+    /// judged sparse under the old absolute floor can easily clear today's relative/lone one
+    /// (Springfloden's three English files would otherwise sit refused for the rest of a week on a
+    /// verdict nothing here still measures), and `remembered_failure` must not be the thing a fixed
+    /// rule can never see past. Purging it (not merely bypassing it, which only `allow_sparse` did
+    /// before) means even a STRICT request gets a fresh, current judgement.
     #[test]
-    fn a_gone_marker_recorded_for_sparseness_is_read_as_sparse_not_dead() {
+    fn an_old_sparse_tagged_gone_marker_is_purged_not_trusted() {
         use opensubtitles::DownloadError;
 
         let state = state("old-gone-sparse-remembered");
@@ -4060,16 +4214,13 @@ mod translate_retry_tests {
         // this combination any more, but an existing one in the shared cache must still be handled.
         state.cache.put(dead_file_key(FILE_ID), "sparse".into(), DEAD_FILE_TTL);
 
-        let strict = remembered_failure(&state, &client, FILE_ID, false);
         assert!(
-            matches!(&strict, Some(DownloadError::Suspect(_))),
-            "an old sparse-tagged Gone marker must not read as a genuinely dead file: {strict:?}"
+            remembered_failure(&state, &client, FILE_ID, false).is_none(),
+            "a strict request must not be blocked by a stale sparse verdict — it gets a fresh download"
         );
-        assert_eq!(strict.unwrap().reason_tag(), "sparse");
-
         assert!(
-            remembered_failure(&state, &client, FILE_ID, true).is_none(),
-            "allow_sparse must bypass an old sparse-tagged Gone marker, the same as a live sparse backoff"
+            state.cache.get(&dead_file_key(FILE_ID)).is_none(),
+            "the stale marker must be purged, not merely bypassed, so it can't outlast this one read"
         );
 
         // A genuinely dead marker (any other tag) is unaffected: still `Gone`, still unbypassable.
@@ -4177,6 +4328,8 @@ mod translate_retry_tests {
             None,
             None,
             false,
+            false,
+            None,
             false,
         )
         .await;

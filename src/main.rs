@@ -201,7 +201,8 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
             addon::handle_subtitles(state, &parts.headers, config, id, extra).await
         }
         "subtitle" => {
-            // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>][&lang=<code>][&sparse=1]
+            // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>][&lang=<code>]
+            //   [&sparse=1][&ep=<imdb>:<season>:<episode>][&dub=1]
             let file = segs.get(2).copied().unwrap_or("");
             let (stem, want_vtt) = split_subtitle_format(file);
             match stem.and_then(|n| n.parse::<i64>().ok()) {
@@ -214,6 +215,10 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                     // for this language (every other candidate was tried and refused), so a real but
                     // sparse track is worth serving rather than nothing. See `Client::download`.
                     let allow_sparse = query_get(query, "sparse").as_deref() == Some("1");
+                    // Both set by `handle_subtitles` on every URL it hands out — see there for why
+                    // the download route, addressed by file id alone, needs them at all.
+                    let episode_key = query_get(query, "ep");
+                    let dub_flagged = query_get(query, "dub").as_deref() == Some("1");
                     let resp = addon::handle_subtitle_file(
                         state,
                         &parts.headers,
@@ -224,6 +229,8 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                         lang.as_deref(),
                         want_vtt,
                         allow_sparse,
+                        episode_key,
+                        dub_flagged,
                     )
                     .await;
                     if want_vtt {
