@@ -222,15 +222,22 @@ impl<'a> Client<'a> {
     /// than nothing and is returned `Ok` instead of refused. A cue-less body, an expired link or a
     /// service-level failure is refused either way — "sparse" only ever describes a file with real,
     /// correctly-timed cues that don't cover enough of it, never one of those.
+    ///
+    /// `dub_flagged` (the caller's own `foreign_parts_only`/`looks_dubbed` read, from the search
+    /// result — this layer never sees a release string) makes a file sparse outright, regardless of
+    /// its own density. `fullest_sibling_cues` is `addon::judge_sparse`'s per-episode running max,
+    /// read before this call and updated by the caller after it; see `srt::looks_incomplete`.
     #[cfg(test)]
     pub async fn download(
         &self,
         file_id: i64,
         lang: Option<&str>,
         allow_sparse: bool,
+        dub_flagged: bool,
+        fullest_sibling_cues: Option<usize>,
     ) -> Result<String, DownloadError> {
         let permit = self.admit_download().await?;
-        self.download_admitted(file_id, lang, allow_sparse, &permit).await
+        self.download_admitted(file_id, lang, allow_sparse, dub_flagged, fullest_sibling_cues, &permit).await
     }
 
     /// Enter the bounded API window and re-check every shared pause after waiting. A caller may do
@@ -251,6 +258,8 @@ impl<'a> Client<'a> {
         file_id: i64,
         lang: Option<&str>,
         allow_sparse: bool,
+        dub_flagged: bool,
+        fullest_sibling_cues: Option<usize>,
         _permit: &OwnedSemaphorePermit,
     ) -> Result<String, DownloadError> {
         let api_key = self.api_limit_key();
@@ -359,9 +368,11 @@ impl<'a> Client<'a> {
         // Real cues are not proof of a complete transcript either. A sub made for a DUBBED release,
         // or an unflagged foreign-parts-only track, has correctly-timed cues — just only over the
         // scenes the dub or the main dialogue doesn't need translating, which is a small, uneven
-        // fraction of the runtime. `rank` already pushes a FLAGGED one of either shape to the bottom;
-        // this catches the one OpenSubtitles' own metadata didn't flag (the Fauda file this was found
-        // from: an English sub for a DUBBED release, with no `foreign_parts_only` set).
+        // fraction of the runtime. `rank` already pushes a FLAGGED one of either shape to the bottom,
+        // and `dub_flagged` (the caller's own read of that same flag) is decisive here regardless of
+        // density; `fullest_sibling_cues` catches the one OpenSubtitles' own metadata didn't flag (the
+        // Fauda file this was found from: an English sub for a DUBBED release, with no
+        // `foreign_parts_only` set, next to a full sibling that proves the episode has more to it).
         //
         // `Suspect`, the same as a cue-less body: one sparse read could be a genuinely quiet stretch
         // in an otherwise full track, so it is not trusted to unpin on its own, but a repeat escalates
@@ -369,11 +380,12 @@ impl<'a> Client<'a> {
         // established nothing better exists for this language (`allow_sparse`), in which case a real
         // track beats none and this is handed back rather than refused.
         let cues = crate::srt::parse(&body);
-        if crate::srt::looks_incomplete(&cues) && !allow_sparse {
+        if (dub_flagged || crate::srt::looks_incomplete(&cues, fullest_sibling_cues)) && !allow_sparse {
             // The density numbers that made the call, appended in the same `key=value` shape the
             // decision log uses for a SERVED body (`serve_line`) — `stats()` below reads them back
             // out, so a sparse refusal is as diagnosable from the journal as a served one, without
-            // spending a second download credit to re-measure it.
+            // spending a second download credit to re-measure it. A dub-flagged file still carries
+            // them (when it has any cues to measure) even though the flag alone was decisive.
             let detail = crate::srt::stats(&cues)
                 .map(|s| {
                     format!(
@@ -385,9 +397,12 @@ impl<'a> Client<'a> {
                     )
                 })
                 .unwrap_or_default();
-            return Err(DownloadError::Suspect(format!(
-                "file {file_id} has too few cues for its span{detail}"
-            )));
+            let why = if dub_flagged {
+                "is a flagged dub/foreign-parts track"
+            } else {
+                "has too few cues for its span"
+            };
+            return Err(DownloadError::Suspect(format!("file {file_id} {why}, sparse{detail}")));
         }
         Ok(body)
     }
@@ -954,7 +969,7 @@ mod download_tests {
     }
 
     async fn download_from(status: &'static str, body: &'static str) -> Result<String, DownloadError> {
-        download_from_allowing_sparse(status, body, false).await
+        download_from_full(status, body, false, false, None).await
     }
 
     async fn download_from_allowing_sparse(
@@ -962,11 +977,21 @@ mod download_tests {
         body: &'static str,
         allow_sparse: bool,
     ) -> Result<String, DownloadError> {
+        download_from_full(status, body, allow_sparse, false, None).await
+    }
+
+    async fn download_from_full(
+        status: &'static str,
+        body: &'static str,
+        allow_sparse: bool,
+        dub_flagged: bool,
+        fullest_sibling_cues: Option<usize>,
+    ) -> Result<String, DownloadError> {
         let base = upstream(status, body).await;
         let http = reqwest::Client::new();
         let limits = Limits::default();
         Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits }
-            .download(1, None, allow_sparse)
+            .download(1, None, allow_sparse, dub_flagged, fullest_sibling_cues)
             .await
     }
 
@@ -1035,11 +1060,14 @@ mod download_tests {
         let limits = Limits::default();
         let client = Client { http: &http, api_key: "k", token: None, api_base: &base, limits: &limits };
 
-        let first = client.download(1, None, false).await.expect_err("the CDN 429 was accepted");
+        let first = client.download(1, None, false, false, None).await.expect_err("the CDN 429 was accepted");
         assert!(matches!(first, DownloadError::Unavailable(_)), "CDN throttle blamed the file: {first:?}");
         assert_eq!(seen.load(Ordering::SeqCst), 2, "expected one API call and one CDN call");
 
-        let second = client.download(2, None, false).await.expect_err("the CDN pause let another file out");
+        let second = client
+            .download(2, None, false, false, None)
+            .await
+            .expect_err("the CDN pause let another file out");
         assert!(matches!(second, DownloadError::Unavailable(_)));
         assert_eq!(seen.load(Ordering::SeqCst), 2, "a paused CDN spent another /download credit");
     }
@@ -1058,7 +1086,7 @@ mod download_tests {
         limits.api.limited(client.api_limit_key(), Some(Duration::from_secs(60)));
 
         let err = client
-            .download_admitted(1, None, false, &permit)
+            .download_admitted(1, None, false, false, None, &permit)
             .await
             .expect_err("a pause installed after admission still dispatched");
         assert!(matches!(err, DownloadError::Unavailable(_)));
@@ -1116,7 +1144,7 @@ mod download_tests {
         let client =
             Client { http: &http, api_key: "k", token: Some("user"), api_base: &base, limits: &limits };
 
-        let err = client.download(1, None, false).await.expect_err("a 406 must fail");
+        let err = client.download(1, None, false, false, None).await.expect_err("a 406 must fail");
         assert!(matches!(err, DownloadError::Unavailable(_)), "the quota was blamed on the file: {err:?}");
         assert!(
             matches!(client.download_paused(), Some(DownloadError::Unavailable(_))),
@@ -1241,26 +1269,50 @@ mod download_tests {
 
     /// The Fauda shape downloaded: a DUBBED-release English sub with real, correctly-timed cues —
     /// `has_a_cue` and `has_a_cue`'s full cousin both pass it — but far too sparse for its own span
-    /// (200 cues over ~40 minutes, ≈5/minute). `download` must refuse it so den-remux's existing
-    /// fall-back-to-the-next-candidate loop moves on, rather than serving it as if it were complete.
+    /// (200 cues over ~40 minutes, ≈5/minute) NEXT TO a full sibling (the shape `rank` normally
+    /// fetches first, demoting the dub release below it). `download` must refuse it so den-remux's
+    /// existing fall-back-to-the-next-candidate loop moves on, rather than serving it as complete.
     #[tokio::test]
-    async fn a_sparse_but_cued_body_is_refused() {
-        // `download_from` takes `&'static str` (every other case here is a literal); leaking a test's
-        // own generated body is a fine way to get one without widening that signature for one case.
+    async fn a_sparse_but_cued_body_is_refused_next_to_a_full_sibling() {
+        // `download_from_full` takes `&'static str` (every other case here is a literal); leaking a
+        // test's own generated body is a fine way to get one without widening that for one case.
         let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str()); // 200 cues, 12s apart ≈ 5/minute over ~40 minutes
-        let err = download_from("200 OK", srt).await.expect_err("a sparse dub sub must not download clean");
+        let err = download_from_full("200 OK", srt, false, false, Some(500))
+            .await
+            .expect_err("a sparse dub sub next to a full sibling must not download clean");
         // The density numbers that made the call travel with the refusal — `stats()` reads them back
         // out — so the verdict is checkable from the journal without re-downloading the file.
         let stats = err.stats().expect("a sparse-but-cued refusal must carry its density numbers");
         assert_eq!(stats.count, 200);
-        assert!(stats.per_minute < 8.0, "{} cues/minute should read as sparse", stats.per_minute);
         let msg = err.message();
-        assert!(msg.contains("too few cues"), "{msg}");
+        assert!(msg.contains("sparse"), "{msg}");
+    }
+
+    /// With no sibling at all, the same Fauda shape clears the much looser lone floor — the relative
+    /// check (above) and the `dub_flagged` flag (below) are what actually catch it in practice.
+    #[tokio::test]
+    async fn a_sparse_but_cued_body_alone_downloads_clean() {
+        let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str());
+        assert!(download_from("200 OK", srt).await.is_ok());
+    }
+
+    /// OpenSubtitles doesn't always flag a DUBBED release's English sub as `foreign_parts_only` (the
+    /// Fauda file this whole check was found from didn't) — but when the caller's own release-string
+    /// read (`looks_dubbed`) or the API's flag says so, that is decisive on its own, regardless of
+    /// density or of any sibling.
+    #[tokio::test]
+    async fn a_dub_flagged_body_is_refused_regardless_of_density() {
+        let srt: &'static str = Box::leak(spaced_srt(480, 5_000).into_boxed_str()); // dense: 12/minute
+        let err = download_from_full("200 OK", srt, false, true, None)
+            .await
+            .expect_err("a dub-flagged body must be refused even when dense");
+        let msg = err.message();
+        assert!(msg.contains("sparse"), "{msg}");
     }
 
     /// The owner's call: a sparse file is better than nothing when it is the only thing a language
     /// has. `allow_sparse` is den-subtitles saying exactly that has been established — so the SAME
-    /// sparse body that `a_sparse_but_cued_body_is_refused` rejects is handed back here instead.
+    /// sparse body that the test above rejects is handed back here instead.
     #[tokio::test]
     async fn a_sparse_body_is_handed_back_when_the_caller_allows_it() {
         let srt: &'static str = Box::leak(spaced_srt(200, 12_000).into_boxed_str());

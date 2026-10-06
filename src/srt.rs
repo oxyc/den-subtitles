@@ -273,13 +273,26 @@ fn format_ts(ms: u64, ms_sep: char) -> String {
     format!("{h:02}:{m:02}:{s:02}{ms_sep}{milli:03}")
 }
 
-/// Cues per minute a real, complete dialogue track runs at; a full file is typically 12+. Below this
-/// — judged over the cues' OWN span, not the film's real runtime, which nothing at this layer knows —
-/// the file is probably captioning only part of the dialogue.
-const MIN_CUES_PER_MINUTE: f64 = 8.0;
-/// A single silence this long, even in a file whose overall density clears the bar above, is the
-/// same tell: dialogue-driven content does not go quiet for minutes at a time by accident.
-const MAX_GAP_MINUTES: f64 = 3.0;
+/// Cues/minute floor for a file with no sibling to compare against (a lone candidate, or the first of
+/// its episode this process has seen). With nothing to measure it against, only flag a shape no real
+/// dialogue track — however slow-paced — could produce: Springfloden's three English files run
+/// 6.5–7.6/min and must clear this, so this is deliberately looser than the old absolute floor (8/min)
+/// that flagged them. A true partial/dub track (Fauda's ~5/min) still falls under it.
+const LONE_MIN_CUES_PER_MINUTE: f64 = 3.0;
+/// A single silence this long, with no sibling to compare against, is the same kind of tell — but
+/// loosened to match: a slow Nordic drama can go quiet for over a minute between lines; this only
+/// catches a gap no dialogue track leaves by accident.
+const LONE_MAX_GAP_MINUTES: f64 = 6.0;
+/// Below this fraction of the fullest sibling candidate's cue count (same episode, any language), a
+/// file is sparse by comparison: another real candidate proves the episode has more dialogue than
+/// this file captions. Fauda's DUBBED English track (~200 cues) against a full ~45-minute track
+/// (500+) is well under half; Springfloden's three files (276/320/321) are all within a few percent
+/// of each other and clear it easily.
+const SPARSE_RELATIVE_FLOOR: f64 = 0.5;
+/// Below this many sibling cues, "fullest seen" is too thin a sample to judge anything relative to —
+/// a handful of signs-only cues on a title with no fuller candidate yet shouldn't make a normal file
+/// look sparse by comparison.
+const MIN_FULLEST_FOR_RELATIVE_JUDGEMENT: usize = 20;
 
 /// The density measurements `looks_incomplete` judges a file by, surfaced so a caller can put them
 /// in the decision log — the same numbers that decided "sparse" are what makes that verdict
@@ -308,23 +321,33 @@ pub fn stats(cues: &[Cue]) -> Option<Stats> {
 /// part of it? `has_a_cue`/`parse` finding cues at all is not enough: a subtitle made for a DUBBED
 /// release, or an unflagged foreign-parts-only track, has real, correctly-timed cues — just only over
 /// the scenes the dub or the main dialogue doesn't need translating, which OpenSubtitles' own
-/// metadata does not always say.
+/// metadata does not always say (the caller combines this with that flag; see `addon::judge_sparse`).
+///
+/// `fullest_sibling_cues` is the most cues any OTHER candidate for the same episode (any language)
+/// is known to have, when one has already been seen this density is judged RELATIVE to it
+/// (`SPARSE_RELATIVE_FLOOR`) rather than against an absolute floor — a slow-dialogue show's every
+/// candidate can legitimately run under the old fixed 8/minute bar (Springfloden: 6.5–7.6/min), but a
+/// track covering under half of what a real sibling proves is there is sparse regardless of genre.
+/// `None` (a lone candidate, or the first of its episode seen) falls back to a much looser absolute
+/// floor, because there is nothing yet to compare against.
 ///
 /// Found from a real file: Fauda S01E01's English sub for a DUBBED release — 200 cues over 0:19–40:22
-/// (≈5/minute, well under the 8/minute floor here) with gaps up to 4 minutes, including the minute-24
-/// scene a guest reported as missing. Judged against the cues' own span (first cue's start to last
-/// cue's end) rather than the episode's real runtime: a sub that genuinely starts late or ends before
-/// the credits is judged on what it actually covers, not penalised for runtime it was never going to
-/// have.
-pub fn looks_incomplete(cues: &[Cue]) -> bool {
+/// (≈5/minute) with gaps up to 4 minutes, next to a full ~45-minute sibling. Judged against the cues'
+/// own span (first cue's start to last cue's end) rather than the episode's real runtime: a sub that
+/// genuinely starts late or ends before the credits is judged on what it actually covers, not
+/// penalised for runtime it was never going to have.
+pub fn looks_incomplete(cues: &[Cue], fullest_sibling_cues: Option<usize>) -> bool {
     let Some(s) = stats(cues) else { return true };
     if s.span_ms == 0 {
         return true;
     }
-    if s.per_minute < MIN_CUES_PER_MINUTE {
+    if let Some(fullest) = fullest_sibling_cues.filter(|&f| f >= MIN_FULLEST_FOR_RELATIVE_JUDGEMENT) {
+        return (s.count as f64) < (fullest as f64) * SPARSE_RELATIVE_FLOOR;
+    }
+    if s.per_minute < LONE_MIN_CUES_PER_MINUTE {
         return true;
     }
-    (s.max_gap_ms as f64 / 60_000.0) > MAX_GAP_MINUTES
+    (s.max_gap_ms as f64 / 60_000.0) > LONE_MAX_GAP_MINUTES
 }
 
 #[cfg(test)]
@@ -593,9 +616,9 @@ mod tests {
 
     #[test]
     fn no_cues_or_a_zero_span_looks_incomplete() {
-        assert!(looks_incomplete(&[]), "no cues at all");
+        assert!(looks_incomplete(&[], None), "no cues at all");
         let one = vec![Cue { index: 1, start: 5000, end: 5000, text: "x".into() }];
-        assert!(looks_incomplete(&one), "a single zero-length cue has no span to judge");
+        assert!(looks_incomplete(&one, None), "a single zero-length cue has no span to judge");
     }
 
     /// The numbers behind `looks_incomplete`'s verdict, for the decision log — a reader must be able
@@ -607,40 +630,70 @@ mod tests {
         let s = stats(&cues).expect("a real cue list has stats");
         assert_eq!(s.count, cues.len());
         assert!((s.per_minute - 5.0).abs() < 0.5, "per_minute was {}", s.per_minute);
-        assert!(looks_incomplete(&cues), "this is the sparse shape stats should agree is sparse");
     }
 
     /// The real file this check was written for: Fauda S01E01's English sub for a DUBBED release —
-    /// 200 cues over roughly 0:19–40:22 (≈5/minute), well under the 8/minute floor.
+    /// 200 cues over roughly 0:19–40:22 (≈5/minute) — judged next to a full ~45-minute sibling (500+
+    /// cues), which is the shape that actually occurs: `rank` already demotes a dub/foreign-parts
+    /// release below a full track of the same language, so the full one is normally fetched (and
+    /// recorded) first. See `addon::judge_sparse` for the independent dub/foreign-parts-flag check
+    /// that also catches this file even with no sibling yet.
     #[test]
-    fn the_fauda_dubbed_release_shape_is_flagged() {
+    fn the_fauda_dubbed_release_shape_is_flagged_next_to_a_full_sibling() {
         let cues = evenly_spaced(5.0, 40.0);
-        assert!(looks_incomplete(&cues), "{} cues over 40 minutes should read as sparse", cues.len());
+        assert!(
+            looks_incomplete(&cues, Some(500)),
+            "{} cues next to a 500-cue sibling should read as sparse by comparison",
+            cues.len()
+        );
     }
 
-    /// A real, complete track — dense, no long silences — must not be flagged.
+    /// With NO sibling yet, the Fauda shape (5/min) still clears the new, much looser lone floor
+    /// (3/min) — the relative check above, or the dub/foreign-parts flag, is what actually catches it
+    /// in practice; density alone, with nothing to compare against, is deliberately permissive.
+    #[test]
+    fn the_fauda_dubbed_release_shape_alone_clears_the_lone_floor() {
+        let cues = evenly_spaced(5.0, 40.0);
+        assert!(!looks_incomplete(&cues, None), "{} cues alone should not be flagged by density", cues.len());
+    }
+
+    /// A real, complete track — dense, no long silences — must not be flagged, with or without a
+    /// (necessarily smaller) sibling to compare against.
     #[test]
     fn a_dense_full_track_is_not_flagged() {
         let cues = evenly_spaced(12.0, 45.0);
-        assert!(!looks_incomplete(&cues), "{} cues over 45 minutes is a full track", cues.len());
+        assert!(!looks_incomplete(&cues, None), "{} cues over 45 minutes is a full track", cues.len());
+        assert!(!looks_incomplete(&cues, Some(100)), "a full track still beats a smaller sibling");
     }
 
-    /// Density alone can clear the bar while one scene-long silence still gives it away: a 4-minute
-    /// gap in the middle of an otherwise-adequate track.
+    /// A lone candidate with one scene-long silence past the new, looser gap floor is still flagged —
+    /// a 7-minute silence is not a slow Nordic drama's ordinary pacing.
     #[test]
-    fn a_single_long_gap_is_flagged_even_at_adequate_density() {
+    fn a_single_long_gap_is_flagged_even_at_adequate_density_when_lone() {
         let mut cues = evenly_spaced(9.0, 20.0);
         let last = cues.last().unwrap().end;
-        // One more cue, 4 minutes after the others end — density over the WHOLE span stays above the
-        // floor (181 cues / ~24 minutes ≈ 7.5/min is close, so this also leans on the gap check, not
-        // density alone, to prove the gap signal does its own work).
         cues.push(Cue {
             index: 999,
-            start: last + 4 * 60_000,
-            end: last + 4 * 60_000 + 500,
+            start: last + 7 * 60_000,
+            end: last + 7 * 60_000 + 500,
             text: "x".into(),
         });
-        assert!(looks_incomplete(&cues), "a 4-minute silence mid-track should be flagged");
+        assert!(looks_incomplete(&cues, None), "a 7-minute silence mid-track should be flagged");
+    }
+
+    /// Springfloden's own shape: three English candidates (276/320/321 cues, 6.5–7.6/min, longest gap
+    /// 145s) must all clear BOTH the lone floor and the relative check against each other — a slow
+    /// Nordic drama, not foreign-parts files.
+    #[test]
+    fn the_springfloden_candidates_are_not_flagged_lone_or_against_each_other() {
+        for cues in [evenly_spaced(6.5, 42.5), evenly_spaced(7.6, 42.1), evenly_spaced(7.6, 42.2)] {
+            assert!(!looks_incomplete(&cues, None), "{} cues alone should not be flagged", cues.len());
+            assert!(
+                !looks_incomplete(&cues, Some(321)),
+                "{} cues next to the fullest (321) should not be flagged",
+                cues.len()
+            );
+        }
     }
 
     /// A sub that starts late or ends well before the credits is judged on what it covers, not
@@ -648,7 +701,10 @@ mod tests {
     #[test]
     fn a_sub_that_starts_late_is_judged_on_its_own_span_only() {
         let cues = evenly_spaced(12.0, 30.0);
-        assert!(!looks_incomplete(&cues), "a short, dense sub covering only part of the runtime is fine");
+        assert!(
+            !looks_incomplete(&cues, None),
+            "a short, dense sub covering only part of the runtime is fine"
+        );
     }
 }
 
