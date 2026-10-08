@@ -66,10 +66,10 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   applies the validated offset to the whole subtitle. This keeps the job inside the request budget;
   unlike the old full-file alignment, it deliberately does not repair mid-file cuts or drift. The
   app then swaps in the re-synced track. Den also supplies a hashed release identity as
-  `resync_key`; successful results stay cached for 60 days and survive rotating scout play tickets,
-  while remaining scoped to that addon installation. Older clients without the key retain the
-  exact-ticket cache behavior. The stream URL has
-  to be one of den-scout's play routes — `<origin>/<config>/play/<token>`, or the ticket form
+  `resync_key`; successful results survive rotating scout play tickets and are retained for ten
+  years (effectively until the bounded cache needs their space), while remaining scoped to that
+  addon installation. Older clients without the key retain the exact-ticket cache behavior. The
+  stream URL has to be one of den-scout's play routes — `<origin>/<config>/play/<token>`, or the ticket form
   `<origin>/p/<ticket>` (one base64url segment) — at an origin listed in
   `SCOUT_ORIGINS`; any other target, or any target when that is unset, is ignored and the sub is
   served unaligned. alass never gets the URL itself: it reads a relay on 127.0.0.1 that follows
