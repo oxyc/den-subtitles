@@ -534,6 +534,7 @@ mod tests {
             cache_max_bytes: 8 * 1024 * 1024,
             public_base_url: None,
             alass: "alass".to_string(),
+            ffmpeg: "ffmpeg".to_string(),
             config_key: config_key.to_string(),
             config_keys_prev: String::new(),
             metrics_token: metrics_token.to_string(),

@@ -54,8 +54,8 @@ jobs:
           docker run --rm
           --memory=512m --memory-swap=512m
           den-subtitles-tier1-corpus:ci --cgroup-memory-gate
-      # A container of its own, so memory.peak covers only one audio Tier-2 job (alass + its ffmpeg
-      # child) beside one Tier-1 job, the service and the cache/body model.
+      # A container of its own, so memory.peak covers only one partial-audio Tier-2 job (ffmpeg then
+      # alass) beside one Tier-1 job, the service and the cache/body model.
       - name: Tier-2 audio mixed memory gate
         run: >-
           docker run --rm

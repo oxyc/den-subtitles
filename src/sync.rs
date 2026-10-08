@@ -5,9 +5,9 @@
 //!     (see `opensubtitles.rs`) floats those to the top; the sync tiers below only run for the rest.
 //!   * Tier 1 — reference alignment (fast, no audio): align the target subtitle against a subtitle
 //!     we trust to be in sync (e.g. an English hash-match). Sub-second, runs on every result.
-//!   * Tier 2 — audio VAD (robust, opt-in): align against the actual audio with `alass`
-//!     (splits-aware — handles ad breaks / different cuts). Costs a stream fetch, so it's a per-title
-//!     user action, not automatic.
+//!   * Tier 2 — partial audio VAD (opt-in): extract a bounded four-minute window, align it with
+//!     `alass`, validate that it found one stable offset, then apply that offset to the whole file.
+//!     Costs a stream fetch, so it's a per-title user action, not automatic.
 //!
 //! Each tier shells out to `alass` exactly like reel drives yt-dlp/ffmpeg —
 //! the CPU work lives in the subprocess, not this runtime.
@@ -27,11 +27,17 @@ use tokio::time::timeout;
 /// installs them).
 pub struct SyncTools {
     pub alass: String,
+    pub ffmpeg: String,
     pub work_dir: PathBuf,
 }
 
 const TIER1_BUDGET: Duration = Duration::from_secs(20);
-const TIER2_BUDGET: Duration = Duration::from_secs(90);
+const TIER2_EXTRACT_BUDGET: Duration = Duration::from_secs(70);
+const TIER2_ALIGN_BUDGET: Duration = Duration::from_secs(20);
+const TIER2_SAMPLE_SECONDS: u64 = 240;
+const TIER2_MIN_SAMPLE_CUES: usize = 5;
+const TIER2_MAX_SHIFT_MS: i64 = 120_000;
+const TIER2_SAMPLE_LEAD_MS: u64 = 30_000;
 
 impl SyncTools {
     /// Tier 1: shift `target_srt` to line up with `reference_srt` (both SRT text). No audio needed,
@@ -78,27 +84,84 @@ impl SyncTools {
         self.finish(run_result, &out, [&target, &reference]).await
     }
 
-    /// Tier 2: align `target_srt` against the media at `media_url` using alass. `alass` pulls and
-    /// decodes the audio itself via ffprobe/ffmpeg, so `media_url` must be one they may open: the
-    /// request path passes a `resync::Relay` on loopback, never the caller's URL.
+    /// Tier 2: extract a short audio window from `media_url`, align the matching target cues to it,
+    /// and apply the validated constant offset to the whole subtitle. The request path passes a
+    /// `resync::Relay` on loopback, never the caller's URL.
     pub async fn sync_to_audio(
         &self,
         target_srt: &str,
         media_url: &str,
         tag: &str,
     ) -> Result<String, String> {
-        let target = self.write_temp(tag, "target.srt", target_srt.as_bytes()).await?;
-        let out = self.temp_path(tag, "synced.srt");
-        // alass <reference-media> <incorrect-subs> <output>. It runs cropdetect-free VAD + a
-        // split-aware DP alignment, correcting constant offset AND mid-file drift.
-        let run_result = self
+        let all = crate::srt::parse(target_srt);
+        if all.is_empty() {
+            return Err("target subtitle has no cues".into());
+        }
+        let (sample_start, sample) = partial_audio_sample(&all)?;
+
+        let target =
+            self.write_temp(tag, "sample-target.srt", crate::srt::serialize(&sample).as_bytes()).await?;
+        let audio = self.temp_path(tag, "sample.wav");
+        let out = self.temp_path(tag, "sample-synced.srt");
+        let sample_seconds = TIER2_SAMPLE_SECONDS.to_string();
+        let sample_start_seconds = format!("{:.3}", sample_start as f64 / 1000.0);
+        let extract = self
             .run(
-                &self.alass,
-                &[media_url, target.to_string_lossy().as_ref(), out.to_string_lossy().as_ref()],
-                TIER2_BUDGET,
+                &self.ffmpeg,
+                &[
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-ss",
+                    &sample_start_seconds,
+                    "-i",
+                    media_url,
+                    "-t",
+                    &sample_seconds,
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "pcm_s16le",
+                    "-y",
+                    audio.to_string_lossy().as_ref(),
+                ],
+                TIER2_EXTRACT_BUDGET,
             )
             .await;
-        self.finish(run_result, &out, [&target]).await
+        if let Err(e) = require_success(extract, "partial audio extraction") {
+            remove_files([&target, &audio, &out]).await;
+            return Err(e);
+        }
+
+        let align = self
+            .run(
+                &self.alass,
+                &[
+                    "--no-split",
+                    "--disable-fps-guessing",
+                    audio.to_string_lossy().as_ref(),
+                    target.to_string_lossy().as_ref(),
+                    out.to_string_lossy().as_ref(),
+                ],
+                TIER2_ALIGN_BUDGET,
+            )
+            .await;
+        if let Err(e) = require_success(align, "partial audio alignment") {
+            remove_files([&target, &audio, &out]).await;
+            return Err(e);
+        }
+        let aligned = read_capped(&out).await.and_then(|body| {
+            let aligned = crate::srt::parse(&body);
+            partial_audio_shift(&sample, &aligned).map(|shift| shift_cues(&all, shift))
+        });
+        remove_files([&target, &audio, &out]).await;
+        aligned
     }
 
     /// Reclaim scratch files no run could still be using.
@@ -110,7 +173,8 @@ impl SyncTools {
     ///
     /// Age, not ownership: a file older than the longest a run may take cannot belong to a live one.
     pub fn sweep_scratch(&self) {
-        /// Comfortably past `TIER2_BUDGET`, the longest any run is allowed to hold a scratch file.
+        /// Comfortably past the Tier-2 extraction + alignment budgets, the longest a run may hold a
+        /// file.
         const ABANDONED: Duration = Duration::from_secs(30 * 60);
 
         let Ok(entries) = std::fs::read_dir(&self.work_dir) else { return };
@@ -195,6 +259,92 @@ impl SyncTools {
     }
 }
 
+fn require_success(run: Result<std::process::ExitStatus, String>, step: &str) -> Result<(), String> {
+    match run {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{step} exited {status}")),
+        Err(e) => Err(e),
+    }
+}
+
+fn partial_audio_sample(cues: &[crate::srt::Cue]) -> Result<(u64, Vec<crate::srt::Cue>), String> {
+    let window_ms = TIER2_SAMPLE_SECONDS * 1000;
+    let starts =
+        std::iter::once(0).chain(cues.iter().map(|cue| cue.start.saturating_sub(TIER2_SAMPLE_LEAD_MS)));
+    for start in starts {
+        let end = start.saturating_add(window_ms);
+        let in_window = cues.iter().filter(|cue| cue.start >= start && cue.start < end).collect::<Vec<_>>();
+        if in_window.len() < TIER2_MIN_SAMPLE_CUES {
+            continue;
+        }
+        let sample = in_window
+            .into_iter()
+            .enumerate()
+            .map(|(index, cue)| {
+                let mut cue = cue.clone();
+                cue.index = index as u32 + 1;
+                cue.start -= start;
+                cue.end = cue.end.saturating_sub(start);
+                cue
+            })
+            .collect();
+        return Ok((start, sample));
+    }
+    Err("no four-minute window contains enough subtitle cues for partial audio sync".into())
+}
+
+fn partial_audio_shift(original: &[crate::srt::Cue], aligned: &[crate::srt::Cue]) -> Result<i64, String> {
+    let by_index: std::collections::HashMap<_, _> = aligned.iter().map(|cue| (cue.index, cue)).collect();
+    let mut deltas: Vec<i64> = original
+        .iter()
+        .filter_map(|cue| {
+            let shifted = by_index.get(&cue.index)?;
+            // alass clamps a shifted cue at zero. That pair no longer carries the actual offset.
+            (shifted.start > 0).then_some(shifted.start as i64 - cue.start as i64)
+        })
+        .collect();
+    if deltas.len() < 3 {
+        return Err("partial audio sync produced too few comparable cues".into());
+    }
+    deltas.sort_unstable();
+    let shift = deltas[deltas.len() / 2];
+    if shift.abs() > TIER2_MAX_SHIFT_MS {
+        return Err(format!("partial audio sync proposed implausible shift {shift}ms"));
+    }
+    let agreeing = deltas.iter().filter(|delta| (**delta - shift).abs() <= 100).count();
+    if agreeing * 4 < deltas.len() * 3 {
+        return Err("partial audio sync did not find one stable offset".into());
+    }
+    Ok(shift)
+}
+
+fn shift_cues(cues: &[crate::srt::Cue], shift: i64) -> String {
+    let shifted: Vec<_> = cues
+        .iter()
+        .cloned()
+        .map(|mut cue| {
+            cue.start = shift_timestamp(cue.start, shift);
+            cue.end = shift_timestamp(cue.end, shift);
+            cue
+        })
+        .collect();
+    crate::srt::serialize(&shifted)
+}
+
+fn shift_timestamp(value: u64, shift: i64) -> u64 {
+    if shift < 0 {
+        value.saturating_sub(shift.unsigned_abs())
+    } else {
+        value.saturating_add(shift as u64)
+    }
+}
+
+async fn remove_files<const N: usize>(paths: [&PathBuf; N]) {
+    for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
 fn canonical_srt(body: &str, name: &str) -> Result<String, String> {
     let cues = crate::srt::parse(body);
     if cues.is_empty() {
@@ -231,7 +381,7 @@ mod tests {
     }
 
     fn tools(dir: &std::path::Path, alass: String) -> SyncTools {
-        SyncTools { alass, work_dir: dir.to_path_buf() }
+        SyncTools { alass, ffmpeg: "ffmpeg".into(), work_dir: dir.to_path_buf() }
     }
 
     /// A real cue, because the tiers now have to return something that parses as a subtitle.
@@ -352,7 +502,7 @@ mod tests {
     fn the_scratch_sweep_reclaims_what_a_cancelled_run_left() {
         let dir = work_dir("scratch-sweep");
         std::fs::create_dir_all(&dir).unwrap();
-        let tools = SyncTools { alass: "y".into(), work_dir: dir.clone() };
+        let tools = SyncTools { alass: "y".into(), ffmpeg: "y".into(), work_dir: dir.clone() };
 
         let abandoned = dir.join("old-tag-target.srt");
         let in_flight = dir.join("live-tag-target.srt");
@@ -373,14 +523,88 @@ mod tests {
     #[tokio::test]
     async fn tier2_audio_success_returns_synced_output() {
         let dir = work_dir("t2-ok");
-        // alass's contract is `<media> <target> <out>`; positional $2=target, $3=out.
-        let bin = fake_bin(&dir, "fake-alass", r#"cp "$2" "$3""#).await;
-        let t = tools(&dir, bin);
-        let out = t.sync_to_audio(SUB, "http://192.168.1.9/s.mkv", "tag-t2").await;
-        assert_eq!(out.unwrap(), SUB);
-        assert!(!dir.join("tag-t2-target.srt").exists());
-        assert!(!dir.join("tag-t2-synced.srt").exists());
+        let full = (1..=6)
+            .map(|index| crate::srt::Cue {
+                index,
+                start: if index == 6 { 600_000 } else { index as u64 * 20_000 },
+                end: if index == 6 { 601_000 } else { index as u64 * 20_000 + 1_000 },
+                text: format!("cue {index}"),
+            })
+            .collect::<Vec<_>>();
+        let (_, sample) = partial_audio_sample(&full).unwrap();
+        let sample = sample
+            .into_iter()
+            .map(|mut cue| {
+                cue.start -= 5_000;
+                cue.end -= 5_000;
+                cue
+            })
+            .collect::<Vec<_>>();
+        // The fast path invokes alass with two flags, then audio/target/output: output is $5.
+        let alass = fake_bin(
+            &dir,
+            "fake-alass",
+            &format!("cat > \"$5\" <<'EOF'\n{}EOF", crate::srt::serialize(&sample)),
+        )
+        .await;
+        // ffmpeg's destination is its last argument.
+        let ffmpeg = fake_bin(
+            &dir,
+            "fake-ffmpeg",
+            "test \"$5\" = -ss; test \"$6\" = 0.000; for last; do :; done; printf RIFF > \"$last\"",
+        )
+        .await;
+        let t = SyncTools { alass, ffmpeg, work_dir: dir.clone() };
+        let out = t
+            .sync_to_audio(&crate::srt::serialize(&full), "http://192.168.1.9/s.mkv", "tag-t2")
+            .await
+            .unwrap();
+        let shifted = crate::srt::parse(&out);
+        assert_eq!(shifted[0].start, 15_000);
+        assert_eq!(shifted[5].start, 595_000, "the sampled offset must be applied to later cues too");
+        assert!(!dir.join("tag-t2-sample-target.srt").exists());
+        assert!(!dir.join("tag-t2-sample.wav").exists());
+        assert!(!dir.join("tag-t2-sample-synced.srt").exists());
         tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[test]
+    fn partial_audio_shift_rejects_an_implausible_or_unstable_answer() {
+        let cues = (1..=5)
+            .map(|index| crate::srt::Cue {
+                index,
+                start: index as u64 * 20_000,
+                end: index as u64 * 20_000 + 1_000,
+                text: "x".into(),
+            })
+            .collect::<Vec<_>>();
+        let mut huge = cues.clone();
+        for cue in &mut huge {
+            cue.start += 180_000;
+        }
+        assert!(partial_audio_shift(&cues, &huge).unwrap_err().contains("implausible"));
+
+        let mut unstable = cues.clone();
+        for (i, cue) in unstable.iter_mut().enumerate() {
+            cue.start = (cue.start as i64 + i as i64 * 1_000) as u64;
+        }
+        assert!(partial_audio_shift(&cues, &unstable).unwrap_err().contains("stable"));
+    }
+
+    #[test]
+    fn partial_audio_sample_seeks_to_late_dialogue_and_normalizes_its_timestamps() {
+        let cues = (1..=5)
+            .map(|index| crate::srt::Cue {
+                index: 7,
+                start: 600_000 + index as u64 * 20_000,
+                end: 601_000 + index as u64 * 20_000,
+                text: "x".into(),
+            })
+            .collect::<Vec<_>>();
+        let (start, sample) = partial_audio_sample(&cues).unwrap();
+        assert_eq!(start, 590_000);
+        assert_eq!(sample[0].start, 30_000);
+        assert_eq!(sample.iter().map(|cue| cue.index).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
     }
 }
 

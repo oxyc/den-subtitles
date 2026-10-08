@@ -12,10 +12,10 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 /// cache (including allocator overhead) plus retained inputs/outputs and requires at least 112 MiB
 /// cgroup headroom with the real service running. Tier 2 takes two units, leaving one for Tier 1 so
 /// an audio decode cannot stop every cheap reference alignment. That other maximum is measured too:
-/// CI runs one real audio Tier-2 job (alass and its ffprobe/ffmpeg children, on a two-hour 5.1
+/// CI runs one real partial-audio Tier-2 job (ffmpeg extraction followed by alass, on a two-hour 5.1
 /// soundtrack) beside back-to-back Tier-1 jobs, the service and the same 112 MiB, in a fresh 512 MiB
-/// cgroup, against the same 400 MiB ceiling; it peaks near 310 MiB. Tier-2 alass holds about
-/// 115 MiB RSS and ffmpeg about 56 MiB, which is what the two units must cover.
+/// cgroup, against the same 400 MiB ceiling. The two units conservatively preserve the measured
+/// headroom while the extraction or alignment subprocess is resident.
 const SYNC_MEMORY_UNITS: usize = 3;
 const TIER1_SLOTS: usize = 3;
 const TIER2_SLOTS: usize = 1;
@@ -49,10 +49,11 @@ pub struct AppState {
     pub inflight: Arc<InFlight>,
     /// How far a running translation has got, for the `.status` endpoint.
     pub progress: Progress,
-    /// Tier binaries allowed to run at once. `alass` decodes audio through ffmpeg and gets up to 90
-    /// seconds; the runtime has one thread and the container is a homelab box. The single-flight map
-    /// collapses duplicates of the SAME alignment, but distinct ones — twenty picker URLs, or a
-    /// client naming twenty different `?ref=` values — are distinct keys and would all spawn.
+    /// Tier binaries allowed to run at once. Partial-audio extraction and alignment together get up
+    /// to 90 seconds; the runtime has one thread and the container is a homelab box. The
+    /// single-flight map collapses duplicates of the SAME alignment, but distinct ones — twenty
+    /// picker URLs, or a client naming twenty different `?ref=` values — are distinct keys and would
+    /// all spawn.
     pub sync_admission: SyncAdmission,
     pub sync: SyncTools,
     /// Consecutive OpenSubtitles search failures — surfaced as `degraded` on /health (ADDON-02).
@@ -81,7 +82,11 @@ impl AppState {
                 None
             }
         };
-        let sync = SyncTools { alass: cfg.alass.clone(), work_dir: cfg.cache_dir.join("sync") };
+        let sync = SyncTools {
+            alass: cfg.alass.clone(),
+            ffmpeg: cfg.ffmpeg.clone(),
+            work_dir: cfg.cache_dir.join("sync"),
+        };
         // Disk tier under CACHE_DIR/store so a restart/redeploy doesn't cold-start the cache.
         let cache = Cache::new(cfg.cache_max_bytes as usize, Some(cfg.cache_dir.join("store")));
         // A malformed key disables sealed URLs (legacy plaintext keeps working) rather than crashing.

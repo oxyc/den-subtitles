@@ -61,8 +61,11 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   at 2 MiB. The PR corpus gates timing parity against `ffsubsync` across cross-language split/merged,
   missing/extra-cue, malformed, drift, sparse and long-track fixtures without shipping `ffsubsync`.
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
-  non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon runs `alass`
-  against the stream audio server-side and the app swaps in the re-synced track. The stream URL has
+  non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon extracts a
+  four-minute mono audio window, runs constant-offset `alass` against only the matching cues, and
+  applies the validated offset to the whole subtitle. This keeps the job inside the request budget;
+  unlike the old full-file alignment, it deliberately does not repair mid-file cuts or drift. The
+  app then swaps in the re-synced track. The stream URL has
   to be one of den-scout's play routes — `<origin>/<config>/play/<token>`, or the ticket form
   `<origin>/p/<ticket>` (one base64url segment) — at an origin listed in
   `SCOUT_ORIGINS`; any other target, or any target when that is unset, is ignored and the sub is
@@ -204,6 +207,7 @@ it optional (`.env.example` lists the same):
 | `SCOUT_ORIGINS` | unset (Tier 2 off) | Comma-separated den-scout origins (`http://192.168.86.193:8080`) a `?resync=` target may be at — the origin of the stream URLs scout hands the app. |
 | `SCOUT_ALIASES` | unset | `<public origin>=<LAN origin>` pairs (`https://d-play.oxy.fi=http://192.168.86.193:8080`): a resync target on scout's public name is fetched at its LAN address, so two services on one box never go through the WAN and the tunnel. Both sides must also be in `SCOUT_ORIGINS`. |
 | `ALASS_PATH` | `alass` (image: `/usr/local/bin/alass`) | The `alass` binary for Tier-1 reference and Tier-2 audio sync. |
+| `FFMPEG_PATH` | `ffmpeg` (image: `/usr/bin/ffmpeg`) | The `ffmpeg` binary used to extract Tier-2's bounded partial-audio sample. |
 
 On a trusted LAN the origin derived from the request's `Host` / `X-Forwarded-Host` header is fine —
 leave `PUBLIC_BASE_URL` unset. Once the addon is reachable by untrusted clients (i.e. exposed
@@ -281,11 +285,10 @@ service resident and three real Tier-1 aligners running, it forces 112 MiB resid
 64 MiB cache with allocator overhead plus every running/prepared tier's capped bodies and buffers. The
 gate requires total cgroup usage to stay below 400 MiB, preserving at least 112 MiB of headroom.
 A second run in a fresh 512 MiB container (`--tier2-memory-gate`) measures admission's other
-maximum under the same ceiling: one real audio Tier-2 job — `alass` against a two-hour synthetic 5.1
-soundtrack built into the corpus image, over a loopback URL as in production, with its
-ffprobe/ffmpeg children — beside back-to-back Tier-1 jobs, the service and the same 112 MiB. It also
-requires that alass's ffmpeg child was seen in the cgroup and that Tier 2 repaired the fixture's
-offset and mid-film cut to within 250 ms at p95.
+maximum under the same ceiling: one real partial-audio Tier-2 job — ffmpeg extracts four minutes
+from a two-hour synthetic 5.1 soundtrack over a loopback URL, then `alass --no-split` aligns the
+matching cues — beside back-to-back Tier-1 jobs, the service and the same 112 MiB. It also requires
+that ffmpeg ran in the cgroup and that Tier 2 recovered the fixture's constant offset within 250 ms.
 
 ## Deploy
 
