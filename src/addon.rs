@@ -32,7 +32,12 @@ use crate::state::{AppState, SyncOutcome, SyncReservation, SyncTier};
 use crate::userconfig::{LlmConfig, UserConfig};
 use crate::{resync, srt, translate};
 
-const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60); // 60 days — mirrors the app cache
+// Ordinary downloaded and translated subtitle artifacts mirror the app cache.
+const CACHE_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 60);
+// A successful audio alignment is expensive to reproduce and only a few KiB to retain. Ten years is
+// effectively "until the bounded disk cache evicts it", while keeping the cache format's ordinary
+// finite-expiry semantics and allowing a future alignment-version bump to replace it cleanly.
+const SYNC_RESULT_TTL: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 /// How long a raw sub stands in for an alignment that failed. Long enough that a retrying client
 /// doesn't re-spawn the tier binary per request, short enough that a fixed deploy heals itself.
 const SYNC_RETRY_TTL: Duration = Duration::from_secs(600);
@@ -1207,9 +1212,9 @@ async fn sync_and_cache(
         // of the ladder produced it.
         Some((body, offset_ms)) => {
             let offset_key = offset_ms.map(|_| subtitle_offset_key(&cache_key));
-            state.cache.put(cache_key, body.clone(), CACHE_TTL);
+            state.cache.put(cache_key, body.clone(), SYNC_RESULT_TTL);
             if let (Some(offset_key), Some(offset_ms)) = (offset_key, offset_ms) {
-                state.cache.put(offset_key, offset_ms.to_string(), CACHE_TTL);
+                state.cache.put(offset_key, offset_ms.to_string(), SYNC_RESULT_TTL);
             }
             log_serve(state, log, "served", tier_label, None, "miss", Some(&body));
             let resp = with_subtitle_offset(httputil::srt(body), offset_ms);
