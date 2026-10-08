@@ -143,7 +143,9 @@ key across batches and films. The first successful answer ends a pause.
   `?resync=<stream-url>` aligns it to the stream's audio with `alass` (Tier 2). Whatever encoding the
   upload is in (Windows-125x, ISO-8859-x, UTF-16), it is served as UTF-8; `lang=<code>`, set on the
   URLs the subtitles resource hands back for languages with their own legacy encodings, hints that
-  detection. `?sparse=1` is the caller's own last resort, asked for only after every candidate for a
+  detection. A successful Tier-2 response carries its already-applied correction in
+  `X-Den-Subtitle-Offset-Ms`, including on cache hits, so clients can display the measured baseline
+  without applying it twice. `?sparse=1` is the caller's own last resort, asked for only after every candidate for a
   language has been tried and refused: a real, correctly-timed but too-sparse-for-its-span track
   (a dubbed release's English captions, say) is served rather than refused, since it is better than
   offering the language at all and getting nothing. A cue-less body, an expired CDN link or a dead
