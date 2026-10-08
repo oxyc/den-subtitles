@@ -31,6 +31,14 @@ pub struct SyncTools {
     pub work_dir: PathBuf,
 }
 
+/// A Tier-2 result carries both the shifted subtitle and the shift alass measured. The body already
+/// contains this correction; callers expose the number as metadata so clients can display it without
+/// applying it a second time.
+pub struct AudioSync {
+    pub body: String,
+    pub shift_ms: i64,
+}
+
 const TIER1_BUDGET: Duration = Duration::from_secs(20);
 const TIER2_EXTRACT_BUDGET: Duration = Duration::from_secs(70);
 const TIER2_ALIGN_BUDGET: Duration = Duration::from_secs(20);
@@ -92,7 +100,7 @@ impl SyncTools {
         target_srt: &str,
         media_url: &str,
         tag: &str,
-    ) -> Result<String, String> {
+    ) -> Result<AudioSync, String> {
         let all = crate::srt::parse(target_srt);
         if all.is_empty() {
             return Err("target subtitle has no cues".into());
@@ -158,7 +166,8 @@ impl SyncTools {
         }
         let aligned = read_capped(&out).await.and_then(|body| {
             let aligned = crate::srt::parse(&body);
-            partial_audio_shift(&sample, &aligned).map(|shift| shift_cues(&all, shift))
+            partial_audio_shift(&sample, &aligned)
+                .map(|shift_ms| AudioSync { body: shift_cues(&all, shift_ms), shift_ms })
         });
         remove_files([&target, &audio, &out]).await;
         aligned
@@ -559,7 +568,8 @@ mod tests {
             .sync_to_audio(&crate::srt::serialize(&full), "http://192.168.1.9/s.mkv", "tag-t2")
             .await
             .unwrap();
-        let shifted = crate::srt::parse(&out);
+        assert_eq!(out.shift_ms, -5_000);
+        let shifted = crate::srt::parse(&out.body);
         assert_eq!(shifted[0].start, 15_000);
         assert_eq!(shifted[5].start, 595_000, "the sampled offset must be applied to later cues too");
         assert!(!dir.join("tag-t2-sample-target.srt").exists());

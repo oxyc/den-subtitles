@@ -845,7 +845,8 @@ pub async fn handle_subtitle_file(
         false => settled_etag.clone(),
     };
     if httputil::if_none_match(req_headers, &conditional_etag) {
-        return httputil::not_modified(&conditional_etag, httputil::SETTLED_SRT);
+        let resp = httputil::not_modified(&conditional_etag, httputil::SETTLED_SRT);
+        return with_cached_subtitle_offset(state, &cache_key, resp);
     }
     let rid = logging::request_id(req_headers);
     // No imdb here at all: this route is addressed by OpenSubtitles file id alone, not by title —
@@ -861,7 +862,8 @@ pub async fn handle_subtitle_file(
     };
     if let Some(hit) = state.cache.get(&cache_key) {
         log_serve(state, ctx, "served", "cache_hit", None, "hit", Some(&hit));
-        return with_settled_etag(httputil::add_timing(httputil::srt(hit), CACHE_HIT), &settled_etag);
+        let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt(hit));
+        return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
     }
     let Some(http) = state.http.as_ref() else {
         log_serve(state, ctx, "refused", "service_unavailable", None, "miss", None);
@@ -875,7 +877,8 @@ pub async fn handle_subtitle_file(
         let guard = state.inflight.acquire(&cache_key).await;
         if let Some(hit) = state.cache.get(&cache_key) {
             log_serve(state, ctx, "served", "cache_hit", None, "hit", Some(&hit));
-            return with_settled_etag(httputil::add_timing(httputil::srt(hit), CACHE_HIT), &settled_etag);
+            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt(hit));
+            return with_settled_etag(httputil::add_timing(resp, CACHE_HIT), &settled_etag);
         }
         Some(guard)
     } else {
@@ -1066,7 +1069,8 @@ async fn sync_and_cache(
         // Settled while we waited: the alignment we were about to run has already been run.
         if let Some(hit) = state.cache.get(&cache_key) {
             log_serve(state, log, "served", "settled_while_waiting", None, "hit", Some(&hit));
-            return httputil::add_timing(httputil::srt(hit), CACHE_HIT);
+            let resp = with_cached_subtitle_offset(state, &cache_key, httputil::srt(hit));
+            return httputil::add_timing(resp, CACHE_HIT);
         }
         // And it may have failed while we waited, in which case re-running it now is the retry the
         // marker exists to prevent.
@@ -1122,7 +1126,7 @@ async fn sync_and_cache(
     // `mine_only` says the failure belongs to this credential rather than to the work — see the two
     // markers above. Only the reference download can set it.
     let mut mine_only = false;
-    let synced: Option<String> = if let Some(url) = resync_url {
+    let synced: Option<(String, Option<i64>)> = if let Some(url) = resync_url {
         // Tier 2 — partial audio VAD against the playing stream (opt-in).
         // ffmpeg is handed a loopback relay, never `url`: it would re-resolve the name and follow
         // redirects on its own (see `resync.rs`). The relay follows the redirect chain here, before
@@ -1140,7 +1144,7 @@ async fn sync_and_cache(
             Err(e) => Err(e),
         };
         match aligned {
-            Ok(s) => Some(s),
+            Ok(s) => Some((s.body, Some(s.shift_ms))),
             Err(e) => {
                 if SYNC_FAILED.allow() {
                     eprintln!("sync: resync of {what} failed: {e}");
@@ -1165,7 +1169,7 @@ async fn sync_and_cache(
                     result
                 };
                 match aligned {
-                    Ok(s) => Some(s),
+                    Ok(s) => Some((s, None)),
                     Err(e) => {
                         if SYNC_FAILED.allow() {
                             eprintln!("sync: aligning {what} to {r} failed: {e}");
@@ -1198,10 +1202,15 @@ async fn sync_and_cache(
     match synced {
         // The alignment happened: this body IS the answer to this key. `tier_label` says which step
         // of the ladder produced it.
-        Some(body) => {
+        Some((body, offset_ms)) => {
+            let offset_key = offset_ms.map(|_| subtitle_offset_key(&cache_key));
             state.cache.put(cache_key, body.clone(), CACHE_TTL);
+            if let (Some(offset_key), Some(offset_ms)) = (offset_key, offset_ms) {
+                state.cache.put(offset_key, offset_ms.to_string(), CACHE_TTL);
+            }
             log_serve(state, log, "served", tier_label, None, "miss", Some(&body));
-            httputil::add_timing(httputil::srt(body), &sync_timing())
+            let resp = with_subtitle_offset(httputil::srt(body), offset_ms);
+            httputil::add_timing(resp, &sync_timing())
         }
         // Asked for and didn't happen. The unaligned body stands in, and is NOT written to
         // `cache_key` — caching it there made one broken afternoon permanent, since the URL is
@@ -1240,12 +1249,32 @@ fn retained_sync_target(
     target.or_else(|| cached_translation(state, translated_body_key?).map(|body| body.srt))
 }
 
-fn sync_outcome(result: &Result<String, String>) -> SyncOutcome {
+fn sync_outcome<T>(result: &Result<T, String>) -> SyncOutcome {
     match result {
         Ok(_) => SyncOutcome::Completed,
         Err(e) if e.ends_with(" timed out") => SyncOutcome::TimedOut,
         Err(_) => SyncOutcome::Failed,
     }
+}
+
+const X_DEN_SUBTITLE_OFFSET_MS: &str = "x-den-subtitle-offset-ms";
+
+fn subtitle_offset_key(cache_key: &str) -> String {
+    format!("subtitle-offset-ms:{cache_key}")
+}
+
+fn with_subtitle_offset(mut resp: Response<Body>, offset_ms: Option<i64>) -> Response<Body> {
+    if let Some(offset_ms) = offset_ms {
+        if let Ok(value) = HeaderValue::from_str(&offset_ms.to_string()) {
+            resp.headers_mut().insert(X_DEN_SUBTITLE_OFFSET_MS, value);
+        }
+    }
+    resp
+}
+
+fn with_cached_subtitle_offset(state: &AppState, cache_key: &str, resp: Response<Body>) -> Response<Body> {
+    let offset_ms = state.cache.get(&subtitle_offset_key(cache_key)).and_then(|v| v.parse().ok());
+    with_subtitle_offset(resp, offset_ms)
 }
 
 /// Fetch a subtitle's SRT, cached by file id (the raw, un-synced text — reused as a sync input).
@@ -2187,6 +2216,7 @@ pub async fn handle_translate(
                 true => httputil::degraded(httputil::srt_provisional(settled), "upstream_unavailable"),
                 false => httputil::srt(settled),
             };
+            let resp = with_cached_subtitle_offset(state, &cache_key, resp);
             return httputil::add_timing(resp, CACHE_HIT);
         }
         CACHE_HIT.to_string()
@@ -3050,6 +3080,15 @@ mod id_tests {
 mod sync_fallback_tests {
     use super::*;
     use hyper::header::CACHE_CONTROL;
+
+    #[test]
+    fn tier2_offset_is_exposed_as_response_metadata() {
+        let response = with_subtitle_offset(httputil::srt("x".into()), Some(-5_880));
+        assert_eq!(response.headers().get(X_DEN_SUBTITLE_OFFSET_MS).unwrap(), "-5880");
+
+        let response = with_subtitle_offset(httputil::srt("x".into()), None);
+        assert!(response.headers().get(X_DEN_SUBTITLE_OFFSET_MS).is_none());
+    }
 
     /// The two response shapes must differ in the one way that matters: `immutable` tells a client
     /// never to come back, which is a year of an out-of-sync subtitle if the body is a stand-in.
