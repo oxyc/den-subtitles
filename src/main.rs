@@ -202,7 +202,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
         }
         "subtitle" => {
             // /<config>/subtitle/<file_id>.(srt|vtt)[?ref=<id>|?resync=<stream-url>][&lang=<code>]
-            //   [&sparse=1][&ep=<imdb>:<season>:<episode>][&dub=1]
+            //   [&resync_key=<sha256>][&sparse=1][&ep=<imdb>:<season>:<episode>][&dub=1]
             let file = segs.get(2).copied().unwrap_or("");
             let (stem, want_vtt) = split_subtitle_format(file);
             match stem.and_then(|n| n.parse::<i64>().ok()) {
@@ -210,6 +210,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                     let query = parts.uri.query().unwrap_or("");
                     let ref_id = query_get(query, "ref").and_then(|v| v.parse().ok());
                     let resync = query_get(query, "resync");
+                    let resync_key = query_get(query, "resync_key");
                     let lang = query_get(query, "lang");
                     // The caller's own last resort: it has already established nothing better exists
                     // for this language (every other candidate was tried and refused), so a real but
@@ -226,6 +227,7 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                         file_id,
                         ref_id,
                         resync,
+                        resync_key,
                         lang.as_deref(),
                         want_vtt,
                         allow_sparse,
@@ -268,9 +270,19 @@ async fn route(state: &Arc<AppState>, parts: &hyper::http::request::Parts) -> Re
                 return httputil::not_found();
             };
             let resync = query_get(parts.uri.query().unwrap_or(""), "resync");
-            let resp =
-                addon::handle_translate(state, &parts.headers, config, id, extra, lang, want_json, resync)
-                    .await;
+            let resync_key = query_get(parts.uri.query().unwrap_or(""), "resync_key");
+            let resp = addon::handle_translate(
+                state,
+                &parts.headers,
+                config,
+                id,
+                extra,
+                lang,
+                want_json,
+                resync,
+                resync_key,
+            )
+            .await;
             if want_vtt {
                 httputil::to_vtt(resp, &parts.headers).await
             } else {

@@ -814,6 +814,7 @@ pub async fn handle_subtitle_file(
     file_id: i64,
     ref_id: Option<i64>,
     resync_url: Option<String>,
+    resync_key: Option<String>,
     lang: Option<&str>,
     want_vtt: bool,
     allow_sparse: bool,
@@ -837,8 +838,10 @@ pub async fn handle_subtitle_file(
         }
     });
     let ref_id = vetted_ref(file_id, ref_id);
+    let install_scope = cfg.iid.as_deref().unwrap_or(config);
+    let resync_cache_identity = resync_cache_identity(install_scope, &resync_url, resync_key);
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
-    let cache_key = sync_cache_key(&os_base_key(file_id), &resync_url, ref_id);
+    let cache_key = sync_cache_key(&os_base_key(file_id), &resync_cache_identity, ref_id);
     let settled_etag = settled_subtitle_etag(&cache_key);
     let conditional_etag = match want_vtt {
         true => httputil::vtt_etag(&settled_etag),
@@ -1662,6 +1665,24 @@ fn sync_cache_key(base: &str, resync_url: &Option<String>, ref_id: Option<i64>) 
     }
 }
 
+/// Stable Tier-2 cache identity supplied by Den, scoped to the install that owns the scout ticket.
+/// Den hashes its release identity (info-hash, then filename), so rotating `/p/` tickets for the
+/// same encode converge without putting a release name in a URL. The install scope prevents a
+/// caller with another valid configuration from deliberately filling someone else's key. New
+/// configs use their durable install id; legacy configs fall back to their full config blob.
+/// Invalid/absent keys retain the old exact-target behavior for older clients.
+fn resync_cache_identity(
+    install_scope: &str,
+    resync_url: &Option<String>,
+    requested: Option<String>,
+) -> Option<String> {
+    let url = resync_url.as_ref()?;
+    let stable = requested.filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    stable
+        .map(|key| format!("stable:v1:{:016x}:{}", short_hash(install_scope), key.to_ascii_lowercase()))
+        .or_else(|| Some(url.clone()))
+}
+
 /// Key of the "this translation failed recently" marker: title-scoped, and answerable before any
 /// network call. That is the whole point of it — a whole film's LLM bill must not be re-paid on the
 /// app's next tap, and the app's own `.json`-then-`.srt` flow retries once by design.
@@ -2043,6 +2064,7 @@ pub async fn handle_translate(
     lang: &str,
     want_json: bool,
     resync_url: Option<String>,
+    resync_key: Option<String>,
 ) -> Response<Body> {
     let Some(cfg) = state.decode_config(config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
@@ -2189,10 +2211,12 @@ pub async fn handle_translate(
             None
         }
     });
+    let install_scope = cfg.iid.as_deref().unwrap_or(config);
+    let resync_cache_identity = resync_cache_identity(install_scope, &resync_url, resync_key);
     // The translated body inherits its source's timing, so it needs the same Tier-1 correction the
     // source itself would get from the picker.
     let ref_id = align_for(cached_body.as_ref().and_then(|body| body.source));
-    let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
+    let cache_key = sync_cache_key(&body_key, &resync_cache_identity, ref_id);
 
     // Read once, not twice. Asking again on the settled path could miss what the first read saw —
     // LRU eviction and TTL expiry both happen between two reads — and answer "not translated" for a
@@ -2507,7 +2531,7 @@ pub async fn handle_translate(
         // binary on an alignment that is a no-op by construction — and file the result under a key
         // the next request, now pinned, never asks for.
         let ref_id = align_for(used_source);
-        let cache_key = sync_cache_key(&body_key, &resync_url, ref_id);
+        let cache_key = sync_cache_key(&body_key, &resync_cache_identity, ref_id);
         // Do not wait for sync admission while retaining the translated film. Every translated body
         // is durable under `body_key` before it reaches here, so release this request's copy, reserve
         // the appropriate tier, and reload only after it is inside the bounded retention set.
@@ -3044,6 +3068,26 @@ mod tests {
         let both = sync_cache_key(&os_base_key(5), &Some("http://host/s.mkv".into()), Some(9));
         assert_eq!(both, resynced);
     }
+
+    #[test]
+    fn a_stable_release_key_survives_ticket_rotation_but_stays_install_scoped() {
+        let release = "a".repeat(64);
+        let ticket_a = Some("https://scout.example/p/ticket-a".into());
+        let ticket_b = Some("https://scout.example/p/ticket-b".into());
+        let a = resync_cache_identity("install-a", &ticket_a, Some(release.clone())).unwrap();
+        let b = resync_cache_identity("install-a", &ticket_b, Some(release.clone())).unwrap();
+        assert_eq!(sync_cache_key("os:5", &Some(a), None), sync_cache_key("os:5", &Some(b.clone()), None));
+
+        let other_install = resync_cache_identity("install-b", &ticket_b, Some(release)).unwrap();
+        assert_ne!(
+            sync_cache_key("os:5", &Some(other_install), None),
+            sync_cache_key("os:5", &Some(b), None),
+        );
+
+        let invalid = resync_cache_identity("install-a", &ticket_b, Some("not-a-digest".into()));
+        assert_eq!(invalid, ticket_b, "older or malformed clients stay keyed by their exact target");
+        assert!(resync_cache_identity("install-a", &None, Some("a".repeat(64))).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -3374,6 +3418,7 @@ mod translate_retry_tests {
                 "French",
                 false,
                 None,
+                None,
             )
             .await;
             assert_eq!(resp.status(), StatusCode::OK, "{name}");
@@ -3666,9 +3711,18 @@ mod translate_retry_tests {
             translate_fail_key(&config, "tt0111161", None, None, &translate::canonical_lang("Swedish"), llm);
         state.cache.put(format!("{SYNCFAIL}{cache_key}"), "1".into(), SYNC_RETRY_TTL);
 
-        let resp =
-            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
-                .await;
+        let resp = handle_translate(
+            &state,
+            &HeaderMap::new(),
+            &config,
+            "tt0111161",
+            "",
+            "Swedish",
+            false,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         // Still a 502, and it says how much of the backoff is left.
         let wait: u64 =
@@ -3696,9 +3750,18 @@ mod translate_retry_tests {
         let now = std::time::SystemTime::now();
         state.cache.put(quota_key(&config, now), DAILY_TRANSLATIONS.to_string(), QUOTA_TTL);
 
-        let resp =
-            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
-                .await;
+        let resp = handle_translate(
+            &state,
+            &HeaderMap::new(),
+            &config,
+            "tt0111161",
+            "",
+            "Swedish",
+            false,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let header = |name: &str| resp.headers().get(name).expect(name).to_str().unwrap().to_string();
         let wait: u64 = header("retry-after").parse().unwrap();
@@ -4367,6 +4430,7 @@ mod translate_retry_tests {
             None,
             None,
             None,
+            None,
             false,
             false,
             None,
@@ -4465,7 +4529,8 @@ mod translate_retry_tests {
         let config = config_segment();
         let long = "x".repeat(MAX_LANG + 1);
         let resp =
-            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", &long, false, None).await;
+            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", &long, false, None, None)
+                .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an over-long language was accepted");
 
         // Nothing was written for it — not the body key, and not the failure marker either.
@@ -4476,9 +4541,18 @@ mod translate_retry_tests {
         assert_eq!(files, 0, "an invalid request left {files} cache files behind");
 
         // A real language still works its way through to the upstream check.
-        let resp =
-            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
-                .await;
+        let resp = handle_translate(
+            &state,
+            &HeaderMap::new(),
+            &config,
+            "tt0111161",
+            "",
+            "Swedish",
+            false,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "a valid language must not be refused");
     }
 
@@ -4508,9 +4582,18 @@ mod translate_retry_tests {
         };
 
         // Finnish is a different job: it must get past the marker and fail on its own merits.
-        let resp =
-            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Finnish", false, None)
-                .await;
+        let resp = handle_translate(
+            &state,
+            &HeaderMap::new(),
+            &config,
+            "tt0111161",
+            "",
+            "Finnish",
+            false,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let finnish = body_of(resp).await;
         assert!(
@@ -4519,9 +4602,18 @@ mod translate_retry_tests {
         );
 
         // Swedish, the marked one, is still short-circuited.
-        let resp =
-            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", "Swedish", false, None)
-                .await;
+        let resp = handle_translate(
+            &state,
+            &HeaderMap::new(),
+            &config,
+            "tt0111161",
+            "",
+            "Swedish",
+            false,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let swedish = body_of(resp).await;
         assert!(
