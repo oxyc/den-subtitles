@@ -14,6 +14,7 @@ pub struct Config {
     /// headers when unset.
     pub public_base_url: Option<String>,
     pub alass: String,
+    pub ffmpeg: String,
     /// Sealed config-in-URL (den-scout/docs/SEALED-CONFIG.md). `config_key` = current X25519 private key
     /// (base64); `config_keys_prev` = comma-separated prior keys (rotation). Empty → sealed URLs disabled.
     pub config_key: String,
@@ -69,6 +70,7 @@ impl Config {
                 .unwrap_or(256 * 1024 * 1024),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             alass: env_opt("ALASS_PATH").unwrap_or_else(|| "alass".to_string()),
+            ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
             config_key: env_opt("CONFIG_KEY").unwrap_or_default(),
             config_keys_prev: env_opt("CONFIG_KEYS_PREV").unwrap_or_default(),
             revocation: crate::userconfig::Revocation::from_env(

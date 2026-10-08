@@ -63,11 +63,10 @@ CASES = [
     Case("different-cut-parity", 600, offset_ms=2_000, cut_at=300, cut_ms=30_000),
 ]
 
-# Tier 2's job: a two-hour film whose subtitle is 5 s late and a further 30 s late after a mid-film
-# cut. The soundtrack speaks exactly the reference cues, so the truth is `reference_times`. Cues
-# start about 2 s apart, so 3,600 of them fill two hours: denser dialogue than a real film carries,
-# which gives the split-aware alignment more to hold, not less.
-TIER2_CASE = Case("audio-tier2", 3_600, offset_ms=5_000, cut_at=1_800, cut_ms=30_000)
+# Tier 2's bounded sample must recover a constant 5 s offset from a two-hour film. The soundtrack
+# speaks exactly the reference cues, so the truth is `reference_times`. A partial-audio alignment
+# deliberately does not promise to repair a different cut or drift later in the file.
+TIER2_CASE = Case("audio-tier2", 3_600, offset_ms=5_000)
 SOUNDTRACK = Path("/usr/local/share/den-subtitles/soundtrack.mkv")
 SAMPLE_RATE = 16_000
 
@@ -501,12 +500,11 @@ def cgroup_file_and_anon() -> tuple[int, int]:
 
 
 def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int]:
-    """Measure the container at admission's other maximum: one audio Tier-2 job and one Tier-1 job.
+    """Measure admission's other maximum: partial-audio Tier 2 beside one Tier-1 job.
 
-    Run in a fresh container, so `memory.peak` covers only this load. alass is handed a loopback URL
-    exactly as `sync_to_audio` hands it the relay, and spawns ffprobe and ffmpeg as its own children,
-    which is how they are charged in production. Tier-1 jobs are restarted back to back until Tier 2
-    finishes, so one is resident at every point of the audio decode and the alignment after it.
+    Run in a fresh container, so `memory.peak` covers only this load. ffmpeg extracts the same
+    four-minute window production uses from a loopback relay, then alass aligns only matching cues.
+    Tier-1 jobs restart back to back so one is resident throughout extraction and alignment.
     """
     limit = cgroup_limit()
     long_film = next(case for case in CASES if case.name == "long-film")
@@ -515,8 +513,15 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
     write_srt(tier1_ref, ref_times, texts=ref_texts)
     write_srt(tier1_in, target_times(long_film, target_truth), texts=target_texts)
     truth = reference_times(TIER2_CASE)
+    target = target_times(TIER2_CASE, truth)
+    sample_indices = [i for i, (start, _) in enumerate(target) if start < 240_000]
+    sample_truth = [truth[i] for i in sample_indices]
+    sample_target = [target[i] for i in sample_indices]
+    all_texts = [f"cue {i}: deterministic dialogue {i * 17 % 101}" for i in range(1, len(target) + 1)]
+    sample_texts = [all_texts[i] for i in sample_indices]
     tier2_in, tier2_out = root / "tier2-in.srt", root / "tier2-out.srt"
-    tier2_texts = write_srt(tier2_in, target_times(TIER2_CASE, truth))
+    tier2_audio = root / "tier2-sample.wav"
+    write_srt(tier2_in, sample_target, texts=sample_texts)
     tier1_command = [alass, "--no-split", str(tier1_ref), str(tier1_in), str(root / "tier1-out.srt")]
 
     handler = type("Relay", (MediaRelay,), {"media": soundtrack})
@@ -530,14 +535,37 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
         0,
     )
     tier2 = tier1 = None
+    stage = "extract"
     try:
         with resident_service(root, alass), open(root / "tier2.err", "w+") as tier2_err:
             started = time.perf_counter()
             tier2 = subprocess.Popen(
-                [alass, url, str(tier2_in), str(tier2_out)], stdout=subprocess.DEVNULL, stderr=tier2_err
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", "0.000",
+                    "-i", url, "-t", "240", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+                    "-c:a", "pcm_s16le", "-y", str(tier2_audio),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=tier2_err,
             )
             checked: set[int] = set()
-            while tier2.poll() is None:
+            while True:
+                if tier2.poll() is not None:
+                    if tier2.returncode:
+                        tier2_err.seek(0)
+                        raise RuntimeError(f"Tier-2 {stage} failed: {tier2_err.read()[-500:]}")
+                    if stage == "extract":
+                        stage = "align"
+                        tier2 = subprocess.Popen(
+                            [
+                                alass, "--no-split", "--disable-fps-guessing", str(tier2_audio),
+                                str(tier2_in), str(tier2_out),
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=tier2_err,
+                        )
+                        continue
+                    break
                 if tier1 is None or tier1.poll() is not None:
                     if tier1 is not None:
                         _, stderr = tier1.communicate()
@@ -554,7 +582,7 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
                 tree = process_tree(os.getpid())
                 stats["tree_kb"] = max(stats["tree_kb"], sum(rss for _, _, rss in tree))
                 for pid, name, rss in tree:
-                    if pid == tier2.pid:
+                    if pid == tier2.pid and stage == "align":
                         stats["tier2_alass_kb"] = max(stats["tier2_alass_kb"], rss)
                     elif pid == tier1.pid:
                         stats["tier1_alass_kb"] = max(stats["tier1_alass_kb"], rss)
@@ -571,9 +599,6 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
             stats["memory_peak"] = cgroup_value("memory.peak")
             stats["peak"] = max(stats["sampled"], cgroup_value("memory.current"), stats["memory_peak"])
             stats["limit"] = limit
-            if tier2.returncode:
-                tier2_err.seek(0)
-                raise RuntimeError(f"Tier-2 alass failed: {tier2_err.read()[-500:]}")
     finally:
         for proc in (tier1, tier2):
             if proc is not None and proc.poll() is None:
@@ -582,9 +607,9 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
         relay.shutdown()
 
     aligned, texts = parse(tier2_out)
-    if texts != tier2_texts:
+    if texts != sample_texts:
         raise AssertionError("Tier 2 changed cue text/order")
-    stats["p95_ms"] = round(percentile(errors(aligned, truth), 0.95))
+    stats["p95_ms"] = round(percentile(errors(aligned, sample_truth), 0.95))
     return stats
 
 
@@ -718,12 +743,12 @@ def tier2_gate(alass: str, soundtrack: Path, gate_bytes: int) -> int:
         f"RESOURCE tier2_wall_ms={stats['wall_ms']} tier1_runs_alongside={stats['tier1_runs']} "
         f"tier2_p95_ms={stats['p95_ms']}"
     )
-    # The measurement is only of Tier 2 if its ffmpeg decode ran, in this cgroup, next to Tier 1.
+    # The measurement is only of Tier 2 if its ffmpeg extraction ran in this cgroup, next to Tier 1.
     if not stats["ffmpeg_seen"] or stats["foreign_cgroup"]:
-        failed.append("Tier-2 gate did not observe alass's ffmpeg child inside this cgroup")
+        failed.append("Tier-2 gate did not observe ffmpeg extraction inside this cgroup")
     if not stats["tier1_runs"]:
         failed.append("no Tier-1 job completed alongside Tier 2")
-    # Tier 2 is split-aware: it must repair both the offset and the mid-film cut against the audio.
+    # Partial-audio Tier 2 must recover the constant offset from its bounded sample.
     if stats["p95_ms"] > 250:
         failed.append(f"Tier-2 alignment p95 {stats['p95_ms']} ms exceeds 250 ms")
     if stats["peak"] > gate_bytes:

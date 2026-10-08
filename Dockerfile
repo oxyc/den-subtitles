@@ -57,7 +57,8 @@ RUN useradd --system --uid 65532 --user-group --create-home --home-dir /home/non
 WORKDIR /app
 ENV PORT=8093 \
     CACHE_DIR=/cache \
-    ALASS_PATH=/usr/local/bin/alass
+    ALASS_PATH=/usr/local/bin/alass \
+    FFMPEG_PATH=/usr/bin/ffmpeg
 VOLUME ["/cache"]
 EXPOSE 8093
 

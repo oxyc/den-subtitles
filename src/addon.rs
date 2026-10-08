@@ -1037,7 +1037,7 @@ async fn sync_and_cache(
     // the source pick there is a separate decision (`translation_source`), untouched by this fix.
     sparse_fallback: bool,
 ) -> Response<Body> {
-    // A sync that just failed is not retried on every request — the binary spawn, or a 90s alass
+    // A sync that just failed is not retried on every request — a binary spawn, or a 90s Tier-2
     // timeout, would be paid again per request. The marker is separate from `cache_key` so that key
     // never holds anything but a settled answer.
     //
@@ -1056,7 +1056,7 @@ async fn sync_and_cache(
     let mine_marker = format!("{SYNCFAIL}{:016x}:{cache_key}", os_download_identity(client));
     let backed_off = || state.cache.get(&shared_marker).is_some() || state.cache.get(&mine_marker).is_some();
     // One tier binary per key at a time. Concurrent requests for the same alignment were each
-    // spawning their own — a 90s alass run against the same stream, on a runtime with one thread —
+    // spawning their own — a 90s Tier-2 run against the same stream, on a runtime with one thread —
     // and the scratch-file tag below only made that safe, never rare.
     let _flight = if wanted_sync {
         let guard = match flight {
@@ -1123,8 +1123,8 @@ async fn sync_and_cache(
     // markers above. Only the reference download can set it.
     let mut mine_only = false;
     let synced: Option<String> = if let Some(url) = resync_url {
-        // Tier 2 — audio VAD against the playing stream (opt-in; alass pulls the audio via ffmpeg).
-        // alass is handed a loopback relay, never `url`: ffmpeg would re-resolve the name and follow
+        // Tier 2 — partial audio VAD against the playing stream (opt-in).
+        // ffmpeg is handed a loopback relay, never `url`: it would re-resolve the name and follow
         // redirects on its own (see `resync.rs`). The relay follows the redirect chain here, before
         // the permit, for the reason Tier 1 fetches its reference first — it is network work.
         let aligned = match resync::Relay::open(&url, &state.cfg.scout_origins, &state.cfg.scout_aliases)
@@ -3186,6 +3186,7 @@ mod translate_retry_tests {
             cache_max_bytes: 1 << 20,
             public_base_url: None,
             alass: "alass".into(),
+            ffmpeg: "ffmpeg".into(),
             config_key: String::new(),
             config_keys_prev: String::new(),
             metrics_token: String::new(),
@@ -4512,6 +4513,7 @@ mod decision_log_tests {
             cache_max_bytes: 1 << 20,
             public_base_url: None,
             alass: "alass".into(),
+            ffmpeg: "ffmpeg".into(),
             config_key: String::new(),
             config_keys_prev: String::new(),
             metrics_token: String::new(),
