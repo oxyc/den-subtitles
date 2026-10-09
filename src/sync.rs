@@ -5,7 +5,7 @@
 //!     (see `opensubtitles.rs`) floats those to the top; the sync tiers below only run for the rest.
 //!   * Tier 1 — reference alignment (fast, no audio): align the target subtitle against a subtitle
 //!     we trust to be in sync (e.g. an English hash-match). Sub-second, runs on every result.
-//!   * Tier 2 — partial audio VAD (opt-in): extract a bounded four-minute window, align it with
+//!   * Tier 2 — partial audio VAD (opt-in): extract a bounded 90-second window, align it with
 //!     `alass`, validate that it found one stable offset, then apply that offset to the whole file.
 //!     Costs a stream fetch, so it's a per-title user action, not automatic.
 //!
@@ -42,7 +42,10 @@ pub struct AudioSync {
 const TIER1_BUDGET: Duration = Duration::from_secs(20);
 const TIER2_EXTRACT_BUDGET: Duration = Duration::from_secs(70);
 const TIER2_ALIGN_BUDGET: Duration = Duration::from_secs(20);
-const TIER2_SAMPLE_SECONDS: u64 = 240;
+// A four-minute window still meant reading roughly 500 MiB from a 6 GiB, 43-minute Blu-ray and
+// repeatedly exhausted the extraction budget. Ninety seconds keeps enough dialogue for constant-
+// offset VAD while cutting the remote media read by 62.5%.
+const TIER2_SAMPLE_SECONDS: u64 = 90;
 const TIER2_MIN_SAMPLE_CUES: usize = 5;
 const TIER2_MAX_SHIFT_MS: i64 = 120_000;
 const TIER2_SAMPLE_LEAD_MS: u64 = 30_000;
@@ -278,28 +281,45 @@ fn require_success(run: Result<std::process::ExitStatus, String>, step: &str) ->
 
 fn partial_audio_sample(cues: &[crate::srt::Cue]) -> Result<(u64, Vec<crate::srt::Cue>), String> {
     let window_ms = TIER2_SAMPLE_SECONDS * 1000;
+    // Prefer the most dialogue-dense window. A short sample chosen merely because it was the first
+    // one with five cues can be mostly intro/title-card silence, which gives VAD little to align.
+    // Sort once, then slide both bounds forward. Re-filtering every candidate against every cue is
+    // quadratic on a hostile subtitle; this stays O(n log n), including the sort.
+    let mut ordered = cues.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|cue| cue.start);
     let starts =
-        std::iter::once(0).chain(cues.iter().map(|cue| cue.start.saturating_sub(TIER2_SAMPLE_LEAD_MS)));
+        std::iter::once(0).chain(ordered.iter().map(|cue| cue.start.saturating_sub(TIER2_SAMPLE_LEAD_MS)));
+    let (mut left, mut right) = (0, 0);
+    let mut best: Option<(u64, usize, usize)> = None;
     for start in starts {
-        let end = start.saturating_add(window_ms);
-        let in_window = cues.iter().filter(|cue| cue.start >= start && cue.start < end).collect::<Vec<_>>();
-        if in_window.len() < TIER2_MIN_SAMPLE_CUES {
-            continue;
+        while left < ordered.len() && ordered[left].start < start {
+            left += 1;
         }
-        let sample = in_window
-            .into_iter()
-            .enumerate()
-            .map(|(index, cue)| {
-                let mut cue = cue.clone();
-                cue.index = index as u32 + 1;
-                cue.start -= start;
-                cue.end = cue.end.saturating_sub(start);
-                cue
-            })
-            .collect();
-        return Ok((start, sample));
+        right = right.max(left);
+        let end = start.saturating_add(window_ms);
+        while right < ordered.len() && ordered[right].start < end {
+            right += 1;
+        }
+        if best.is_none_or(|(_, best_left, best_right)| right - left > best_right - best_left) {
+            best = Some((start, left, right));
+        }
     }
-    Err("no four-minute window contains enough subtitle cues for partial audio sync".into())
+    let Some((start, left, right)) = best.filter(|(_, left, right)| right - left >= TIER2_MIN_SAMPLE_CUES)
+    else {
+        return Err("no 90-second window contains enough subtitle cues for partial audio sync".into());
+    };
+    let sample = ordered[left..right]
+        .iter()
+        .enumerate()
+        .map(|(index, cue)| {
+            let mut cue = (*cue).clone();
+            cue.index = index as u32 + 1;
+            cue.start -= start;
+            cue.end = cue.end.saturating_sub(start);
+            cue
+        })
+        .collect();
+    Ok((start, sample))
 }
 
 fn partial_audio_shift(original: &[crate::srt::Cue], aligned: &[crate::srt::Cue]) -> Result<i64, String> {
@@ -535,8 +555,8 @@ mod tests {
         let full = (1..=6)
             .map(|index| crate::srt::Cue {
                 index,
-                start: if index == 6 { 600_000 } else { index as u64 * 20_000 },
-                end: if index == 6 { 601_000 } else { index as u64 * 20_000 + 1_000 },
+                start: if index == 6 { 600_000 } else { index as u64 * 15_000 },
+                end: if index == 6 { 601_000 } else { index as u64 * 15_000 + 1_000 },
                 text: format!("cue {index}"),
             })
             .collect::<Vec<_>>();
@@ -570,7 +590,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.shift_ms, -5_000);
         let shifted = crate::srt::parse(&out.body);
-        assert_eq!(shifted[0].start, 15_000);
+        assert_eq!(shifted[0].start, 10_000);
         assert_eq!(shifted[5].start, 595_000, "the sampled offset must be applied to later cues too");
         assert!(!dir.join("tag-t2-sample-target.srt").exists());
         assert!(!dir.join("tag-t2-sample.wav").exists());
@@ -606,13 +626,13 @@ mod tests {
         let cues = (1..=5)
             .map(|index| crate::srt::Cue {
                 index: 7,
-                start: 600_000 + index as u64 * 20_000,
-                end: 601_000 + index as u64 * 20_000,
+                start: 600_000 + index as u64 * 10_000,
+                end: 601_000 + index as u64 * 10_000,
                 text: "x".into(),
             })
             .collect::<Vec<_>>();
         let (start, sample) = partial_audio_sample(&cues).unwrap();
-        assert_eq!(start, 590_000);
+        assert_eq!(start, 580_000, "ties should keep the earliest window and its full audio lead-in");
         assert_eq!(sample[0].start, 30_000);
         assert_eq!(sample.iter().map(|cue| cue.index).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
     }

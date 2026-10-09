@@ -503,7 +503,7 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
     """Measure admission's other maximum: partial-audio Tier 2 beside one Tier-1 job.
 
     Run in a fresh container, so `memory.peak` covers only this load. ffmpeg extracts the same
-    four-minute window production uses from a loopback relay, then alass aligns only matching cues.
+    90-second window production uses from a loopback relay, then alass aligns only matching cues.
     Tier-1 jobs restart back to back so one is resident throughout extraction and alignment.
     """
     limit = cgroup_limit()
@@ -514,7 +514,7 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
     write_srt(tier1_in, target_times(long_film, target_truth), texts=target_texts)
     truth = reference_times(TIER2_CASE)
     target = target_times(TIER2_CASE, truth)
-    sample_indices = [i for i, (start, _) in enumerate(target) if start < 240_000]
+    sample_indices = [i for i, (start, _) in enumerate(target) if start < 90_000]
     sample_truth = [truth[i] for i in sample_indices]
     sample_target = [target[i] for i in sample_indices]
     all_texts = [f"cue {i}: deterministic dialogue {i * 17 % 101}" for i in range(1, len(target) + 1)]
@@ -542,7 +542,7 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
             tier2 = subprocess.Popen(
                 [
                     "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", "0.000",
-                    "-i", url, "-t", "240", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+                    "-i", url, "-t", "90", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
                     "-c:a", "pcm_s16le", "-y", str(tier2_audio),
                 ],
                 stdout=subprocess.DEVNULL,
