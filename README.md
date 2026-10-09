@@ -61,10 +61,13 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   at 2 MiB. The PR corpus gates timing parity against `ffsubsync` across cross-language split/merged,
   missing/extra-cue, malformed, drift, sparse and long-track fixtures without shipping `ffsubsync`.
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
-  non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon extracts a
-  dialogue-dense 90-second mono audio window, runs constant-offset `alass` against only the matching
-  cues, and applies the validated offset to the whole subtitle. This keeps the job inside the request budget;
-  unlike the old full-file alignment, it deliberately does not repair mid-file cuts or drift. The
+  non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon extracts
+  one dialogue-dense 80-second mono audio batch and independently aligns each 40-second half. It
+  accepts the offset when those probes agree within 250 ms; disagreement or a failed probe fetches
+  a distant 160-second batch with two 80-second probes. Thus the normal path reads 80 seconds while
+  difficult tracks can use exactly four minutes of total evidence inside a 90-second wall-clock
+  ceiling. The confirmed offset is applied to the whole subtitle. Unlike the old full-file
+  alignment, this deliberately does not repair mid-file cuts or drift. The
   app then swaps in the re-synced track. Den also supplies a hashed release identity as
   `resync_key`; successful results survive rotating scout play tickets and are retained for ten
   years (effectively until the bounded cache needs their space), while remaining scoped to that
@@ -291,10 +294,12 @@ service resident and three real Tier-1 aligners running, it forces 112 MiB resid
 64 MiB cache with allocator overhead plus every running/prepared tier's capped bodies and buffers. The
 gate requires total cgroup usage to stay below 400 MiB, preserving at least 112 MiB of headroom.
 A second run in a fresh 512 MiB container (`--tier2-memory-gate`) measures admission's other
-maximum under the same ceiling: one real partial-audio Tier-2 job — ffmpeg extracts 90 seconds
-from a two-hour synthetic 5.1 soundtrack over a loopback URL, then `alass --no-split` aligns the
-matching cues — beside back-to-back Tier-1 jobs, the service and the same 112 MiB. It also requires
-that ffmpeg ran in the cgroup and that Tier 2 recovered the fixture's constant offset within 250 ms.
+maximum under the same ceiling: one real partial-audio Tier-2 fast path — ffmpeg extracts one
+80-second batch from a two-hour synthetic 5.1 soundtrack over a loopback URL, then
+`alass --no-split` independently aligns each 40-second half's matching cues — beside back-to-back
+Tier-1 jobs, the service and the same 112 MiB. It also requires that ffmpeg ran in the cgroup, that
+both probes recovered the fixture's constant offset within 250 ms, and that their measured offsets
+agree within 250 ms.
 
 ## Deploy
 
