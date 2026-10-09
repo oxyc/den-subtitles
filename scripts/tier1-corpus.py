@@ -502,8 +502,8 @@ def cgroup_file_and_anon() -> tuple[int, int]:
 def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int]:
     """Measure admission's other maximum: partial-audio Tier 2 beside one Tier-1 job.
 
-    Run in a fresh container, so `memory.peak` covers only this load. ffmpeg extracts the same
-    90-second window production uses from a loopback relay, then alass aligns only matching cues.
+    Run in a fresh container, so `memory.peak` covers only this load. ffmpeg extracts one 80-second
+    batch like production's early-success path, then alass aligns each 40-second half's matching cues.
     Tier-1 jobs restart back to back so one is resident throughout extraction and alignment.
     """
     limit = cgroup_limit()
@@ -514,14 +514,24 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
     write_srt(tier1_in, target_times(long_film, target_truth), texts=target_texts)
     truth = reference_times(TIER2_CASE)
     target = target_times(TIER2_CASE, truth)
-    sample_indices = [i for i, (start, _) in enumerate(target) if start < 90_000]
-    sample_truth = [truth[i] for i in sample_indices]
-    sample_target = [target[i] for i in sample_indices]
     all_texts = [f"cue {i}: deterministic dialogue {i * 17 % 101}" for i in range(1, len(target) + 1)]
-    sample_texts = [all_texts[i] for i in sample_indices]
-    tier2_in, tier2_out = root / "tier2-in.srt", root / "tier2-out.srt"
-    tier2_audio = root / "tier2-sample.wav"
-    write_srt(tier2_in, sample_target, texts=sample_texts)
+    batch_start = 0
+    probe_seconds = 40
+    probe_starts = [batch_start, batch_start + probe_seconds * 1000]
+    probes = []
+    for probe, probe_start in enumerate(probe_starts):
+        indices = [
+            i for i, (start, _) in enumerate(target)
+            if probe_start <= start < probe_start + probe_seconds * 1000
+        ]
+        sample_truth = [(start - batch_start, end - batch_start) for i in indices for start, end in [truth[i]]]
+        sample_target = [(start - batch_start, end - batch_start) for i in indices for start, end in [target[i]]]
+        sample_texts = [all_texts[i] for i in indices]
+        tier2_in = root / f"tier2-{probe}-in.srt"
+        tier2_out = root / f"tier2-{probe}-out.srt"
+        write_srt(tier2_in, sample_target, texts=sample_texts)
+        probes.append((sample_truth, sample_target, sample_texts, tier2_in, tier2_out))
+    tier2_audio = root / "tier2-batch.wav"
     tier1_command = [alass, "--no-split", str(tier1_ref), str(tier1_in), str(root / "tier1-out.srt")]
 
     handler = type("Relay", (MediaRelay,), {"media": soundtrack})
@@ -535,19 +545,35 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
         0,
     )
     tier2 = tier1 = None
+    probe = 0
     stage = "extract"
+
+    def start_extract() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", f"{batch_start / 1000:.3f}",
+                "-i", url, "-t", str(probe_seconds * 2), "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "8000",
+                "-c:a", "pcm_s16le", "-y", str(tier2_audio),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=tier2_err,
+        )
+
+    def start_align(index: int) -> subprocess.Popen[bytes]:
+        _, _, _, tier2_in, tier2_out = probes[index]
+        return subprocess.Popen(
+            [
+                alass, "--no-split", "--disable-fps-guessing", str(tier2_audio),
+                str(tier2_in), str(tier2_out),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=tier2_err,
+        )
+
     try:
         with resident_service(root, alass), open(root / "tier2.err", "w+") as tier2_err:
             started = time.perf_counter()
-            tier2 = subprocess.Popen(
-                [
-                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-ss", "0.000",
-                    "-i", url, "-t", "90", "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
-                    "-c:a", "pcm_s16le", "-y", str(tier2_audio),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=tier2_err,
-            )
+            tier2 = start_extract()
             checked: set[int] = set()
             while True:
                 if tier2.poll() is not None:
@@ -556,16 +582,13 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
                         raise RuntimeError(f"Tier-2 {stage} failed: {tier2_err.read()[-500:]}")
                     if stage == "extract":
                         stage = "align"
-                        tier2 = subprocess.Popen(
-                            [
-                                alass, "--no-split", "--disable-fps-guessing", str(tier2_audio),
-                                str(tier2_in), str(tier2_out),
-                            ],
-                            stdout=subprocess.DEVNULL,
-                            stderr=tier2_err,
-                        )
+                        tier2 = start_align(probe)
                         continue
-                    break
+                    probe += 1
+                    if probe == len(probes):
+                        break
+                    tier2 = start_align(probe)
+                    continue
                 if tier1 is None or tier1.poll() is not None:
                     if tier1 is not None:
                         _, stderr = tier1.communicate()
@@ -606,10 +629,19 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
                 proc.wait()
         relay.shutdown()
 
-    aligned, texts = parse(tier2_out)
-    if texts != sample_texts:
-        raise AssertionError("Tier 2 changed cue text/order")
-    stats["p95_ms"] = round(percentile(errors(aligned, sample_truth), 0.95))
+    measured_offsets = []
+    probe_p95 = []
+    for sample_truth, sample_target, sample_texts, _, tier2_out in probes:
+        aligned, texts = parse(tier2_out)
+        if texts != sample_texts:
+            raise AssertionError("Tier 2 changed cue text/order")
+        probe_p95.append(round(percentile(errors(aligned, sample_truth), 0.95)))
+        measured_offsets.append(round(statistics.median(
+            aligned_start - target_start
+            for (aligned_start, _), (target_start, _) in zip(aligned, sample_target)
+        )))
+    stats["p95_ms"] = max(probe_p95)
+    stats["offset_spread_ms"] = max(measured_offsets) - min(measured_offsets)
     return stats
 
 
@@ -741,7 +773,7 @@ def tier2_gate(alass: str, soundtrack: Path, gate_bytes: int) -> int:
     )
     print(
         f"RESOURCE tier2_wall_ms={stats['wall_ms']} tier1_runs_alongside={stats['tier1_runs']} "
-        f"tier2_p95_ms={stats['p95_ms']}"
+        f"tier2_p95_ms={stats['p95_ms']} offset_spread_ms={stats['offset_spread_ms']}"
     )
     # The measurement is only of Tier 2 if its ffmpeg extraction ran in this cgroup, next to Tier 1.
     if not stats["ffmpeg_seen"] or stats["foreign_cgroup"]:
@@ -751,6 +783,8 @@ def tier2_gate(alass: str, soundtrack: Path, gate_bytes: int) -> int:
     # Partial-audio Tier 2 must recover the constant offset from its bounded sample.
     if stats["p95_ms"] > 250:
         failed.append(f"Tier-2 alignment p95 {stats['p95_ms']} ms exceeds 250 ms")
+    if stats["offset_spread_ms"] > 250:
+        failed.append(f"Tier-2 probe offsets disagree by {stats['offset_spread_ms']} ms")
     if stats["peak"] > gate_bytes:
         failed.append(
             f"Tier-2 mixed memory gate missed: total cgroup peak must stay <= "

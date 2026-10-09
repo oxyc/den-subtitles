@@ -50,7 +50,8 @@ pub struct AppState {
     /// How far a running translation has got, for the `.status` endpoint.
     pub progress: Progress,
     /// Tier binaries allowed to run at once. Partial-audio extraction and alignment together get up
-    /// to 90 seconds; the runtime has one thread and the container is a homelab box. The
+    /// to 90 seconds across progressive probes; the runtime has one thread and the container is a
+    /// homelab box. The
     /// single-flight map collapses duplicates of the SAME alignment, but distinct ones — twenty
     /// picker URLs, or a client naming twenty different `?ref=` values — are distinct keys and would
     /// all spawn.
