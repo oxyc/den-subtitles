@@ -62,8 +62,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   missing/extra-cue, malformed, drift, sparse and long-track fixtures without shipping `ffsubsync`.
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
   non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon extracts a
-  four-minute mono audio window, runs constant-offset `alass` against only the matching cues, and
-  applies the validated offset to the whole subtitle. This keeps the job inside the request budget;
+  dialogue-dense 90-second mono audio window, runs constant-offset `alass` against only the matching
+  cues, and applies the validated offset to the whole subtitle. This keeps the job inside the request budget;
   unlike the old full-file alignment, it deliberately does not repair mid-file cuts or drift. The
   app then swaps in the re-synced track. Den also supplies a hashed release identity as
   `resync_key`; successful results survive rotating scout play tickets and are retained for ten
@@ -291,7 +291,7 @@ service resident and three real Tier-1 aligners running, it forces 112 MiB resid
 64 MiB cache with allocator overhead plus every running/prepared tier's capped bodies and buffers. The
 gate requires total cgroup usage to stay below 400 MiB, preserving at least 112 MiB of headroom.
 A second run in a fresh 512 MiB container (`--tier2-memory-gate`) measures admission's other
-maximum under the same ceiling: one real partial-audio Tier-2 job — ffmpeg extracts four minutes
+maximum under the same ceiling: one real partial-audio Tier-2 job — ffmpeg extracts 90 seconds
 from a two-hour synthetic 5.1 soundtrack over a loopback URL, then `alass --no-split` aligns the
 matching cues — beside back-to-back Tier-1 jobs, the service and the same 112 MiB. It also requires
 that ffmpeg ran in the cgroup and that Tier 2 recovered the fixture's constant offset within 250 ms.
