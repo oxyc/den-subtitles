@@ -541,7 +541,7 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
     own_cgroup = Path("/proc/self/cgroup").read_text()
     stats = dict.fromkeys(
         ["sampled", "file", "anon", "tree_kb", "tier2_alass_kb", "tier1_alass_kb", "ffmpeg_kb", "ffprobe_kb",
-         "ffmpeg_seen", "foreign_cgroup", "tier1_runs"],
+         "ffmpeg_seen", "foreign_cgroup", "tier1_started", "tier1_observed", "tier1_completed"],
         0,
     )
     tier2 = tier1 = None
@@ -594,10 +594,11 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
                         _, stderr = tier1.communicate()
                         if tier1.returncode:
                             raise RuntimeError(f"Tier-1 alass failed: {stderr[-500:]}")
-                        stats["tier1_runs"] += 1
+                        stats["tier1_completed"] += 1
                     tier1 = subprocess.Popen(
                         tier1_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
                     )
+                    stats["tier1_started"] += 1
                 current = cgroup_value("memory.current")
                 if current > stats["sampled"]:
                     stats["sampled"] = current
@@ -609,6 +610,7 @@ def tier2_memory_peak(root: Path, alass: str, soundtrack: Path) -> dict[str, int
                         stats["tier2_alass_kb"] = max(stats["tier2_alass_kb"], rss)
                     elif pid == tier1.pid:
                         stats["tier1_alass_kb"] = max(stats["tier1_alass_kb"], rss)
+                        stats["tier1_observed"] = 1
                     elif name in ("ffmpeg", "ffprobe"):
                         stats[f"{name}_kb"] = max(stats[f"{name}_kb"], rss)
                     if name == "ffmpeg" and pid not in checked:
@@ -772,14 +774,18 @@ def tier2_gate(alass: str, soundtrack: Path, gate_bytes: int) -> int:
         f"ffmpeg={stats['ffmpeg_kb']} ffprobe={stats['ffprobe_kb']} tier1_alass={stats['tier1_alass_kb']}"
     )
     print(
-        f"RESOURCE tier2_wall_ms={stats['wall_ms']} tier1_runs_alongside={stats['tier1_runs']} "
+        f"RESOURCE tier2_wall_ms={stats['wall_ms']} tier1_started={stats['tier1_started']} "
+        f"tier1_observed={stats['tier1_observed']} tier1_completed={stats['tier1_completed']} "
         f"tier2_p95_ms={stats['p95_ms']} offset_spread_ms={stats['offset_spread_ms']}"
     )
     # The measurement is only of Tier 2 if its ffmpeg extraction ran in this cgroup, next to Tier 1.
     if not stats["ffmpeg_seen"] or stats["foreign_cgroup"]:
         failed.append("Tier-2 gate did not observe ffmpeg extraction inside this cgroup")
-    if not stats["tier1_runs"]:
-        failed.append("no Tier-1 job completed alongside Tier 2")
+    # Completion order is not part of this memory gate. A fast Tier-2 can legitimately finish before
+    # the overlapping Tier-1 process, which used to make this assertion depend on runner scheduling.
+    # Observing that exact child in the process tree proves the intended concurrent workload ran.
+    if not stats["tier1_started"] or not stats["tier1_observed"]:
+        failed.append("Tier-1 did not run alongside Tier 2")
     # Partial-audio Tier 2 must recover the constant offset from its bounded sample.
     if stats["p95_ms"] > 250:
         failed.append(f"Tier-2 alignment p95 {stats['p95_ms']} ms exceeds 250 ms")
