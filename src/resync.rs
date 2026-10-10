@@ -2,7 +2,7 @@
 //! chosen stream to alass.
 //!
 //! `?resync=` is a URL picked by whoever sends the request, and the addon fetches it server-side for
-//! up to 90 seconds across progressive probes. Unguarded, that is a blind GET from inside the box
+//! up to 95 seconds across progressive probes. Unguarded, that is a blind GET from inside the box
 //! to anything the box can
 //! reach — every LAN host, and `den-embed:8080` on the container network — plus attacker-chosen
 //! media fed to ffmpeg's parsers. Two rules close it:
@@ -56,7 +56,7 @@ const HOP_BUDGET: Duration = Duration::from_secs(15);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bytes one resync may pull through the relay. Tier 2's 90-second wall-clock budget is the tighter
+/// Bytes one resync may pull through the relay. Tier 2's 95-second wall-clock budget is the tighter
 /// bound on any real link; this one holds even if that budget ever grows.
 const MAX_RELAY_BYTES: u64 = 8 << 30;
 
