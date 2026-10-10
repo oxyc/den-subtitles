@@ -68,7 +68,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   80-second windows from dialogue-dense regions spread across the title, stitches the three reads
   into a four-minute sample locally, and requires its offset to agree with an overlapping
   two-window sample. Keeping every network read short avoids the timeout caused by one contiguous
-  160-second read through a large video file. The confirmed offset is applied to the whole subtitle.
+  160-second read through a large video file; the two fallback reads run concurrently so bandwidth
+  variance in one cannot consume the other's wall-clock allowance. The confirmed offset is applied to the whole subtitle.
   Unlike the old full-file
   alignment, this deliberately does not repair mid-file cuts or drift. The
   app then swaps in the re-synced track. Den also supplies a hashed release identity as

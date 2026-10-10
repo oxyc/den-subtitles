@@ -42,8 +42,10 @@ pub struct AudioSync {
 
 const TIER1_BUDGET: Duration = Duration::from_secs(20);
 // Stay below the Apple client's 105-second held-answer timeout, including relay setup and response.
-const TIER2_TOTAL_BUDGET: Duration = Duration::from_secs(90);
-const TIER2_EXTRACT_BUDGET: Duration = Duration::from_secs(36);
+const TIER2_TOTAL_BUDGET: Duration = Duration::from_secs(95);
+const TIER2_FAST_EXTRACT_BUDGET: Duration = Duration::from_secs(36);
+const TIER2_FALLBACK_EXTRACT_BUDGET: Duration = Duration::from_secs(65);
+const TIER2_FINISH_RESERVE: Duration = Duration::from_secs(6);
 const TIER2_ALIGN_BUDGET: Duration = Duration::from_secs(5);
 // FFmpeg still has to read interleaved video packets when it writes audio only. A contiguous
 // 160-second fallback therefore pulls roughly 400 MiB from a 6 GiB, 43-minute Blu-ray and cannot
@@ -123,83 +125,55 @@ impl SyncTools {
         }
         let batches = partial_audio_batches(&all)?;
         let started = Instant::now();
-        let mut extracted = Vec::new();
+        let fast_audio = self.temp_path(tag, "batch-0.wav");
+        let fast_budget = remaining_extraction_budget(started, TIER2_FAST_EXTRACT_BUDGET)?;
+        self.extract_audio_batch(&batches[0], media_url, audio_stream, &fast_audio, fast_budget).await?;
+        let mut extracted = vec![(0, fast_audio)];
 
-        for (batch_index, batch) in batches.iter().enumerate() {
-            let audio_name = format!("batch-{batch_index}.wav");
-            let audio = self.temp_path(tag, &audio_name);
-            let sample_start_seconds = format!("{:.3}", batch.start_ms as f64 / 1000.0);
-            let batch_seconds = batch.seconds.to_string();
-            // Aether exposes FFmpeg AVStream indices directly. Use the stream the viewer is
-            // actually hearing; 0:a:0 remains the compatibility fallback for older clients.
-            let audio_map = audio_stream.map_or_else(|| "0:a:0".into(), |index| format!("0:{index}"));
-            let extract_budget = match remaining_stage_budget(started, TIER2_EXTRACT_BUDGET) {
-                Ok(budget) => budget,
-                Err(e) => {
-                    remove_extracted(&extracted).await;
-                    remove_files([&audio]).await;
-                    return Err(e);
-                }
-            };
-            let extract = self
-                .run(
-                    &self.ffmpeg,
-                    &[
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-ss",
-                        &sample_start_seconds,
-                        "-i",
-                        media_url,
-                        "-t",
-                        &batch_seconds,
-                        "-map",
-                        &audio_map,
-                        "-vn",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        "8000",
-                        "-c:a",
-                        "pcm_s16le",
-                        "-y",
-                        audio.to_string_lossy().as_ref(),
-                    ],
-                    extract_budget,
+        // Preserve the cheap path: most releases need only this one 80-second read.
+        let mut shifts = Vec::new();
+        for (probe_index, probe) in batches[0].probes.iter().enumerate() {
+            if let Ok(shift) = self
+                .measure_audio_shift(
+                    extracted[0].1.as_path(),
+                    probe,
+                    tag,
+                    &format!("fast-{probe_index}"),
+                    started,
                 )
-                .await;
-            if let Err(e) = require_success(extract, "partial audio extraction") {
-                remove_extracted(&extracted).await;
-                remove_files([&audio]).await;
-                return Err(format!("{e} at {:.3}s", batch.start_ms as f64 / 1000.0));
-            }
-            extracted.push((batch_index, audio));
-
-            // Preserve the cheap path: most releases need only this one 80-second read.
-            if batch_index == 0 {
-                let mut shifts = Vec::new();
-                for (probe_index, probe) in batch.probes.iter().enumerate() {
-                    if let Ok(shift) = self
-                        .measure_audio_shift(
-                            extracted.last().unwrap().1.as_path(),
-                            probe,
-                            tag,
-                            &format!("fast-{probe_index}"),
-                            started,
-                        )
-                        .await
-                    {
-                        shifts.push(shift);
-                    }
-                }
-                if let Some(shift_ms) = consensus_shift(&shifts) {
-                    remove_extracted(&extracted).await;
-                    return Ok(AudioSync { body: shift_cues(&all, shift_ms), shift_ms });
-                }
+                .await
+            {
+                shifts.push(shift);
             }
         }
+        if let Some(shift_ms) = consensus_shift(&shifts) {
+            remove_extracted(&extracted).await;
+            return Ok(AudioSync { body: shift_cues(&all, shift_ms), shift_ms });
+        }
+
+        // Both remaining reads start together. They are bandwidth-bound remote demuxes; making one
+        // spend its whole allowance before even starting the other caused otherwise-fast requests
+        // to fail at the per-read cap. Concurrent reads share one wall-clock deadline and leave a
+        // fixed reserve for the cheap local stitch + align steps.
+        let fallback_budget = match remaining_extraction_budget(started, TIER2_FALLBACK_EXTRACT_BUDGET) {
+            Ok(budget) => budget,
+            Err(error) => {
+                remove_extracted(&extracted).await;
+                return Err(error);
+            }
+        };
+        let fallback_one = self.temp_path(tag, "batch-1.wav");
+        let fallback_two = self.temp_path(tag, "batch-2.wav");
+        let (one, two) = tokio::join!(
+            self.extract_audio_batch(&batches[1], media_url, audio_stream, &fallback_one, fallback_budget),
+            self.extract_audio_batch(&batches[2], media_url, audio_stream, &fallback_two, fallback_budget),
+        );
+        if let Err(error) = one.and(two) {
+            remove_extracted(&extracted).await;
+            remove_files([&fallback_one, &fallback_two]).await;
+            return Err(error);
+        }
+        extracted.extend([(1, fallback_one), (2, fallback_two)]);
 
         let mut chronological = (0..batches.len()).collect::<Vec<_>>();
         chronological.sort_by_key(|&index| batches[index].start_ms);
@@ -234,6 +208,57 @@ impl SyncTools {
         Err(format!(
             "partial audio sync could not confirm one offset across distributed windows; measured offsets: {measured:?}"
         ))
+    }
+
+    async fn extract_audio_batch(
+        &self,
+        batch: &AudioBatch,
+        media_url: &str,
+        audio_stream: Option<u32>,
+        audio: &PathBuf,
+        budget: Duration,
+    ) -> Result<(), String> {
+        let sample_start_seconds = format!("{:.3}", batch.start_ms as f64 / 1000.0);
+        let batch_seconds = batch.seconds.to_string();
+        // Aether exposes FFmpeg AVStream indices directly. Use the stream the viewer is actually
+        // hearing; 0:a:0 remains the compatibility fallback for older clients.
+        let audio_map = audio_stream.map_or_else(|| "0:a:0".into(), |index| format!("0:{index}"));
+        let extract = self
+            .run(
+                &self.ffmpeg,
+                &[
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-ss",
+                    &sample_start_seconds,
+                    "-i",
+                    media_url,
+                    "-t",
+                    &batch_seconds,
+                    "-map",
+                    &audio_map,
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "8000",
+                    "-c:a",
+                    "pcm_s16le",
+                    "-y",
+                    audio.to_string_lossy().as_ref(),
+                ],
+                budget,
+            )
+            .await;
+        match require_success(extract, "partial audio extraction") {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                remove_files([audio]).await;
+                Err(format!("{error} at {:.3}s", batch.start_ms as f64 / 1000.0))
+            }
+        }
     }
 
     async fn measure_composite_shift(
@@ -435,6 +460,15 @@ fn remaining_stage_budget(started: Instant, stage_cap: Duration) -> Result<Durat
     let remaining = TIER2_TOTAL_BUDGET.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         Err("partial audio sync timed out".into())
+    } else {
+        Ok(stage_cap.min(remaining))
+    }
+}
+
+fn remaining_extraction_budget(started: Instant, stage_cap: Duration) -> Result<Duration, String> {
+    let remaining = TIER2_TOTAL_BUDGET.saturating_sub(started.elapsed()).saturating_sub(TIER2_FINISH_RESERVE);
+    if remaining.is_zero() {
+        Err("partial audio sync timed out before extraction".into())
     } else {
         Ok(stage_cap.min(remaining))
     }
