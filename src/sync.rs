@@ -114,6 +114,7 @@ impl SyncTools {
         &self,
         target_srt: &str,
         media_url: &str,
+        audio_stream: Option<u32>,
         tag: &str,
     ) -> Result<AudioSync, String> {
         let all = crate::srt::parse(target_srt);
@@ -130,6 +131,9 @@ impl SyncTools {
             let audio = self.temp_path(tag, &audio_name);
             let sample_start_seconds = format!("{:.3}", batch.start_ms as f64 / 1000.0);
             let batch_seconds = batch.seconds.to_string();
+            // Aether exposes FFmpeg AVStream indices directly. Use the stream the viewer is
+            // actually hearing; 0:a:0 remains the compatibility fallback for older clients.
+            let audio_map = audio_stream.map_or_else(|| "0:a:0".into(), |index| format!("0:{index}"));
             let extract_cap =
                 if batch_index == 0 { TIER2_FAST_EXTRACT_BUDGET } else { TIER2_FALLBACK_EXTRACT_BUDGET };
             let extract_budget = match remaining_stage_budget(started, extract_cap) {
@@ -154,7 +158,7 @@ impl SyncTools {
                         "-t",
                         &batch_seconds,
                         "-map",
-                        "0:a:0",
+                        &audio_map,
                         "-vn",
                         "-ac",
                         "1",
@@ -701,14 +705,14 @@ mod tests {
             &dir,
             "fake-ffmpeg",
             &format!(
-                "test \"$5\" = -ss; printf '%s\\n' \"$6\" >> '{}'; for last; do :; done; printf RIFF > \"$last\"",
+                "test \"$5\" = -ss; test \"${{12}}\" = 0:3; printf '%s\\n' \"$6\" >> '{}'; for last; do :; done; printf RIFF > \"$last\"",
                 calls.to_string_lossy()
             ),
         )
         .await;
         let t = SyncTools { alass, ffmpeg, work_dir: dir.clone() };
         let out = t
-            .sync_to_audio(&crate::srt::serialize(&full), "http://192.168.1.9/s.mkv", "tag-t2")
+            .sync_to_audio(&crate::srt::serialize(&full), "http://192.168.1.9/s.mkv", Some(3), "tag-t2")
             .await
             .unwrap();
         assert_eq!(out.shift_ms, 0);
@@ -769,7 +773,7 @@ mod tests {
         .await;
         let t = SyncTools { alass, ffmpeg, work_dir: dir.clone() };
         let out = t
-            .sync_to_audio(&crate::srt::serialize(&full), "http://192.168.1.9/s.mkv", "tag-fallback")
+            .sync_to_audio(&crate::srt::serialize(&full), "http://192.168.1.9/s.mkv", None, "tag-fallback")
             .await
             .unwrap();
         assert_eq!(out.shift_ms, 0);

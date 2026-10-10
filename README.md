@@ -61,7 +61,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   at 2 MiB. The PR corpus gates timing parity against `ffsubsync` across cross-language split/merged,
   missing/extra-cue, malformed, drift, sparse and long-track fixtures without shipping `ffsubsync`.
 - **Tier 2 (user action).** The Den app's "Re-sync with audio" menu item (shown only for a
-  non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>`; the addon extracts
+  non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>` and identifies the
+  audio stream currently selected in the player with `resync_audio=<AVStream index>`; the addon extracts
   one dialogue-dense 80-second mono audio batch and independently aligns each 40-second half. It
   accepts the offset when those probes agree within 250 ms; disagreement or a failed probe fetches
   a distant 160-second batch with two 80-second probes. Thus the normal path reads 80 seconds while
@@ -71,7 +72,8 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   app then swaps in the re-synced track. Den also supplies a hashed release identity as
   `resync_key`; successful results survive rotating scout play tickets and are retained for ten
   years (effectively until the bounded cache needs their space), while remaining scoped to that
-  addon installation. Older clients without the key retain the exact-ticket cache behavior. The
+  addon installation and audio stream. Older clients without the key retain the exact-ticket cache
+  behavior and default to the first audio stream. The
   stream URL has to be one of den-scout's play routes — `<origin>/<config>/play/<token>`, or the ticket form
   `<origin>/p/<ticket>` (one base64url segment) — at an origin listed in
   `SCOUT_ORIGINS`; any other target, or any target when that is unset, is ignored and the sub is
@@ -152,7 +154,8 @@ key across batches and films. The first successful answer ends a pause.
   detection. A successful Tier-2 response carries its already-applied correction in
   `X-Den-Subtitle-Offset-Ms`, including on cache hits, so clients can display the measured baseline
   without applying it twice. `?resync_key=<sha256>` gives the cache a stable release identity across
-  rotating stream tickets. `?sparse=1` is the caller's own last resort, asked for only after every candidate for a
+  rotating stream tickets, and `?resync_audio=<AVStream index>` selects and cache-scopes the exact
+  audio track heard by the viewer. `?sparse=1` is the caller's own last resort, asked for only after every candidate for a
   language has been tried and refused: a real, correctly-timed but too-sparse-for-its-span track
   (a dubbed release's English captions, say) is served rather than refused, since it is better than
   offering the language at all and getting nothing. A cue-less body, an expired CDN link or a dead
