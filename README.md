@@ -64,10 +64,12 @@ BYOK translation harness (all providers), the cache, the Docker image, and the *
   non-hash-matched sub) calls the subtitle proxy with `?resync=<stream-url>` and identifies the
   audio stream currently selected in the player with `resync_audio=<AVStream index>`; the addon extracts
   one dialogue-dense 80-second mono audio batch and independently aligns each 40-second half. It
-  accepts the offset when those probes agree within 250 ms; disagreement or a failed probe fetches
-  a distant 160-second batch with two 80-second probes. Thus the normal path reads 80 seconds while
-  difficult tracks can use exactly four minutes of total evidence inside a 90-second wall-clock
-  ceiling. The confirmed offset is applied to the whole subtitle. Unlike the old full-file
+  accepts the offset when those probes agree within 250 ms. On disagreement it fetches two more
+  80-second windows from dialogue-dense regions spread across the title, stitches the three reads
+  into a four-minute sample locally, and requires its offset to agree with an overlapping
+  two-window sample. Keeping every network read short avoids the timeout caused by one contiguous
+  160-second read through a large video file. The confirmed offset is applied to the whole subtitle.
+  Unlike the old full-file
   alignment, this deliberately does not repair mid-file cuts or drift. The
   app then swaps in the re-synced track. Den also supplies a hashed release identity as
   `resync_key`; successful results survive rotating scout play tickets and are retained for ten

@@ -5,9 +5,9 @@
 //!     (see `opensubtitles.rs`) floats those to the top; the sync tiers below only run for the rest.
 //!   * Tier 1 — reference alignment (fast, no audio): align the target subtitle against a subtitle
 //!     we trust to be in sync (e.g. an English hash-match). Sub-second, runs on every result.
-//!   * Tier 2 — partial audio VAD (opt-in): extract an 80-second batch, align its two independent
-//!     40-second probes, and stop when they agree; a distant 160-second fallback brings difficult
-//!     tracks to four minutes of total evidence.
+//!   * Tier 2 — partial audio VAD (opt-in): extract an 80-second batch and stop when its two
+//!     40-second probes agree. If they do not, stitch three distributed 80-second reads into a
+//!     four-minute sample and require a confirming alignment from an overlapping two-window sample.
 //!     Costs a stream fetch, so it's a per-title user action, not automatic.
 //!
 //! Each tier shells out to `alass` exactly like reel drives yt-dlp/ffmpeg —
@@ -43,14 +43,14 @@ pub struct AudioSync {
 const TIER1_BUDGET: Duration = Duration::from_secs(20);
 // Stay below the Apple client's 105-second held-answer timeout, including relay setup and response.
 const TIER2_TOTAL_BUDGET: Duration = Duration::from_secs(90);
-const TIER2_FAST_EXTRACT_BUDGET: Duration = Duration::from_secs(28);
-const TIER2_FALLBACK_EXTRACT_BUDGET: Duration = Duration::from_secs(52);
+const TIER2_EXTRACT_BUDGET: Duration = Duration::from_secs(36);
 const TIER2_ALIGN_BUDGET: Duration = Duration::from_secs(5);
-// A contiguous four-minute window meant reading roughly 500 MiB from a 6 GiB, 43-minute Blu-ray.
-// The fast batch is one third of the four-minute ceiling. Only disagreement fetches the remaining
-// two thirds from a distant part of the episode.
-const TIER2_FAST_PROBE_SECONDS: u64 = 40;
-const TIER2_FALLBACK_PROBE_SECONDS: u64 = 80;
+// FFmpeg still has to read interleaved video packets when it writes audio only. A contiguous
+// 160-second fallback therefore pulls roughly 400 MiB from a 6 GiB, 43-minute Blu-ray and cannot
+// reliably finish inside the request deadline. Keep each network read at 80 seconds and concatenate
+// three distributed reads locally when the cheap probe disagrees.
+const TIER2_PROBE_SECONDS: u64 = 40;
+const TIER2_DISTRIBUTED_BATCHES: usize = 3;
 const TIER2_MIN_PROBE_CUES: usize = 5;
 const TIER2_MAX_SHIFT_MS: i64 = 120_000;
 const TIER2_SAMPLE_LEAD_MS: u64 = 30_000;
@@ -123,8 +123,7 @@ impl SyncTools {
         }
         let batches = partial_audio_batches(&all)?;
         let started = Instant::now();
-        let mut shifts = Vec::new();
-        let mut last_error = None;
+        let mut extracted = Vec::new();
 
         for (batch_index, batch) in batches.iter().enumerate() {
             let audio_name = format!("batch-{batch_index}.wav");
@@ -134,11 +133,10 @@ impl SyncTools {
             // Aether exposes FFmpeg AVStream indices directly. Use the stream the viewer is
             // actually hearing; 0:a:0 remains the compatibility fallback for older clients.
             let audio_map = audio_stream.map_or_else(|| "0:a:0".into(), |index| format!("0:{index}"));
-            let extract_cap =
-                if batch_index == 0 { TIER2_FAST_EXTRACT_BUDGET } else { TIER2_FALLBACK_EXTRACT_BUDGET };
-            let extract_budget = match remaining_stage_budget(started, extract_cap) {
+            let extract_budget = match remaining_stage_budget(started, TIER2_EXTRACT_BUDGET) {
                 Ok(budget) => budget,
                 Err(e) => {
+                    remove_extracted(&extracted).await;
                     remove_files([&audio]).await;
                     return Err(e);
                 }
@@ -173,72 +171,161 @@ impl SyncTools {
                 )
                 .await;
             if let Err(e) = require_success(extract, "partial audio extraction") {
+                remove_extracted(&extracted).await;
                 remove_files([&audio]).await;
-                last_error = Some(e);
-                continue;
+                return Err(format!("{e} at {:.3}s", batch.start_ms as f64 / 1000.0));
             }
+            extracted.push((batch_index, audio));
 
-            for (probe_index, probe) in batch.probes.iter().enumerate() {
-                let target_name = format!("batch-{batch_index}-probe-{probe_index}-target.srt");
-                let out_name = format!("batch-{batch_index}-probe-{probe_index}-synced.srt");
-                let target =
-                    match self.write_temp(tag, &target_name, crate::srt::serialize(probe).as_bytes()).await {
-                        Ok(target) => target,
-                        Err(e) => {
-                            remove_files([&audio]).await;
-                            return Err(e);
-                        }
-                    };
-                let out = self.temp_path(tag, &out_name);
-                let align_budget = match remaining_stage_budget(started, TIER2_ALIGN_BUDGET) {
-                    Ok(budget) => budget,
-                    Err(e) => {
-                        remove_files([&target, &audio, &out]).await;
-                        return Err(e);
-                    }
-                };
-                let align = self
-                    .run(
-                        &self.alass,
-                        &[
-                            "--no-split",
-                            "--disable-fps-guessing",
-                            audio.to_string_lossy().as_ref(),
-                            target.to_string_lossy().as_ref(),
-                            out.to_string_lossy().as_ref(),
-                        ],
-                        align_budget,
-                    )
-                    .await;
-                if let Err(e) = require_success(align, "partial audio alignment") {
-                    remove_files([&target, &out]).await;
-                    last_error = Some(e);
-                    continue;
-                }
-                let measured = read_capped(&out).await.and_then(|body| {
-                    let aligned = crate::srt::parse(&body);
-                    partial_audio_shift(probe, &aligned)
-                });
-                remove_files([&target, &out]).await;
-                match measured {
-                    Ok(shift) => {
+            // Preserve the cheap path: most releases need only this one 80-second read.
+            if batch_index == 0 {
+                let mut shifts = Vec::new();
+                for (probe_index, probe) in batch.probes.iter().enumerate() {
+                    if let Ok(shift) = self
+                        .measure_audio_shift(
+                            extracted.last().unwrap().1.as_path(),
+                            probe,
+                            tag,
+                            &format!("fast-{probe_index}"),
+                            started,
+                        )
+                        .await
+                    {
                         shifts.push(shift);
-                        if let Some(shift_ms) = consensus_shift(&shifts) {
-                            remove_files([&audio]).await;
-                            return Ok(AudioSync { body: shift_cues(&all, shift_ms), shift_ms });
-                        }
                     }
-                    Err(e) => last_error = Some(e),
+                }
+                if let Some(shift_ms) = consensus_shift(&shifts) {
+                    remove_extracted(&extracted).await;
+                    return Ok(AudioSync { body: shift_cues(&all, shift_ms), shift_ms });
                 }
             }
-            remove_files([&audio]).await;
         }
 
-        let detail = match last_error {
-            Some(error) => format!("{error}; measured offsets: {shifts:?}"),
-            None => format!("measured offsets did not agree: {shifts:?}"),
+        let mut chronological = (0..batches.len()).collect::<Vec<_>>();
+        chronological.sort_by_key(|&index| batches[index].start_ms);
+        let full =
+            self.measure_composite_shift(&batches, &extracted, &chronological, tag, "full", started).await;
+        let mut measured = Vec::new();
+        if let Ok(shift) = full {
+            measured.push(shift);
+            // Test the later pair first: it avoids the opening credits and confirmed the exact
+            // Springfloden failure that motivated distributed sampling.
+            for (pair_index, pair) in chronological.windows(2).rev().enumerate() {
+                if let Ok(pair_shift) = self
+                    .measure_composite_shift(
+                        &batches,
+                        &extracted,
+                        pair,
+                        tag,
+                        &format!("pair-{pair_index}"),
+                        started,
+                    )
+                    .await
+                {
+                    measured.push(pair_shift);
+                    if let Some(shift_ms) = consensus_shift(&measured) {
+                        remove_extracted(&extracted).await;
+                        return Ok(AudioSync { body: shift_cues(&all, shift_ms), shift_ms });
+                    }
+                }
+            }
+        }
+        remove_extracted(&extracted).await;
+        Err(format!(
+            "partial audio sync could not confirm one offset across distributed windows; measured offsets: {measured:?}"
+        ))
+    }
+
+    async fn measure_composite_shift(
+        &self,
+        batches: &[AudioBatch],
+        extracted: &[(usize, PathBuf)],
+        selected: &[usize],
+        tag: &str,
+        name: &str,
+        started: Instant,
+    ) -> Result<i64, String> {
+        let audio = self.temp_path(tag, &format!("{name}.wav"));
+        let mut args = vec!["-hide_banner".into(), "-loglevel".into(), "error".into(), "-nostdin".into()];
+        for index in selected {
+            let path =
+                extracted.iter().find(|(batch, _)| batch == index).ok_or("missing audio batch")?.1.as_path();
+            args.push("-i".into());
+            args.push(path.to_string_lossy().into_owned());
+        }
+        let inputs = (0..selected.len()).map(|index| format!("[{index}:a]")).collect::<String>();
+        args.extend([
+            "-filter_complex".into(),
+            format!("{inputs}concat=n={}:v=0:a=1[out]", selected.len()),
+            "-map".into(),
+            "[out]".into(),
+            "-y".into(),
+            audio.to_string_lossy().into_owned(),
+        ]);
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let budget = remaining_stage_budget(started, TIER2_ALIGN_BUDGET)?;
+        let stitch = self.run(&self.ffmpeg, &refs, budget).await;
+        if let Err(error) = require_success(stitch, "partial audio stitching") {
+            remove_files([&audio]).await;
+            return Err(error);
+        }
+
+        let mut cues = Vec::new();
+        for (packed_index, batch_index) in selected.iter().enumerate() {
+            for cue in batches[*batch_index].probes.iter().flatten() {
+                let mut cue = cue.clone();
+                cue.index = cues.len() as u32 + 1;
+                let offset = packed_index as u64 * TIER2_PROBE_SECONDS * 2 * 1000;
+                cue.start += offset;
+                cue.end += offset;
+                cues.push(cue);
+            }
+        }
+        let result = self.measure_audio_shift(&audio, &cues, tag, name, started).await;
+        remove_files([&audio]).await;
+        result
+    }
+
+    async fn measure_audio_shift(
+        &self,
+        audio: &std::path::Path,
+        cues: &[crate::srt::Cue],
+        tag: &str,
+        name: &str,
+        started: Instant,
+    ) -> Result<i64, String> {
+        let target = self
+            .write_temp(tag, &format!("{name}-target.srt"), crate::srt::serialize(cues).as_bytes())
+            .await?;
+        let out = self.temp_path(tag, &format!("{name}-synced.srt"));
+        let budget = match remaining_stage_budget(started, TIER2_ALIGN_BUDGET) {
+            Ok(budget) => budget,
+            Err(error) => {
+                remove_files([&target, &out]).await;
+                return Err(error);
+            }
         };
-        Err(format!("partial audio sync could not confirm one offset across two windows: {detail}"))
+        let align = self
+            .run(
+                &self.alass,
+                &[
+                    "--no-split",
+                    "--disable-fps-guessing",
+                    audio.to_string_lossy().as_ref(),
+                    target.to_string_lossy().as_ref(),
+                    out.to_string_lossy().as_ref(),
+                ],
+                budget,
+            )
+            .await;
+        let result = match require_success(align, "partial audio alignment") {
+            Ok(()) => {
+                read_capped(&out).await.and_then(|body| partial_audio_shift(cues, &crate::srt::parse(&body)))
+            }
+            Err(e) => Err(e),
+        };
+        remove_files([&target, &out]).await;
+        result
     }
 
     /// Reclaim scratch files no run could still be using.
@@ -356,29 +443,42 @@ fn remaining_stage_budget(started: Instant, stage_cap: Duration) -> Result<Durat
 fn partial_audio_batches(cues: &[crate::srt::Cue]) -> Result<Vec<AudioBatch>, String> {
     let mut ordered = cues.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|cue| cue.start);
-    let fast_probe_ms = TIER2_FAST_PROBE_SECONDS * 1000;
-    let fallback_probe_ms = TIER2_FALLBACK_PROBE_SECONDS * 1000;
-    let mut fast = audio_batch_candidates(&ordered, fast_probe_ms);
-    fast.sort_by_key(|(start, left, _, right)| (std::cmp::Reverse(right - left), *start));
-    let Some(first) = fast.into_iter().next() else {
-        return Err("no 80-second batch has enough cues in both 40-second probes".into());
-    };
-
-    let first_end = first.0.saturating_add(fast_probe_ms * 2);
-    let fallback = audio_batch_candidates(&ordered, fallback_probe_ms)
-        .into_iter()
-        .filter(|(start, _, _, _)| {
-            let end = start.saturating_add(fallback_probe_ms * 2);
-            end <= first.0 || first_end <= *start
-        })
-        .max_by_key(|(start, left, _, right)| {
-            (start.abs_diff(first.0) / (fallback_probe_ms * 2), right - left, std::cmp::Reverse(*start))
-        });
-
-    let mut selected = vec![(first, fast_probe_ms)];
-    if let Some(fallback) = fallback {
-        selected.push((fallback, fallback_probe_ms));
+    let probe_ms = TIER2_PROBE_SECONDS * 1000;
+    let candidates = audio_batch_candidates(&ordered, probe_ms);
+    let duration = ordered.last().map(|cue| cue.end).unwrap_or_default();
+    let mut selected: Vec<((u64, usize, usize, usize), u64)> = Vec::new();
+    for region in 0..TIER2_DISTRIBUTED_BATCHES {
+        let start = duration * region as u64 / TIER2_DISTRIBUTED_BATCHES as u64;
+        let end = duration * (region + 1) as u64 / TIER2_DISTRIBUTED_BATCHES as u64;
+        let best = candidates
+            .iter()
+            .filter(|(batch_start, _, _, _)| (start..end).contains(&batch_start.saturating_add(probe_ms)))
+            .filter(|(batch_start, _, _, _)| {
+                selected.iter().all(|((selected_start, ..), _)| {
+                    batch_start.saturating_add(probe_ms * 2) <= *selected_start
+                        || selected_start.saturating_add(probe_ms * 2) <= *batch_start
+                })
+            })
+            .max_by_key(|(batch_start, left, _, right)| (right - left, std::cmp::Reverse(*batch_start)))
+            .copied()
+            .ok_or("subtitle does not have enough dialogue in three distributed regions")?;
+        selected.push((best, probe_ms));
     }
+    let mut chronological = selected.iter().map(|((start, ..), _)| *start).collect::<Vec<_>>();
+    chronological.sort_unstable();
+    if chronological.windows(2).any(|pair| pair[0] + probe_ms * 2 > pair[1]) {
+        return Err(format!(
+            "subtitle does not have three non-overlapping dialogue regions: {chronological:?}"
+        ));
+    }
+    // Run the densest region first so easy titles retain the one-read fast path.
+    let fast = selected
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, ((_, left, _, right), _))| right - left)
+        .map(|(index, _)| index)
+        .unwrap();
+    selected.swap(0, fast);
     Ok(selected
         .into_iter()
         .map(|((start_ms, left, middle, right), probe_ms)| AudioBatch {
@@ -505,6 +605,12 @@ fn shift_timestamp(value: u64, shift: i64) -> u64 {
 
 async fn remove_files<const N: usize>(paths: [&PathBuf; N]) {
     for path in paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+async fn remove_extracted(paths: &[(usize, PathBuf)]) {
+    for (_, path) in paths {
         let _ = tokio::fs::remove_file(path).await;
     }
 }
@@ -726,7 +832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier2_audio_uses_the_distant_fallback_after_disagreement() {
+    async fn tier2_audio_uses_distributed_fallback_after_disagreement() {
         let dir = work_dir("t2-fallback");
         let full = (0..108)
             .map(|index| {
@@ -737,10 +843,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let batches = partial_audio_batches(&full).unwrap();
-        assert_eq!(batches.len(), 2, "the fixture needs a distant fallback batch");
+        assert_eq!(batches.len(), 3, "the fixture needs three distributed batches");
 
-        // First probe says 0, second says +1s, so the fast batch cannot be trusted. The first
-        // distant probe says 0 again, producing a two-window consensus across different regions.
+        // First probe says 0, second says +1s, so the fast batch cannot be trusted. The stitched
+        // three-window result and its confirming two-window result both say 0.
         let mut disagree = batches[0].probes[1].clone();
         for cue in &mut disagree {
             cue.start += 1_000;
@@ -777,8 +883,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.shift_ms, 0);
-        assert_eq!(tokio::fs::read_to_string(&extract_calls).await.unwrap(), "xx");
-        assert_eq!(tokio::fs::read_to_string(&align_calls).await.unwrap().trim(), "3");
+        assert_eq!(tokio::fs::read_to_string(&extract_calls).await.unwrap(), "xxxxx");
+        assert_eq!(tokio::fs::read_to_string(&align_calls).await.unwrap().trim(), "4");
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
 
@@ -806,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_audio_batches_have_two_independent_probes_and_distant_fallback() {
+    fn partial_audio_batches_have_two_probes_in_three_distributed_regions() {
         let cues = (0..108)
             .map(|index| {
                 let region = index / 36;
@@ -816,16 +922,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let batches = partial_audio_batches(&cues).unwrap();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].seconds, 80);
-        assert_eq!(batches[1].seconds, 160);
-        assert!(batches[0].start_ms + 80_000 <= batches[1].start_ms);
-        assert!(batches[0].probes.iter().all(|probe| probe.len() >= TIER2_MIN_PROBE_CUES));
-        assert!(batches[1].probes.iter().all(|probe| probe.len() >= TIER2_MIN_PROBE_CUES));
-        assert!(batches[0].probes[0].iter().all(|cue| cue.start < 40_000));
-        assert!(batches[0].probes[1].iter().all(|cue| cue.start >= 40_000));
-        assert!(batches[1].probes[0].iter().all(|cue| cue.start < 80_000));
-        assert!(batches[1].probes[1].iter().all(|cue| cue.start >= 80_000));
+        assert_eq!(batches.len(), 3);
+        let mut starts = batches.iter().map(|batch| batch.start_ms).collect::<Vec<_>>();
+        starts.sort_unstable();
+        assert!(starts.windows(2).all(|pair| pair[0] + 80_000 <= pair[1]));
+        for batch in &batches {
+            assert_eq!(batch.seconds, 80);
+            assert!(batch.probes.iter().all(|probe| probe.len() >= TIER2_MIN_PROBE_CUES));
+            assert!(batch.probes[0].iter().all(|cue| cue.start < 40_000));
+            assert!(batch.probes[1].iter().all(|cue| cue.start >= 40_000));
+        }
     }
 
     #[test]
