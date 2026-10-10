@@ -820,6 +820,7 @@ pub async fn handle_subtitle_file(
     ref_id: Option<i64>,
     resync_url: Option<String>,
     resync_key: Option<String>,
+    resync_audio: Option<u32>,
     lang: Option<&str>,
     want_vtt: bool,
     allow_sparse: bool,
@@ -844,7 +845,7 @@ pub async fn handle_subtitle_file(
     });
     let ref_id = vetted_ref(file_id, ref_id);
     let install_scope = cfg.iid.as_deref().unwrap_or(config);
-    let resync_cache_identity = resync_cache_identity(install_scope, &resync_url, resync_key);
+    let resync_cache_identity = resync_cache_identity(install_scope, &resync_url, resync_key, resync_audio);
     // Cache identity depends on the sync mode so the raw and aligned variants don't collide.
     let cache_key = sync_cache_key(&os_base_key(file_id), &resync_cache_identity, ref_id);
     let settled_etag = settled_subtitle_etag(&cache_key);
@@ -954,6 +955,7 @@ pub async fn handle_subtitle_file(
         None,
         ref_id,
         resync_url,
+        resync_audio,
         reservation,
         flight,
         &what,
@@ -1038,6 +1040,7 @@ async fn sync_and_cache(
     translated_body_key: Option<&str>,
     ref_id: Option<i64>,
     resync_url: Option<String>,
+    resync_audio: Option<u32>,
     mut reservation: Option<SyncReservation<'_>>,
     flight: Option<InFlightGuard>,
     what: &str,
@@ -1145,7 +1148,7 @@ async fn sync_and_cache(
             Ok(relay) => {
                 let prepared = reservation.take().expect("Tier-2 sync was reserved before retaining bodies");
                 let mut slot = state.sync_admission.acquire(prepared).await;
-                let result = state.sync.sync_to_audio(&target, &relay.url(), &tag).await;
+                let result = state.sync.sync_to_audio(&target, &relay.url(), resync_audio, &tag).await;
                 slot.finish(sync_outcome(&result));
                 result
             }
@@ -1680,12 +1683,22 @@ fn resync_cache_identity(
     install_scope: &str,
     resync_url: &Option<String>,
     requested: Option<String>,
+    audio_stream: Option<u32>,
 ) -> Option<String> {
     let url = resync_url.as_ref()?;
     let stable = requested.filter(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()));
     stable
-        .map(|key| format!("stable:v1:{:016x}:{}", short_hash(install_scope), key.to_ascii_lowercase()))
-        .or_else(|| Some(url.clone()))
+        .map(|key| {
+            format!(
+                "stable:v2:{:016x}:{}:a{}",
+                short_hash(install_scope),
+                key.to_ascii_lowercase(),
+                audio_stream.map_or_else(|| "default".into(), |index| index.to_string())
+            )
+        })
+        .or_else(|| {
+            Some(format!("{url}#audio={}", audio_stream.map_or_else(|| "default".into(), |i| i.to_string())))
+        })
 }
 
 /// Key of the "this translation failed recently" marker: title-scoped, and answerable before any
@@ -2070,6 +2083,7 @@ pub async fn handle_translate(
     want_json: bool,
     resync_url: Option<String>,
     resync_key: Option<String>,
+    resync_audio: Option<u32>,
 ) -> Response<Body> {
     let Some(cfg) = state.decode_config(config) else {
         return httputil::error(StatusCode::BAD_REQUEST, "bad_config");
@@ -2217,7 +2231,7 @@ pub async fn handle_translate(
         }
     });
     let install_scope = cfg.iid.as_deref().unwrap_or(config);
-    let resync_cache_identity = resync_cache_identity(install_scope, &resync_url, resync_key);
+    let resync_cache_identity = resync_cache_identity(install_scope, &resync_url, resync_key, resync_audio);
     // The translated body inherits its source's timing, so it needs the same Tier-1 correction the
     // source itself would get from the picker.
     let ref_id = align_for(cached_body.as_ref().and_then(|body| body.source));
@@ -2558,6 +2572,7 @@ pub async fn handle_translate(
             wanted_sync.then_some(body_key.as_str()),
             ref_id,
             resync_url,
+            resync_audio,
             None,
             None,
             &format!("translation of {imdb} → {lang_key}"),
@@ -3079,19 +3094,30 @@ mod tests {
         let release = "a".repeat(64);
         let ticket_a = Some("https://scout.example/p/ticket-a".into());
         let ticket_b = Some("https://scout.example/p/ticket-b".into());
-        let a = resync_cache_identity("install-a", &ticket_a, Some(release.clone())).unwrap();
-        let b = resync_cache_identity("install-a", &ticket_b, Some(release.clone())).unwrap();
-        assert_eq!(sync_cache_key("os:5", &Some(a), None), sync_cache_key("os:5", &Some(b.clone()), None));
+        let a = resync_cache_identity("install-a", &ticket_a, Some(release.clone()), Some(3)).unwrap();
+        let b = resync_cache_identity("install-a", &ticket_b, Some(release.clone()), Some(3)).unwrap();
+        assert_eq!(
+            sync_cache_key("os:5", &Some(a.clone()), None),
+            sync_cache_key("os:5", &Some(b.clone()), None)
+        );
 
-        let other_install = resync_cache_identity("install-b", &ticket_b, Some(release)).unwrap();
+        let other_install = resync_cache_identity("install-b", &ticket_b, Some(release), Some(3)).unwrap();
         assert_ne!(
             sync_cache_key("os:5", &Some(other_install), None),
             sync_cache_key("os:5", &Some(b), None),
         );
 
-        let invalid = resync_cache_identity("install-a", &ticket_b, Some("not-a-digest".into()));
-        assert_eq!(invalid, ticket_b, "older or malformed clients stay keyed by their exact target");
-        assert!(resync_cache_identity("install-a", &None, Some("a".repeat(64))).is_none());
+        let invalid = resync_cache_identity("install-a", &ticket_b, Some("not-a-digest".into()), Some(3));
+        assert_eq!(
+            invalid,
+            ticket_b.map(|url| format!("{url}#audio=3")),
+            "older or malformed clients stay keyed by their exact target and audio stream"
+        );
+        assert!(resync_cache_identity("install-a", &None, Some("a".repeat(64)), Some(3)).is_none());
+
+        let other_audio =
+            resync_cache_identity("install-a", &ticket_a, Some("a".repeat(64)), Some(4)).unwrap();
+        assert_ne!(a, other_audio, "different audio tracks must not share an aligned subtitle");
     }
 }
 
@@ -3424,6 +3450,7 @@ mod translate_retry_tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await;
             assert_eq!(resp.status(), StatusCode::OK, "{name}");
@@ -3726,6 +3753,7 @@ mod translate_retry_tests {
             false,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -3763,6 +3791,7 @@ mod translate_retry_tests {
             "",
             "Swedish",
             false,
+            None,
             None,
             None,
         )
@@ -4436,6 +4465,7 @@ mod translate_retry_tests {
             None,
             None,
             None,
+            None,
             false,
             false,
             None,
@@ -4533,9 +4563,19 @@ mod translate_retry_tests {
         let state = state("long-lang");
         let config = config_segment();
         let long = "x".repeat(MAX_LANG + 1);
-        let resp =
-            handle_translate(&state, &HeaderMap::new(), &config, "tt0111161", "", &long, false, None, None)
-                .await;
+        let resp = handle_translate(
+            &state,
+            &HeaderMap::new(),
+            &config,
+            "tt0111161",
+            "",
+            &long,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an over-long language was accepted");
 
         // Nothing was written for it — not the body key, and not the failure marker either.
@@ -4554,6 +4594,7 @@ mod translate_retry_tests {
             "",
             "Swedish",
             false,
+            None,
             None,
             None,
         )
@@ -4597,6 +4638,7 @@ mod translate_retry_tests {
             false,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -4615,6 +4657,7 @@ mod translate_retry_tests {
             "",
             "Swedish",
             false,
+            None,
             None,
             None,
         )
