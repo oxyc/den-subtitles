@@ -53,7 +53,7 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
 fn render(state: &AppState) -> String {
     let cache = state.cache.stats();
     let mut out = String::with_capacity(1024);
-    let version = format!("version=\"{}\"", env!("CARGO_PKG_VERSION"));
+    let version = format!("version=\"{}\"", crate::release_version());
     series(
         &mut out,
         "subtitles_build_info",

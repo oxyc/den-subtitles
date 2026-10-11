@@ -256,9 +256,9 @@ pub fn manifest(install: Option<&crate::userconfig::UserConfig>) -> Value {
     let configured = install.is_some();
     let mut manifest = json!({
         "id": "com.den.subtitles",
-        // Single source of truth: the Cargo package version (CI asserts it == the v* tag). So the
-        // manifest can't drift from Cargo.toml, nor the tag from either.
-        "version": env!("CARGO_PKG_VERSION"),
+        // Single source of truth: the VERSION file, which the image build passes in as DEN_VERSION
+        // (docker-publish asserts it == the v* tag). So the manifest can't drift from the tag.
+        "version": crate::release_version(),
         "name": "Den Subtitles",
         "description": if configured {
             "OpenSubtitles (hash-matched + auto-synced) with optional BYOK AI translation for Den."

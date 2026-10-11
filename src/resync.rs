@@ -242,7 +242,7 @@ async fn pinned_client(url: &Url, origins: &[Origin]) -> Result<reqwest::Client,
     // `host_str` brackets an IPv6 literal.
     let bare = origin.host.trim_start_matches('[').trim_end_matches(']');
     let builder = reqwest::Client::builder()
-        .user_agent(concat!("den-subtitles/", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("den-subtitles/{}", crate::release_version()))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT);

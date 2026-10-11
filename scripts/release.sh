@@ -1,138 +1,96 @@
 #!/usr/bin/env bash
-# Cut a release, and refuse to cut a broken one.
+# Publish a release without rebuilding or retesting it.
 #
-#   scripts/release.sh 0.37.0
+#   scripts/release.sh 0.25.0
 #
-# Tagging by hand is how several releases in this fleet built nothing, and the failure hides well: CI gates on
-# a formatter, a tag that fails it produces NO image, and `den-update` then reports "already at <digest>" —
-# which means "the registry is unchanged" and reads as "nothing to deploy". The tag exists, the deploy command
-# exits 0, and the box keeps serving the old binary.
-#
-# den-update cannot tell the difference, because a release that never happened and a release that broke leave
-# the registry in exactly the same state. So the check belongs here: this checks first and tags second, then
-# waits for the build rather than assuming it.
-#
-# One file, copied verbatim into every addon repo. It works out the toolchain and the repo slug itself, so
-# there is nothing per-repo to keep in sync — and a script that differed per repo is how one of them would
-# quietly stop checking.
+# Main CI has already built, behavior-probed and scanned an immutable candidate image for the exact commit; the
+# vX.Y.Z workflow only verifies and promotes that digest. So this script changes only VERSION (never Cargo.toml:
+# the image supplies DEN_VERSION at run time, which keeps the cached dependency build valid), pushes that commit,
+# waits for its exact main CI, and only then tags. A failed main run creates no tag and cannot move :latest.
 set -euo pipefail
 
 version="${1:-}"
-[ -n "$version" ] || { echo "usage: scripts/release.sh <version>   e.g. 0.37.0" >&2; exit 1; }
+[ -n "$version" ] || { echo "usage: scripts/release.sh <version>   e.g. 0.25.0" >&2; exit 1; }
 case "$version" in
     v*) echo "error: give the version without the leading v ($version -> ${version#v})" >&2; exit 1 ;;
     *.*.*) ;;
     *) echo "error: '$version' is not a semver version" >&2; exit 1 ;;
 esac
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "error: '$version' is not X.Y.Z" >&2; exit 1; }
 
 cd "$(dirname "$0")/.."
 # From the remote, so nothing here names a repo.
 slug="$(git remote get-url origin | sed -e 's#.*[:/]\([^/]*/[^/]*\)$#\1#' -e 's/\.git$//')"
-
-# Against HEAD, so a STAGED change counts too. Plain `git diff` compares the working tree with the INDEX, so
-# anything already staged is invisible to it — and that is the one state in which a version bump that changed
-# nothing still produces a commit, and this script tags and publishes a release carrying the old version.
+# Against HEAD, so a STAGED change counts too.
 git diff --quiet HEAD || { echo "error: working tree has uncommitted changes" >&2; exit 1; }
 git fetch --quiet origin
-branch="$(git symbolic-ref --quiet --short HEAD || echo HEAD)"
 main="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD | sed 's#^origin/##' || echo main)"
 # These repos are worked on by several sessions at once; releasing on top of a stale main is how a push gets
 # rejected halfway through, with a tag already made.
-git merge-base --is-ancestor "origin/$main" HEAD \
-    || { echo "error: origin/$main has moved — rebase onto it before releasing" >&2; exit 1; }
+[ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$main")" ] \
+    || { echo "error: checkout is not the latest origin/$main — update it before releasing" >&2; exit 1; }
 git rev-parse "v$version" >/dev/null 2>&1 && { echo "error: tag v$version already exists" >&2; exit 1; }
+command -v gh >/dev/null 2>&1 || {
+    echo "error: gh is required to prove exact-main CI before tagging" >&2; exit 1; }
 
-# FORMAT THE WAY CI DOES. `cargo fmt` is unavailable on at least one machine here (no rustfmt component, no
-# rustup) and fails with "no such command", which reads as "not applicable" — that reading is what cost the
-# releases. nix runs the real thing against the repo's own config.
-run_rustfmt() {
-    if cargo fmt --all --check 2>/dev/null; then return 0; fi
-    command -v nix >/dev/null 2>&1 \
-        || { echo "error: no rustfmt, and no nix to borrow one" >&2; return 1; }
-    # shellcheck disable=SC2046
-    nix run nixpkgs#rustfmt -- --edition 2021 --check $(git ls-files '*.rs')
-}
+current="$(cat VERSION)"
+if [ "$current" != "$version" ]; then
+    printf '%s\n' "$version" > VERSION
+    [ "$(cat VERSION)" = "$version" ] || { echo "error: VERSION still says '$(cat VERSION)'" >&2; exit 1; }
+    git add VERSION
+    git commit --quiet -m "${slug#*/} $version"
+    git push --quiet origin "HEAD:$main"
+fi
+sha="$(git rev-parse HEAD)"
 
-# The version as the file carries it now. Read through this both before and after the bump: the bump is the
-# one step whose failure looks exactly like success, so it gets proved rather than trusted.
-read_version() {
-    if [ "$version_file" = "Cargo.toml" ]; then
-        sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1
-    else
-        sed -n 's/.*manifestVersion = "\(.*\)".*/\1/p' "$version_file" | head -1
-    fi
-}
-
-if [ -f Cargo.toml ]; then
-    echo "==> formatting";  run_rustfmt
-    echo "==> tests";       cargo test --quiet
-    version_file="Cargo.toml"
-elif [ -f go.mod ]; then
-    echo "==> formatting"
-    unformatted="$(gofmt -l .)"
-    [ -z "$unformatted" ] || { echo "error: needs gofmt:"; echo "$unformatted"; exit 1; }
-    echo "==> vet";   go vet ./...
-    echo "==> tests"; go test ./...
-    # Go carries its version in a constant rather than a manifest.
-    version_file="$(git grep -l 'manifestVersion = "' -- '*.go' | head -1)"
-else
-    echo "error: no Cargo.toml and no go.mod — teach this script the toolchain" >&2
+echo "==> waiting for exact-main candidate $sha"
+status=""; conclusion=""
+for _ in $(seq 1 120); do
+    # Until the run exists `.[0]` is null, which reads as not completed, so the loop waits for it.
+    read -r status conclusion <<<"$(gh run list --repo "$slug" --workflow ci.yml --branch "$main" --commit "$sha" \
+        --event push --limit 1 --json status,conclusion --jq '.[0] | "\(.status // "-") \(.conclusion // "-")"')"
+    [ "$status" = completed ] && break
+    sleep 15
+done
+if [ "$status" != completed ]; then
+    echo "error: exact-main CI did not finish within 30 minutes" >&2
+    exit 1
+fi
+if [ "$conclusion" != success ]; then
+    echo "error: exact-main CI for $sha finished $conclusion; no release tag was created" >&2
+    echo "       logs: gh run list --repo $slug --workflow ci.yml --commit $sha" >&2
     exit 1
 fi
 
-current="$(read_version)"
-[ -n "$current" ] || { echo "error: could not read the current version" >&2; exit 1; }
-[ "$current" != "$version" ] || { echo "error: already at $version" >&2; exit 1; }
+# Do not quietly release an older generation when another session merged while CI ran. Rerunning against the new
+# head needs no second version commit: VERSION already carries the intended release and its own candidate will win.
+git fetch --quiet origin
+[ "$sha" = "$(git rev-parse "origin/$main")" ] || {
+    echo "error: origin/$main moved while CI ran — update this checkout and rerun; nothing was tagged" >&2
+    exit 1
+}
 
-echo "==> version $current -> $version"
-if [ "$version_file" = "Cargo.toml" ]; then
-    # Only the FIRST `version = "…"`, which is `[package]`'s. This was `sed -i "0,/re/s//…/"`, whose `0,`
-    # address is a GNU extension: BSD sed — every macOS here — accepts it, substitutes NOTHING, and exits 0.
-    # The release then died at `git commit` with "nothing to commit", and would have tagged a build still
-    # carrying the old version had anything else been staged. awk does the same job on either platform.
-    awk -v old="version = \"$current\"" -v new="version = \"$version\"" \
-        '!bumped && $0 == old { $0 = new; bumped = 1 } { print }' Cargo.toml > Cargo.toml.next
-    mv Cargo.toml.next Cargo.toml
-    cargo build --quiet   # refresh the lockfile's own entry
-    git add Cargo.toml Cargo.lock
-else
-    sed -i.bak "s/manifestVersion = \"$current\"/manifestVersion = \"$version\"/" "$version_file"
-    rm -f "$version_file.bak"
-    git add "$version_file"
-fi
-bumped="$(read_version)"
-[ "$bumped" = "$version" ] \
-    || { echo "error: $version_file still says '$bumped' — the version bump did not apply" >&2; exit 1; }
-git commit --quiet -m "${slug#*/} $version"
-
-echo "==> pushing"
-git push --quiet origin "HEAD:$main"
 git tag -a "v$version" -m "${slug#*/} $version"
 git push --quiet origin "v$version"
 
-# WAIT FOR THE IMAGE. Without this the script ends exactly where the old mistake began: a pushed tag, and no
-# idea whether anything was built from it.
-command -v gh >/dev/null 2>&1 || {
-    echo "note: no gh — check it yourself: https://github.com/$slug/actions"; exit 0; }
-echo "==> waiting for docker-publish"
+echo "==> promoting the tested candidate"
 status=""; conclusion=""
 for _ in $(seq 1 80); do
-    # This tag's own image build. The newest run of ANY workflow is whatever started last — main's CI or a Dependabot
-    # update often does — and reading that one reported an image built while the build was still running. Until the
-    # tag's run exists `.[0]` is null, which reads as not completed, so the loop waits for it.
+    # This tag's own promotion run: the newest run of ANY workflow is whatever started last.
     read -r status conclusion <<<"$(gh run list --repo "$slug" --workflow docker-publish.yml --branch "v$version" \
-        --limit 1 --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion // "-")"')"
-    [ "$status" = "completed" ] && break
+        --limit 1 --json status,conclusion --jq '.[0] | "\(.status // "-") \(.conclusion // "-")"')"
+    [ "$status" = completed ] && break
     sleep 15
 done
-if [ "$status" != "completed" ]; then
-    echo "note: still building after 20 minutes — gh run list --repo $slug"; exit 0
+if [ "$status" != completed ]; then
+    echo "note: promotion is still running after 20 minutes — gh run list --repo $slug"; exit 0
 fi
-if [ "$conclusion" != "success" ]; then
-    echo "error: the build for v$version FAILED ($conclusion). No image exists, so there is nothing to" >&2
-    echo "       deploy — den-update will report the box is already at the previous digest, and that is" >&2
-    echo "       THIS, not a no-op. Logs: gh run view --repo $slug --log-failed" >&2
+[ "$conclusion" = success ] || {
+    echo "error: v$version promotion failed ($conclusion); :latest was not moved" >&2
+    echo "       den-update will report the box is already at the previous digest — that is THIS, not a no-op." >&2
+    echo "       logs: gh run view --repo $slug --log-failed" >&2
     exit 1
-fi
-echo "v$version built. Deploy with:"
+}
+echo "v$version is signed and published. Deploy with:"
 echo "  ssh root@pve 'incus exec den -- env TUF_ROOT=/var/lib/den/sigstore den-update ${slug#*/}'"

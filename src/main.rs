@@ -29,7 +29,7 @@ mod userconfig;
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hyper::header::{HeaderValue, ACCESS_CONTROL_ALLOW_ORIGIN};
@@ -42,6 +42,21 @@ use tokio::net::TcpListener;
 use crate::config::Config;
 use crate::httputil::Body;
 use crate::state::AppState;
+
+/// The release the image carries (`DEN_VERSION`, set from the repo's `VERSION` file at build time). Keeping it
+/// out of Cargo.toml means a release does not invalidate the cached dependency build merely to change its tag.
+/// Developer builds and tests have no image metadata, so they fall back to the package version.
+pub(crate) fn release_version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            std::env::var("DEN_VERSION")
+                .ok()
+                .filter(|version| !version.is_empty())
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
+        })
+        .as_str()
+}
 
 /// The /configure page, embedded so the binary is self-contained.
 const CONFIGURE_PAGE: &str = include_str!("configure.html");
@@ -349,7 +364,7 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     eprintln!(
         "den-subtitles {} listening on :{port} — metrics={} log_requests={} log_identity={} sealed={} \
          revoked={} epoch={} require_iid={} cache_dir={} cache_max_mib={} public_base={} resync={}",
-        env!("CARGO_PKG_VERSION"),
+        release_version(),
         on_off(!state.cfg.metrics_token.is_empty()),
         on_off(state.cfg.log_requests),
         on_off(state.cfg.log_identity),
@@ -1100,7 +1115,7 @@ mod tests {
             "text/plain; version=0.0.4; charset=utf-8"
         );
         let body = body_string(resp).await;
-        let build = format!("subtitles_build_info{{version=\"{}\"}} 1\n", env!("CARGO_PKG_VERSION"));
+        let build = format!("subtitles_build_info{{version=\"{}\"}} 1\n", release_version());
         assert!(body.contains(&build), "no build_info line in:\n{body}");
         assert!(body.contains("\nsubtitles_consecutive_failures{kind=\"opensubtitles\"} 0\n"), "{body}");
         assert!(body.contains("# TYPE subtitles_cache_disk_write_failures_total counter\n"), "{body}");

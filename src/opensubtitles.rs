@@ -18,7 +18,9 @@ use crate::ratelimit::{self, Pauses};
 
 /// OpenSubtitles asks every API consumer for `User-Agent: <app name> v<version>`, so this one keeps
 /// that form rather than the `den-subtitles/<version>` the shared client sends everywhere else.
-const USER_AGENT: &str = concat!("den-subtitles v", env!("CARGO_PKG_VERSION"));
+fn user_agent() -> String {
+    format!("den-subtitles v{}", crate::release_version())
+}
 
 /// One search hit, with the metadata needed to rank fit-to-stream and to show detail in the app
 /// picker. (De)serializable so a whole search result caches as JSON and rebuilds into a response.
@@ -193,7 +195,7 @@ impl<'a> Client<'a> {
             .http
             .get(format!("{}/subtitles", self.api_base))
             .header("Api-Key", self.api_key)
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", user_agent())
             .query(&query)
             .send()
             .await
@@ -273,7 +275,7 @@ impl<'a> Client<'a> {
             .http
             .post(format!("{}/download", self.api_base))
             .header("Api-Key", self.api_key)
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", user_agent())
             // `sub_format` asked for rather than assumed. `srt::parse` is an SRT parser and nothing
             // downstream handles ASS or WebVTT, so the format was already load-bearing — it was just
             // whatever the endpoint happened to default to.

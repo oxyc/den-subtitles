@@ -7,7 +7,9 @@
 # ---- build the Rust binary -------------------------------------------------
 FROM rust:1-trixie AS build
 WORKDIR /src
-# Cache deps: build manifests + a dummy main first so a code-only change re-links only our crate.
+# Cache deps: build manifests + a dummy main first so a code-only change re-links only our crate. The release
+# version is NOT in Cargo.toml (it is the VERSION file, passed to the runtime stage below), so a release
+# commit leaves this layer, and the dependency build inside it, cached.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked && rm -rf src
 COPY src ./src
@@ -59,6 +61,17 @@ ENV PORT=8093 \
     CACHE_DIR=/cache \
     ALASS_PATH=/usr/local/bin/alass \
     FFMPEG_PATH=/usr/bin/ffmpeg
+
+# The release identity comes last so that changing it re-runs nothing above. The service reports DEN_VERSION
+# at run time (startup line, /manifest.json, /metrics); a build without it fails here rather than shipping an
+# image that reports the placeholder Cargo.toml version.
+ARG DEN_VERSION
+ARG GIT_REVISION
+RUN printf '%s\n' "$DEN_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || { echo "DEN_VERSION must be X.Y.Z, got '$DEN_VERSION'" >&2; exit 1; }
+ENV DEN_VERSION=$DEN_VERSION
+LABEL org.opencontainers.image.version=$DEN_VERSION \
+      org.opencontainers.image.revision=$GIT_REVISION
 VOLUME ["/cache"]
 EXPOSE 8093
 
